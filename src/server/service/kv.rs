@@ -17,7 +17,8 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use mio::Token;
-use grpc::{ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode, UnarySink};
+use grpc::{ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode,
+           ServerStreamingSink, UnarySink};
 use futures::{future, Future, Stream};
 use futures::sync::oneshot;
 use protobuf::RepeatedField;
@@ -765,6 +766,16 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             });
 
         ctx.spawn(future);
+    }
+
+    #[allow(dead_code)]
+    #[allow(unused_variables)]
+    fn coprocessor_stream(
+        &self,
+        ctx: RpcContext,
+        req: Request,
+        sink: ServerStreamingSink<Response>,
+    ) {
     }
 
     fn raft(
