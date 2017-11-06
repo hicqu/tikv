@@ -17,11 +17,13 @@ use std::sync::Arc;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::mem;
 
+use protobuf::Message as PbMsg;
+use futures::{future, stream};
+
 use tipb::select::{self, Chunk, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
 use tipb::executor::ExecType;
 use tipb::schema::ColumnInfo;
-use protobuf::Message as PbMsg;
 use kvproto::coprocessor::{KeyRange, Request, Response};
 use kvproto::errorpb::{self, ServerIsBusy};
 use kvproto::kvrpcpb::{CommandPri, IsolationLevel};
@@ -30,7 +32,7 @@ use util::time::{duration_to_sec, Instant};
 use util::worker::{BatchRunnable, FutureScheduler, Scheduler};
 use util::collections::HashMap;
 use util::threadpool::{Context, ContextFactory, ThreadPool, ThreadPoolBuilder};
-use server::{Config, OnResponse};
+use server::{Config, OnResponse, ResponseStream};
 use storage::{self, engine, Engine, FlowStatistics, Snapshot, Statistics, StatisticsSummary};
 use storage::engine::Error as EngineError;
 use pd::PdTask;
@@ -48,6 +50,7 @@ pub const REQ_TYPE_INDEX: i64 = 102;
 pub const REQ_TYPE_DAG: i64 = 103;
 pub const REQ_TYPE_ANALYZE: i64 = 104;
 pub const BATCH_ROW_COUNT: usize = 64;
+pub const CHUNKS_PER_STREAM: usize = 1024;
 
 // If a request has been handled for more than 60 seconds, the client should
 // be timeout already, so it can be safely aborted.
@@ -604,7 +607,13 @@ fn notify_batch_failed<E: Into<Error> + Debug>(e: E, reqs: Vec<RequestTask>) {
 
 fn respond(resp: Response, mut t: RequestTask) -> Statistics {
     t.stop_record_handling();
-    (t.on_resp)(resp);
+    match t.on_resp {
+        OnResponse::Unary(cb) => cb(resp),
+        OnResponse::Streaming(cb) => {
+            let stream = box stream::once::<_, Error>(Ok(resp));
+            cb(stream);
+        }
+    };
     t.statistics
 }
 
@@ -625,14 +634,31 @@ impl TiDbEndPoint {
         if let Err(e) = t.check_outdated() {
             return on_error(e, t);
         }
-        let resp = match t.cop_req.take().unwrap() {
-            Ok(CopRequest::Select(sel)) => self.handle_select(sel, &mut t),
-            Ok(CopRequest::DAG(dag)) => self.handle_dag(dag, &mut t),
-            Ok(CopRequest::Analyze(analyze)) => self.handle_analyze(analyze, &mut t),
-            Err(err) => Err(err),
-        };
-        match resp {
-            Ok(r) => respond(r, t),
+
+        match t.cop_req.take().unwrap() {
+            Ok(CopRequest::Select(sel)) => {
+                let resp = self.handle_select(sel, &mut t).unwrap_or_else(err_resp);
+                respond(resp, t)
+            }
+            Ok(CopRequest::DAG(dag)) => if !t.on_resp.is_streaming() {
+                let resp = self.handle_dag(dag, &mut t).unwrap_or_else(err_resp);
+                respond(resp, t)
+            } else {
+                match self.handle_dag_stream(dag, &mut t) {
+                    Ok(stream) => match t.on_resp {
+                        OnResponse::Streaming(cb) => {
+                            cb(stream);
+                            t.statistics
+                        }
+                        _ => unreachable!(),
+                    },
+                    Err(e) => on_error(e, t),
+                }
+            },
+            Ok(CopRequest::Analyze(aly)) => {
+                let resp = self.handle_analyze(aly, &mut t).unwrap_or_else(err_resp);
+                respond(resp, t)
+            }
             Err(e) => on_error(e, t),
         }
     }
@@ -646,9 +672,22 @@ impl TiDbEndPoint {
     pub fn handle_dag(self, dag: DAGRequest, t: &mut RequestTask) -> Result<Response> {
         let ranges = t.req.get_ranges().to_vec();
         let mut ctx = DAGContext::new(dag, ranges, self.snap, t.ctx.clone())?;
-        let res = ctx.handle_request();
-        t.statistics.add(&ctx.take_statistics());
-        res
+        match ctx.handle_request(false) {
+            Ok(Some(resp)) => Ok(resp),
+            Ok(None) => unreachable!(),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn handle_dag_stream(self, dag: DAGRequest, t: &mut RequestTask) -> Result<ResponseStream> {
+        let ranges = t.req.get_ranges().to_vec();
+        let ctx = DAGContext::new(dag, ranges, self.snap, t.ctx.clone())?;
+        let stream = stream::unfold(ctx, |mut ctx| match ctx.handle_request(true) {
+            Ok(Some(resp)) => Some(future::ok::<_, _>((resp, ctx))),
+            Ok(None) => None,
+            Err(e) => Some(future::err::<_, _>(e)),
+        });
+        Ok(box stream)
     }
 
     pub fn handle_analyze(self, analyze: AnalyzeReq, t: &mut RequestTask) -> Result<Response> {

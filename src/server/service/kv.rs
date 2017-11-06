@@ -37,7 +37,7 @@ use storage::engine::Error as EngineError;
 use server::transport::RaftStoreRouter;
 use server::snap::Task as SnapTask;
 use server::metrics::*;
-use server::Error;
+use server::{Error, OnResponse};
 use raftstore::store::Msg as StoreMessage;
 use coprocessor::{EndPointTask, RequestTask};
 
@@ -749,9 +749,8 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             .start_coarse_timer();
 
         let (cb, future) = make_callback();
-        let res = self.end_point_scheduler
-            .schedule(EndPointTask::Request(RequestTask::new(req, cb)));
-        if let Err(e) = res {
+        let task = EndPointTask::Request(RequestTask::new(req, OnResponse::Unary(cb)));
+        if let Err(e) = self.end_point_scheduler.schedule(task) {
             self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
             return;
         }

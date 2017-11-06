@@ -12,6 +12,7 @@
 // limitations under the License.
 
 use std::boxed::FnBox;
+use futures::Stream;
 use kvproto::coprocessor::Response;
 mod metrics;
 mod service;
@@ -32,5 +33,20 @@ pub use self::transport::{ServerRaftStoreRouter, ServerTransport};
 pub use self::node::{create_raft_storage, Node};
 pub use self::resolve::{PdStoreAddrResolver, StoreAddrResolver};
 pub use self::raft_client::RaftClient;
+use coprocessor::Error as CopError;
 
-pub type OnResponse = Box<FnBox(Response) + Send>;
+pub type ResponseStream = Box<Stream<Item = Response, Error = CopError>>;
+
+pub enum OnResponse {
+    Unary(Box<FnBox(Response) + Send>),
+    Streaming(Box<FnBox(ResponseStream) + Send>),
+}
+
+impl OnResponse {
+    pub fn is_streaming(&self) -> bool {
+        match self {
+            &OnResponse::Unary(_) => false,
+            &OnResponse::Streaming(_) => true,
+        }
+    }
+}
