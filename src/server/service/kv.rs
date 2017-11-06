@@ -12,13 +12,12 @@
 // limitations under the License.
 
 use std::boxed::FnBox;
-use std::fmt::Debug;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use mio::Token;
 use grpc::{ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode,
-           ServerStreamingSink, UnarySink};
+           ServerStreamingSink, UnarySink, WriteFlags};
 use futures::{future, Future, Stream};
 use futures::sync::oneshot;
 use protobuf::RepeatedField;
@@ -82,11 +81,24 @@ impl<T: RaftStoreRouter + 'static> Service<T> {
         let status = RpcStatus::new(code, Some(format!("{}", err)));
         ctx.spawn(sink.fail(status).map_err(|_| ()));
     }
+
+    fn send_fail_status_to_stream<M>(
+        &self,
+        ctx: RpcContext,
+        sink: ServerStreamingSink<M>,
+        err: Error,
+        code: RpcStatusCode,
+    ) {
+        let status = RpcStatus::new(code, Some(format!("{}", err)));
+        ctx.spawn(sink.fail(status).map_err(|_| ()));
+    }
 }
 
-fn make_callback<T: Debug + Send + 'static>() -> (Box<FnBox(T) + Send>, oneshot::Receiver<T>) {
+fn make_callback<T: Send + 'static>() -> (Box<FnBox(T) + Send>, oneshot::Receiver<T>) {
     let (tx, rx) = oneshot::channel();
-    let callback = move |resp| { tx.send(resp).unwrap(); };
+    let callback = move |resp| if tx.send(resp).is_err() {
+        error!("send by onshot::channel fail");
+    };
     (box callback, rx)
 }
 
@@ -775,6 +787,38 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
         req: Request,
         sink: ServerStreamingSink<Response>,
     ) {
+        let label = "coprocessor_stream";
+        let timer = GRPC_MSG_HISTOGRAM_VEC
+            .with_label_values(&[label])
+            .start_coarse_timer();
+        let (cb, future) = make_callback();
+        let task = EndPointTask::Request(RequestTask::new(req, OnResponse::Streaming(cb)));
+        if let Err(e) = self.end_point_scheduler.schedule(task) {
+            self.send_fail_status_to_stream(
+                ctx,
+                sink,
+                Error::from(e),
+                RpcStatusCode::ResourceExhausted,
+            );
+            return;
+        }
+
+        let future = future
+            .map_err(Error::from)
+            .and_then(|stream| {
+                stream
+                    .map(|resp| (resp, WriteFlags::default()))
+                    .map_err(|e| Error::Other(box e))
+                    .forward(sink)
+                    .map(|_| ())
+                    .map_err(Error::from)
+            })
+            .map_err(move |e| {
+                debug!("{} failed: {:?}", label, e);
+                GRPC_MSG_FAIL_COUNTER.with_label_values(&[label]).inc();
+            });
+
+        ctx.spawn(future);
     }
 
     fn raft(

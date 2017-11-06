@@ -35,7 +35,7 @@ pub use self::resolve::{PdStoreAddrResolver, StoreAddrResolver};
 pub use self::raft_client::RaftClient;
 use coprocessor::Error as CopError;
 
-pub type ResponseStream = Box<Stream<Item = Response, Error = CopError>>;
+pub type ResponseStream = Box<Stream<Item = Response, Error = CopError> + Send>;
 
 pub enum OnResponse {
     Unary(Box<FnBox(Response) + Send>),
@@ -44,9 +44,9 @@ pub enum OnResponse {
 
 impl OnResponse {
     pub fn is_streaming(&self) -> bool {
-        match self {
-            &OnResponse::Unary(_) => false,
-            &OnResponse::Streaming(_) => true,
+        match *self {
+            OnResponse::Unary(_) => false,
+            OnResponse::Streaming(_) => true,
         }
     }
 }

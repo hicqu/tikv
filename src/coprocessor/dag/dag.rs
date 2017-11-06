@@ -35,6 +35,9 @@ pub struct DAGContext {
     output_offsets: Vec<u32>,
 }
 
+// TODO: we should ensure underlay things Send.
+unsafe impl Send for DAGContext {}
+
 impl DAGContext {
     pub fn new(
         mut req: DAGRequest,
@@ -82,8 +85,8 @@ impl DAGContext {
                         chunks.push(chunk);
                         cur_chunk_count = 1;
                     }
-                    let mut chunk = chunks.last_mut().unwrap();
 
+                    let chunk = chunks.last_mut().unwrap();
                     if self.has_aggr {
                         chunk.mut_rows_data().extend_from_slice(&row.data.value);
                     } else {
@@ -111,6 +114,7 @@ impl DAGContext {
         }
     }
 
+    #[allow(dead_code)]
     pub fn take_statistics(&mut self) -> Statistics {
         self.exec.take_statistics()
     }
