@@ -19,8 +19,9 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::mem;
 
 use protobuf::{CodedInputStream, Message as PbMsg};
-use futures::future;
+use futures::{future, stream, Future};
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
+use grpc::Error as GrpcError;
 
 use tipb::select::{self, Chunk, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
@@ -171,7 +172,7 @@ impl Host {
     ) -> Host {
         let create_pool = |name_prefix: &str, size: usize| {
             CpuPoolBuilder::new()
-                .name(name_prefix)
+                .name_prefix(name_prefix)
                 .pool_size(size)
                 .create()
         };
@@ -197,12 +198,12 @@ impl Host {
         debug!("failed to handle batch request: {:?}", e);
         let resp = err_resp(e.into());
         for t in reqs {
-            t.respond(resp.clone())
+            t.on_finish.respond(resp.clone());
         }
     }
 
     fn notify_batch_failed_by_id<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
-        let reqs = self.reqs.remove(batch_id).unwrap();
+        let reqs = self.reqs.remove(&batch_id).unwrap();
         Host::notify_batch_failed(e, reqs);
     }
 
@@ -212,9 +213,8 @@ impl Host {
             .with_label_values(&[t.ctx.get_scan_tag(), get_req_pri_str(pri)])
             .add(1.0);
 
-        t.stop_record_waiting();
         if let Err(e) = t.check_outdated() {
-            t.on_error(e);
+            t.on_finish.on_error(e);
         }
 
         let pool = match pri {
@@ -223,31 +223,32 @@ impl Host {
             CommandPri::Normal => &mut self.pool,
         };
 
-        let mut statistics = Statistics::default();
+        let mut on_finish = t.on_finish;
+        on_finish.stop_record_waiting();
         let (ranges, req_ctx) = (t.req.take_ranges().into_vec(), t.ctx);
 
-        let dispatch_request = move || -> Result<()> {
+        let dispatch_request = move || -> Result<_> {
             match t.cop_req {
-                Ok(CopRequest::Select(sel)) => {
-                    let mut ctx = SelectContext::new(sel, snap, req_ctx)?;
+                // TODO: here we don't need Arc.
+                CopRequest::Select(sel) => {
+                    let mut ctx = SelectContext::new(sel, snap, Arc::new(req_ctx))?;
                     let res = ctx.handle_request(ranges)?;
-                    ctx.collect_statistics_into(&mut statistics);
-                    t.resp_sink.respond(res)
+                    ctx.collect_statistics_into(&mut on_finish.statistics);
+                    Ok(t.on_finish.respond(res))
                 }
-                Ok(CopRequest::DAG(dag)) => {
+                CopRequest::DAG(dag) => {
                     let ranges = t.req.take_ranges().into_vec();
-                    let mut ctx = DAGContext::new(dag, ranges, snap, req_ctx)?;
-                    let res = ctx.handle_request();
-                    ctx.collect_statistics_into(&mut statistics);
-                    t.resp_sink.respond(res)
+                    let mut ctx = DAGContext::new(dag, ranges, snap, Arc::new(req_ctx))?;
+                    let res = ctx.handle_request()?;
+                    ctx.collect_statistics_into(&mut on_finish.statistics);
+                    Ok(t.on_finish.respond(res))
                 }
-                Ok(CopRequest::Analyze(analyze)) => {
+                CopRequest::Analyze(analyze) => {
                     let mut ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
-                    let res = ctx.handle_request();
-                    ctx.collect_statistics_into(&mut statistics);
-                    t.resp_sink.respond(res)
+                    let res = ctx.handle_request()?;
+                    ctx.collect_statistics_into(&mut on_finish.statistics);
+                    Ok(t.on_finish.respond(res))
                 }
-                Err(e) => t.resp_sink.on_error(e),
             }
         };
         dispatch_request();
@@ -268,7 +269,7 @@ impl Host {
         }
 
         for req in self.reqs.remove(&id).unwrap() {
-            self.handle_request(req);
+            self.handle_request_on_sanpshot(snap.clone(), req);
         }
     }
 }
@@ -325,87 +326,160 @@ impl ReqContext {
     }
 }
 
+struct OnRequestFinish {
+    resp_sink: CopResponseSink,
+    region_id: u64,
+    ranges_len: usize,
+    first_range: Option<KeyRange>,
+    scan_tag: &'static str,
+
+    timer: Instant,
+    wait_time: f64,
+    start_ts: u64,
+    statistics: Statistics,
+}
+
+impl OnRequestFinish {
+    fn respond(self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+        self.stop_record_handling();
+        match self.resp_sink {
+            CopResponseSink::Unary(sink) => box sink.success(resp),
+            CopResponseSink::Streaming(sink) => {
+                let stream = stream::once(resp);
+                box sink.send_all(stream)
+            }
+        }
+    }
+
+    fn on_error(self, e: Error) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+        let resp = err_resp(e);
+        self.respond(resp)
+    }
+
+    fn stop_record_waiting(&mut self) {
+        if self.wait_time > 0 {
+            return;
+        }
+        self.wait_time = duration_to_sec(self.timer.elapsed());
+        COPR_REQ_WAIT_TIME
+            .with_label_values(&[self.scan_tag])
+            .observe(self.wait_time);
+    }
+
+    fn stop_record_handling(&mut self) {
+        self.stop_record_waiting();
+        let handle_time = duration_to_sec(self.timer.elapsed());
+
+        COPR_REQ_HISTOGRAM_VEC
+            .with_label_values(&[self.scan_tag])
+            .observe(handle_time);
+
+        COPR_REQ_HANDLE_TIME
+            .with_label_values(&[self.scan_tag])
+            .observe(handle_time - self.wait_time);
+
+        COPR_SCAN_KEYS
+            .with_label_values(&[self.scan_tag])
+            .observe(self.statistics.total_op_count() as f64);
+
+        if handle_time > SLOW_QUERY_LOWER_BOUND {
+            info!(
+                "[region {}] handle {:?} [{}] takes {:?} [waiting: {:?}, keys: {}, hit: {}, \
+                 ranges: {} ({:?})]",
+                self.region_id,
+                self.start_ts,
+                self.scan_tag,
+                handle_time,
+                self.wait_time,
+                self.statistics.total_op_count(),
+                self.statistics.total_processed(),
+                self.ranges_len,
+                self.first_range,
+            );
+        }
+    }
+}
+
 pub struct RequestTask {
     req: Request,
-    start_ts: u64,
-    wait_time: f64,
-    timer: Instant,
     cop_req: CopRequest,
     ctx: ReqContext,
-    resp_sink: Option<CopResponseSink>,
+    on_finish: OnRequestFinish,
 }
 
 impl RequestTask {
-    pub fn new(req: Request, resp_sink: CopResponseSink, recursion_limit: u32) -> RequestTask {
+    /// create a new `RequestTask`. If success, take the `CopResponseSink`
+    /// from `resp_sink`, or keep it not changed.
+    pub fn new(
+        req: Request,
+        resp_sink: &mut Option<CopResponseSink>,
+        recursion_limit: u32,
+    ) -> Result<RequestTask> {
+        let mut is = CodedInputStream::from_bytes(req.get_data());
+        is.set_recursion_limit(recursion_limit);
+
+        let mut table_scan = false;
+        let (cop_req, start_ts) = match req.get_tp() {
+            tp @ REQ_TYPE_SELECT | tp @ REQ_TYPE_INDEX => {
+                let mut sel = SelectRequest::new();
+                box_try!(sel.merge_from(&mut is));
+                table_scan = tp == REQ_TYPE_SELECT;
+                (CopRequest::Select(sel), sel.get_start_ts())
+            }
+            REQ_TYPE_DAG => {
+                let mut dag = DAGRequest::new();
+                box_try!(dag.merge_from(&mut is));
+
+                table_scan = dag.get_executors()
+                    .iter()
+                    .next()
+                    .map_or(false, |scan| scan.get_tp() == ExecType::TypeTableScan);
+                (CopRequest::DAG(dag), dag.get_start_ts())
+            }
+            REQ_TYPE_ANALYZE => {
+                let mut analyze = AnalyzeReq::new();
+                box_try!(analyze.merge_from(&mut is));
+                table_scan = analyze.get_tp() == AnalyzeType::TypeColumn;
+                (CopRequest::Analyze(analyze), analyze.get_start_ts())
+            }
+            tp => return Err(box_err!("unsupported tp {}", tp)),
+        };
+
+        let timer = Instant::now_coarse();
+        let deadline = timer + Duration::from_secs(REQUEST_MAX_HANDLE_SECS);
         let req_ctx = ReqContext {
             deadline: deadline,
             isolation_level: req.get_context().get_isolation_level(),
             fill_cache: !req.get_context().get_not_fill_cache(),
             table_scan: table_scan,
         };
+        let on_finish = OnRequestFinish {
+            resp_sink: resp_sink.take().unwrap(),
+            region_id: req.get_context().get_region_id(),
+            ranges_len: req.get_ranges().len(),
+            first_range: req.get_ranges().get(0).clone(),
+            scan_tag: req_ctx.get_scan_tag(),
 
-        let timer = Instant::now_coarse();
-        let deadline = timer + Duration::from_secs(REQUEST_MAX_HANDLE_SECS);
-
-        let start_ts: u64;
-        let mut table_scan = false;
-
-        let cop_req = match req.get_tp() {
-            tp @ REQ_TYPE_SELECT | REQ_TYPE_INDEX => {
-                table_scan = tp == REQ_TYPE_SELECT;
-
-                let mut is = CodedInputStream::from_bytes(req.get_data());
-                is.set_recursion_limit(recursion_limit);
-                let mut sel = SelectRequest::new();
-                if let Err(e) = sel.merge_from(&mut is) {
-                    Err(box_err!(e))
-                } else {
-                    start_ts = Some(sel.get_start_ts());
-                    Ok(CopRequest::Select(sel))
-                }
-            }
-            REQ_TYPE_DAG => {
-                let mut is = CodedInputStream::from_bytes(req.get_data());
-                is.set_recursion_limit(recursion_limit);
-                let mut dag = DAGRequest::new();
-                if let Err(e) = dag.merge_from(&mut is) {
-                    Err(box_err!(e))
-                } else {
-                    start_ts = Some(dag.get_start_ts());
-                    if let Some(scan) = dag.get_executors().iter().next() {
-                        if scan.get_tp() == ExecType::TypeTableScan {
-                            table_scan = true;
-                        }
-                    }
-                    Ok(CopRequest::DAG(dag))
-                }
-            }
-            REQ_TYPE_ANALYZE => {
-                let mut is = CodedInputStream::from_bytes(req.get_data());
-                is.set_recursion_limit(recursion_limit);
-                let mut analyze = AnalyzeReq::new();
-                if let Err(e) = analyze.merge_from(&mut is) {
-                    Err(box_err!(e))
-                } else {
-                    start_ts = Some(analyze.get_start_ts());
-                    if analyze.get_tp() == AnalyzeType::TypeColumn {
-                        table_scan = true;
-                    }
-                    Ok(CopRequest::Analyze(analyze))
-                }
-            }
-
-            _ => Err(box_err!("unsupported tp {}", tp)),
-        };
-        RequestTask {
-            req: req,
-            start_ts: start_ts,
-            wait_time: 0,
             timer: timer,
-            resp_sink: Some(resp_sink),
+            wait_time: 0,
+            start_ts: start_ts,
+            statistics: Statistics::default(),
+        };
+
+        Ok(RequestTask {
+            req: req,
             cop_req: cop_req,
-            ctx: Arc::new(req_ctx),
-        }
+            ctx: req_ctx,
+            on_finish: on_finish,
+        })
+    }
+
+    pub fn set_on_finish_sink(&mut self, sink: CopResponseSink) {
+        self.on_finish.resp_sink = Some(sink);
+    }
+
+    pub fn take_on_finish_sink(&mut self) -> CopResponseSink {
+        self.on_finish.resp_sink.take().unwrap()
     }
 
     #[inline]
@@ -413,67 +487,9 @@ impl RequestTask {
         self.ctx.check_if_outdated()
     }
 
-    fn stop_record_waiting(&mut self) {
-        if self.wait_time.is_some() {
-            return;
-        }
-        let wait_time = duration_to_sec(self.timer.elapsed());
-        COPR_REQ_WAIT_TIME
-            .with_label_values(&[self.ctx.get_scan_tag()])
-            .observe(wait_time);
-        self.wait_time = Some(wait_time);
-    }
-
-    fn stop_record_handling(&mut self) {
-        self.stop_record_waiting();
-
-        let handle_time = duration_to_sec(self.timer.elapsed());
-        let type_str = self.ctx.get_scan_tag();
-        COPR_REQ_HISTOGRAM_VEC
-            .with_label_values(&[type_str])
-            .observe(handle_time);
-        let wait_time = self.wait_time.unwrap();
-        COPR_REQ_HANDLE_TIME
-            .with_label_values(&[type_str])
-            .observe(handle_time - wait_time);
-
-        COPR_SCAN_KEYS
-            .with_label_values(&[type_str])
-            .observe(self.statistics.total_op_count() as f64);
-
-        if handle_time > SLOW_QUERY_LOWER_BOUND {
-            info!(
-                "[region {}] handle {:?} [{}] takes {:?} [waiting: {:?}, keys: {}, hit: {}, \
-                 ranges: {} ({:?})]",
-                self.req.get_context().get_region_id(),
-                self.start_ts,
-                type_str,
-                handle_time,
-                wait_time,
-                self.statistics.total_op_count(),
-                self.statistics.total_processed(),
-                self.req.get_ranges().len(),
-                self.req.get_ranges().get(0)
-            );
-        }
-    }
 
     pub fn priority(&self) -> CommandPri {
         self.req.get_context().get_priority()
-    }
-
-    fn respond(self, resp: Response) {
-        // TODO: real logic here.
-        self.stop_record_handling();
-        match self.resp_sink {
-            Unary(sink) => sink.success(resp),
-            Streaming(sink) => sink.send_all(resp),
-        }
-    }
-
-    fn on_error(self, e: Error) {
-        let resp = err_resp(e);
-        self.respond(resp)
     }
 
     fn get_request_key(&self) -> (u64, u64, u64) {

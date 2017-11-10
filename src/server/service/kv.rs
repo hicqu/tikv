@@ -27,7 +27,7 @@ use kvproto::kvrpcpb::*;
 use kvproto::coprocessor::*;
 use kvproto::errorpb::{Error as RegionError, ServerIsBusy};
 
-use util::worker::Scheduler;
+use util::worker::{Scheduler, Stopped};
 use util::buf::PipeBuffer;
 use storage::{self, Key, Mutation, Options, Storage, Value};
 use storage::txn::Error as TxnError;
@@ -750,11 +750,30 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             .with_label_values(&[label])
             .start_coarse_timer();
 
-        let req_task = RequestTask::new(req, CopResponseSink::Unary(sink), self.recursion_limit);
-        let task = EndPointTask::Request(req_task);
-        if let Err(e) = self.end_point_scheduler.schedule(task) {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
+        let deal = |scheduler: &mut Scheduler<EndPointTask>| {
+            let mut sink_opt = Some(CopResponseSink::Unary(sink));
+            let mut req_task = match RequestTask::new(req, &mut sink_opt, self.recursion_limit) {
+                Ok(req_task) => req_task,
+                Err(e) => {
+                    let sink = sink_opt.unwrap().take_unary();
+                    let error = box_err!(e);
+                    return Some((sink, error, RpcStatusCode::InvalidArgument));
+                }
+            };
+
+            match scheduler.schedule(EndPointTask::Request(req_task)) {
+                Err(Stopped(EndPointTask::Request(req_task))) => {
+                    let sink = req_task.take_on_finish_sink().take_unary();
+                    let error = Error::from(Stopped(EndPointTask::Request(req_task)));
+                    return Some((sink, error, RpcStatusCode::ResourceExhausted));
+                }
+                Ok(_) => return None,
+                _ => unreachable!(),
+            }
+        };
+
+        if let Some((sink, error, code)) = deal(&mut self.end_point_scheduler) {
+            self.send_fail_status(ctx, sink, error, code);
         }
     }
 
