@@ -36,7 +36,7 @@ use storage::engine::Error as EngineError;
 use server::transport::RaftStoreRouter;
 use server::snap::Task as SnapTask;
 use server::metrics::*;
-use server::Error;
+use server::{CopResponseSink, Error};
 use raftstore::store::Msg as StoreMessage;
 use coprocessor::{EndPointTask, RequestTask};
 
@@ -750,25 +750,12 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             .with_label_values(&[label])
             .start_coarse_timer();
 
-        let (cb, future) = make_callback();
-        let res = self.end_point_scheduler.schedule(EndPointTask::Request(
-            RequestTask::new(req, cb, self.recursion_limit),
-        ));
-        if let Err(e) = res {
+        let req_task = RequestTask::new(req, CopResponseSink::Unary(sink), self.recursion_limit);
+        let task = EndPointTask::Request(req_task);
+        if let Err(e) = self.end_point_scheduler.schedule(task) {
             self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
             return;
         }
-
-        let future = future
-            .map_err(Error::from)
-            .and_then(|res| sink.success(res).map_err(Error::from))
-            .map(|_| timer.observe_duration())
-            .map_err(move |e| {
-                debug!("{} failed: {:?}", label, e);
-                GRPC_MSG_FAIL_COUNTER.with_label_values(&[label]).inc();
-            });
-
-        ctx.spawn(future);
     }
 
     fn raft(

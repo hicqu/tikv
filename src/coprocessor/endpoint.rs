@@ -14,14 +14,18 @@
 use std::usize;
 use std::time::Duration;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::mem;
+
+use protobuf::{CodedInputStream, Message as PbMsg};
+use futures::future;
+use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
 
 use tipb::select::{self, Chunk, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
 use tipb::executor::ExecType;
 use tipb::schema::ColumnInfo;
-use protobuf::{CodedInputStream, Message as PbMsg};
 use kvproto::coprocessor::{KeyRange, Request, Response};
 use kvproto::errorpb::{self, ServerIsBusy};
 use kvproto::kvrpcpb::{CommandPri, IsolationLevel};
@@ -30,7 +34,7 @@ use util::time::{duration_to_sec, Instant};
 use util::worker::{BatchRunnable, FutureScheduler, Scheduler};
 use util::collections::HashMap;
 use util::threadpool::{Context, ContextFactory, ThreadPool, ThreadPoolBuilder};
-use server::{Config, OnResponse};
+use server::{Config, CopResponseSink};
 use storage::{self, engine, Engine, FlowStatistics, Snapshot, Statistics, StatisticsSummary};
 use storage::engine::Error as EngineError;
 use pd::PdTask;
@@ -68,10 +72,11 @@ pub struct Host {
     sched: Scheduler<Task>,
     reqs: HashMap<u64, Vec<RequestTask>>,
     last_req_id: u64,
-    pool: ThreadPool<CopContext>,
-    low_priority_pool: ThreadPool<CopContext>,
-    high_priority_pool: ThreadPool<CopContext>,
+    pool: CpuPool,
+    low_priority_pool: CpuPool,
+    high_priority_pool: CpuPool,
     max_running_task_count: usize,
+    running_task_count: Arc<AtomicUsize>,
 }
 
 pub type CopRequestStatistics = HashMap<u64, FlowStatistics>;
@@ -164,76 +169,106 @@ impl Host {
         cfg: &Config,
         r: FutureScheduler<PdTask>,
     ) -> Host {
+        let create_pool = |name_prefix: &str, size: usize| {
+            CpuPoolBuilder::new()
+                .name(name_prefix)
+                .pool_size(size)
+                .create()
+        };
+
         Host {
             engine: engine,
             sched: scheduler,
             reqs: HashMap::default(),
             last_req_id: 0,
+            pool: create_pool("endpoint-normal-pool", cfg.end_point_concurrency),
+            low_priority_pool: create_pool("endpoint-low-pool", cfg.end_point_concurrency),
+            high_priority_pool: create_pool("endpoint-high-pool", cfg.end_point_concurrency),
             max_running_task_count: cfg.end_point_max_tasks,
-            pool: ThreadPoolBuilder::new(
-                thd_name!("endpoint-normal-pool"),
-                CopContextFactory { sender: r.clone() },
-            ).thread_count(cfg.end_point_concurrency)
-                .stack_size(cfg.end_point_stack_size.0 as usize)
-                .build(),
-            low_priority_pool: ThreadPoolBuilder::new(
-                thd_name!("endpoint-low-pool"),
-                CopContextFactory { sender: r.clone() },
-            ).thread_count(cfg.end_point_concurrency)
-                .stack_size(cfg.end_point_stack_size.0 as usize)
-                .build(),
-            high_priority_pool: ThreadPoolBuilder::new(
-                thd_name!("endpoint-high-pool"),
-                CopContextFactory { sender: r.clone() },
-            ).thread_count(cfg.end_point_concurrency)
-                .stack_size(cfg.end_point_stack_size.0 as usize)
-                .build(),
+            running_task_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn running_task_count(&self) -> usize {
-        self.pool.get_task_count() + self.low_priority_pool.get_task_count() +
-            self.high_priority_pool.get_task_count()
+        self.running_task_count.load(Ordering::Acquire)
+    }
+
+    fn notify_batch_failed<E: Into<Error> + Debug>(e: E, reqs: Vec<RequestTask>) {
+        debug!("failed to handle batch request: {:?}", e);
+        let resp = err_resp(e.into());
+        for t in reqs {
+            t.respond(resp.clone())
+        }
+    }
+
+    fn notify_batch_failed_by_id<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
+        let reqs = self.reqs.remove(batch_id).unwrap();
+        Host::notify_batch_failed(e, reqs);
+    }
+
+    fn handle_request_on_sanpshot(&mut self, snap: Box<Snapshot>, mut t: RequestTask) {
+        let pri = t.priority();
+        COPR_PENDING_REQS
+            .with_label_values(&[t.ctx.get_scan_tag(), get_req_pri_str(pri)])
+            .add(1.0);
+
+        t.stop_record_waiting();
+        if let Err(e) = t.check_outdated() {
+            t.on_error(e);
+        }
+
+        let pool = match pri {
+            CommandPri::Low => &mut self.low_priority_pool,
+            CommandPri::High => &mut self.high_priority_pool,
+            CommandPri::Normal => &mut self.pool,
+        };
+
+        let mut statistics = Statistics::default();
+        let (ranges, req_ctx) = (t.req.take_ranges().into_vec(), t.ctx);
+
+        let dispatch_request = move || -> Result<()> {
+            match t.cop_req {
+                Ok(CopRequest::Select(sel)) => {
+                    let mut ctx = SelectContext::new(sel, snap, req_ctx)?;
+                    let res = ctx.handle_request(ranges)?;
+                    ctx.collect_statistics_into(&mut statistics);
+                    t.resp_sink.respond(res)
+                }
+                Ok(CopRequest::DAG(dag)) => {
+                    let ranges = t.req.take_ranges().into_vec();
+                    let mut ctx = DAGContext::new(dag, ranges, snap, req_ctx)?;
+                    let res = ctx.handle_request();
+                    ctx.collect_statistics_into(&mut statistics);
+                    t.resp_sink.respond(res)
+                }
+                Ok(CopRequest::Analyze(analyze)) => {
+                    let mut ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
+                    let res = ctx.handle_request();
+                    ctx.collect_statistics_into(&mut statistics);
+                    t.resp_sink.respond(res)
+                }
+                Err(e) => t.resp_sink.on_error(e),
+            }
+        };
+        dispatch_request();
     }
 
     fn handle_snapshot_result(&mut self, id: u64, snapshot: engine::Result<Box<Snapshot>>) {
-        let reqs = self.reqs.remove(&id).unwrap();
         let snap = match snapshot {
             Ok(s) => s,
             Err(e) => {
-                notify_batch_failed(e, reqs);
+                self.notify_batch_failed_by_id(e, id);
                 return;
             }
         };
 
         if self.running_task_count() >= self.max_running_task_count {
-            notify_batch_failed(Error::Full(self.max_running_task_count), reqs);
+            self.notify_batch_failed_by_id(Error::Full(self.max_running_task_count), id);
             return;
         }
 
-        for req in reqs {
-            let pri = req.priority();
-            let pri_str = get_req_pri_str(pri);
-            let type_str = req.ctx.get_scan_tag();
-            COPR_PENDING_REQS
-                .with_label_values(&[type_str, pri_str])
-                .add(1.0);
-            let end_point = TiDbEndPoint::new(snap.clone());
-
-            let pool = match pri {
-                CommandPri::Low => &mut self.low_priority_pool,
-                CommandPri::High => &mut self.high_priority_pool,
-                CommandPri::Normal => &mut self.pool,
-            };
-            pool.execute(move |ctx: &mut CopContext| {
-                let region_id = req.req.get_context().get_region_id();
-                let stats = end_point.handle_request(req);
-                ctx.add_statistics(type_str, &stats);
-                ctx.add_statistics_by_region(region_id, &stats);
-                COPR_PENDING_REQS
-                    .with_label_values(&[type_str, pri_str])
-                    .dec();
-            });
+        for req in self.reqs.remove(&id).unwrap() {
+            self.handle_request(req);
         }
     }
 }
@@ -292,27 +327,33 @@ impl ReqContext {
 
 pub struct RequestTask {
     req: Request,
-    start_ts: Option<u64>,
-    wait_time: Option<f64>,
+    start_ts: u64,
+    wait_time: f64,
     timer: Instant,
-    statistics: Statistics,
-    on_resp: OnResponse,
-    cop_req: Option<Result<CopRequest>>,
-    ctx: Arc<ReqContext>,
+    cop_req: CopRequest,
+    ctx: ReqContext,
+    resp_sink: Option<CopResponseSink>,
 }
 
 impl RequestTask {
-    pub fn new(req: Request, on_resp: OnResponse, recursion_limit: u32) -> RequestTask {
+    pub fn new(req: Request, resp_sink: CopResponseSink, recursion_limit: u32) -> RequestTask {
+        let req_ctx = ReqContext {
+            deadline: deadline,
+            isolation_level: req.get_context().get_isolation_level(),
+            fill_cache: !req.get_context().get_not_fill_cache(),
+            table_scan: table_scan,
+        };
+
         let timer = Instant::now_coarse();
         let deadline = timer + Duration::from_secs(REQUEST_MAX_HANDLE_SECS);
-        let mut start_ts = None;
-        let tp = req.get_tp();
+
+        let start_ts: u64;
         let mut table_scan = false;
-        let cop_req = match tp {
-            REQ_TYPE_SELECT | REQ_TYPE_INDEX => {
-                if tp == REQ_TYPE_SELECT {
-                    table_scan = true;
-                }
+
+        let cop_req = match req.get_tp() {
+            tp @ REQ_TYPE_SELECT | REQ_TYPE_INDEX => {
+                table_scan = tp == REQ_TYPE_SELECT;
+
                 let mut is = CodedInputStream::from_bytes(req.get_data());
                 is.set_recursion_limit(recursion_limit);
                 let mut sel = SelectRequest::new();
@@ -356,20 +397,13 @@ impl RequestTask {
 
             _ => Err(box_err!("unsupported tp {}", tp)),
         };
-        let req_ctx = ReqContext {
-            deadline: deadline,
-            isolation_level: req.get_context().get_isolation_level(),
-            fill_cache: !req.get_context().get_not_fill_cache(),
-            table_scan: table_scan,
-        };
         RequestTask {
             req: req,
             start_ts: start_ts,
-            wait_time: None,
+            wait_time: 0,
             timer: timer,
-            statistics: Default::default(),
-            on_resp: on_resp,
-            cop_req: Some(cop_req),
+            resp_sink: Some(resp_sink),
+            cop_req: cop_req,
             ctx: Arc::new(req_ctx),
         }
     }
@@ -407,7 +441,6 @@ impl RequestTask {
             .with_label_values(&[type_str])
             .observe(self.statistics.total_op_count() as f64);
 
-
         if handle_time > SLOW_QUERY_LOWER_BOUND {
             info!(
                 "[region {}] handle {:?} [{}] takes {:?} [waiting: {:?}, keys: {}, hit: {}, \
@@ -427,6 +460,28 @@ impl RequestTask {
 
     pub fn priority(&self) -> CommandPri {
         self.req.get_context().get_priority()
+    }
+
+    fn respond(self, resp: Response) {
+        // TODO: real logic here.
+        self.stop_record_handling();
+        match self.resp_sink {
+            Unary(sink) => sink.success(resp),
+            Streaming(sink) => sink.send_all(resp),
+        }
+    }
+
+    fn on_error(self, e: Error) {
+        let resp = err_resp(e);
+        self.respond(resp)
+    }
+
+    fn get_request_key(&self) -> (u64, u64, u64) {
+        let ctx = self.req.get_context();
+        let region_id = ctx.get_region_id();
+        let version = ctx.get_region_epoch().get_version();
+        let peer_id = ctx.get_peer().get_id();
+        (region_id, version, peer_id)
     }
 }
 
@@ -452,19 +507,12 @@ impl BatchRunnable<Task> for Host {
             match task {
                 Task::Request(req) => {
                     if let Err(e) = req.check_outdated() {
-                        on_error(e, req);
+                        self.pool.spawn(req.on_error(e)).forget();
                         continue;
                     }
-                    let key = {
-                        let ctx = req.req.get_context();
-                        (
-                            ctx.get_region_id(),
-                            ctx.get_region_epoch().get_version(),
-                            ctx.get_peer().get_id(),
-                        )
-                    };
-                    let group = grouped_reqs.entry(key).or_insert_with(Vec::new);
-                    group.push(req);
+                    let key = req.get_request_key();
+                    grouped_reqs.entry(key).or_insert_with(Vec::new).push(req);
+                    self.running_task_count.fetch_add(1, Ordering::Release);
                 }
                 Task::SnapRes(q_id, snap_res) => {
                     self.handle_snapshot_result(q_id, snap_res);
@@ -479,7 +527,7 @@ impl BatchRunnable<Task> for Host {
                         reqs[0].req.get_context(),
                         box move |(_, res)| sched.schedule(Task::SnapRes(id, res)).unwrap(),
                     ) {
-                        notify_batch_failed(e, reqs);
+                        self.notify_batch_failed(e, reqs);
                     } else {
                         self.reqs.insert(id, reqs);
                     }
@@ -508,12 +556,8 @@ impl BatchRunnable<Task> for Host {
             let mut retry = Vec::new();
             for (id, res) in (start_id..end_id + 1).zip(results) {
                 match res {
-                    Some((_, res)) => {
-                        ready.push((id, res));
-                    }
-                    None => {
-                        retry.push(id);
-                    }
+                    Some((_, res)) => ready.push((id, res)),
+                    None => retry.push((id,)),
                 }
             }
 
@@ -531,27 +575,15 @@ impl BatchRunnable<Task> for Host {
         BATCH_REQUEST_TASKS
             .with_label_values(&["all"])
             .observe(batch.len() as f64);
+
         if let Err(e) = self.engine.async_batch_snapshot(batch, on_finished) {
             for id in start_id..end_id + 1 {
-                let reqs = self.reqs.remove(&id).unwrap();
                 let err = e.maybe_clone().unwrap_or_else(|| {
                     error!("async snapshot batch failed error {:?}", e);
                     EngineError::Other(box_err!("{:?}", e))
                 });
-                notify_batch_failed(err, reqs);
+                self.notify_batch_failed(err, id);
             }
-        }
-    }
-
-    fn shutdown(&mut self) {
-        if let Err(e) = self.pool.stop() {
-            warn!("Stop threadpool failed with {:?}", e);
-        }
-        if let Err(e) = self.low_priority_pool.stop() {
-            warn!("Stop threadpool failed with {:?}", e);
-        }
-        if let Err(e) = self.high_priority_pool.stop() {
-            warn!("Stop threadpool failed with {:?}", e);
         }
     }
 }
@@ -593,79 +625,6 @@ fn err_resp(e: Error) -> Response {
         }
     }
     resp
-}
-
-fn on_error(e: Error, req: RequestTask) -> Statistics {
-    let resp = err_resp(e);
-    respond(resp, req)
-}
-
-fn notify_batch_failed<E: Into<Error> + Debug>(e: E, reqs: Vec<RequestTask>) {
-    debug!("failed to handle batch request: {:?}", e);
-    let resp = err_resp(e.into());
-    for t in reqs {
-        respond(resp.clone(), t);
-    }
-}
-
-fn respond(resp: Response, mut t: RequestTask) -> Statistics {
-    t.stop_record_handling();
-    (t.on_resp)(resp);
-    t.statistics
-}
-
-pub struct TiDbEndPoint {
-    snap: Box<Snapshot>,
-}
-
-impl TiDbEndPoint {
-    pub fn new(snap: Box<Snapshot>) -> TiDbEndPoint {
-        TiDbEndPoint { snap: snap }
-    }
-}
-
-impl TiDbEndPoint {
-    fn handle_request(self, mut t: RequestTask) -> Statistics {
-        t.stop_record_waiting();
-
-        if let Err(e) = t.check_outdated() {
-            return on_error(e, t);
-        }
-        let resp = match t.cop_req.take().unwrap() {
-            Ok(CopRequest::Select(sel)) => self.handle_select(sel, &mut t),
-            Ok(CopRequest::DAG(dag)) => self.handle_dag(dag, &mut t),
-            Ok(CopRequest::Analyze(analyze)) => self.handle_analyze(analyze, &mut t),
-            Err(err) => Err(err),
-        };
-        match resp {
-            Ok(r) => respond(r, t),
-            Err(e) => on_error(e, t),
-        }
-    }
-
-    fn handle_select(self, sel: SelectRequest, t: &mut RequestTask) -> Result<Response> {
-        let mut ctx = SelectContext::new(sel, self.snap, t.ctx.clone())?;
-        let ranges = t.req.take_ranges().into_vec();
-        let res = ctx.handle_request(ranges)?;
-        ctx.collect_statistics_into(&mut t.statistics);
-        Ok(res)
-    }
-
-    pub fn handle_dag(self, dag: DAGRequest, t: &mut RequestTask) -> Result<Response> {
-        let ranges = t.req.take_ranges().into_vec();
-        let mut ctx = DAGContext::new(dag, ranges, self.snap, t.ctx.clone())?;
-        let res = ctx.handle_request();
-        ctx.collect_statistics_into(&mut t.statistics);
-        res
-    }
-
-    pub fn handle_analyze(self, analyze: AnalyzeReq, t: &mut RequestTask) -> Result<Response> {
-        let ranges = t.req.take_ranges().into_vec();
-        let mut ctx = AnalyzeContext::new(analyze, ranges, self.snap, t.ctx.as_ref());
-        let res = ctx.handle_request();
-        ctx.collect_statistics_into(&mut t.statistics);
-        res
-    }
 }
 
 pub fn to_pb_error(err: &Error) -> select::Error {

@@ -11,8 +11,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::boxed::FnBox;
-use kvproto::coprocessor::Response;
 mod metrics;
 mod service;
 mod raft_client;
@@ -25,6 +23,10 @@ pub mod node;
 pub mod resolve;
 pub mod snap;
 
+use grpc::{ServerStreamingSink, UnarySink};
+
+use kvproto::coprocessor::Response;
+
 pub use self::config::{Config, DEFAULT_CLUSTER_ID, DEFAULT_LISTENING_ADDR};
 pub use self::errors::{Error, Result};
 pub use self::server::Server;
@@ -33,4 +35,7 @@ pub use self::node::{create_raft_storage, Node};
 pub use self::resolve::{PdStoreAddrResolver, StoreAddrResolver};
 pub use self::raft_client::RaftClient;
 
-pub type OnResponse = Box<FnBox(Response) + Send>;
+pub enum CopResponseSink {
+    Unary(UnarySink<Response>),
+    Streaming(ServerStreamingSink<Response>),
+}
