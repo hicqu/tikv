@@ -159,7 +159,6 @@ impl Context for CopContext {
                 error!("send coprocessor statistics: {:?}", e);
             };
         }
-
     }
 }
 

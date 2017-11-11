@@ -155,8 +155,6 @@ impl SelectContext {
             let h = box_try!(table::decode_handle(range.get_start()));
             row_count += self.core.handle_row(h, values)?;
         } else {
-            CORP_GET_OR_SCAN_COUNT.with_label_values(&["range"]).inc();
-
             self.set_scanner_on(range, ScanOn::Table)?;
             let scanner = self.scanner.as_mut().unwrap();
             while self.core.limit > row_count {
@@ -197,9 +195,7 @@ impl SelectContext {
     }
 
     fn get_idx_row_from_range(&mut self, r: KeyRange) -> Result<usize> {
-        CORP_GET_OR_SCAN_COUNT.with_label_values(&["range"]).inc();
         let mut row_cnt = 0;
-
         self.set_scanner_on(r, ScanOn::Index)?;
         let scanner = self.scanner.as_mut().unwrap();
         while row_cnt < self.core.limit {
