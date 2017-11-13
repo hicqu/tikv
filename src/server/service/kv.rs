@@ -18,7 +18,8 @@ use std::iter::{self, FromIterator};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use mio::Token;
-use grpc::{ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode, UnarySink};
+use grpc::{ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode,
+           ServerStreamingSink, UnarySink};
 use futures::{future, Future, Stream};
 use futures::sync::oneshot;
 use protobuf::RepeatedField;
@@ -86,13 +87,22 @@ impl<T: RaftStoreRouter + 'static> Service<T> {
         let status = RpcStatus::new(code, Some(format!("{}", err)));
         ctx.spawn(sink.fail(status).map_err(|_| ()));
     }
+
+    fn send_fail_status_to_stream<M>(
+        &self,
+        ctx: RpcContext,
+        sink: ServerStreamingSink<M>,
+        err: Error,
+        code: RpcStatusCode,
+    ) {
+        let status = RpcStatus::new(code, Some(format!("{}", err)));
+        ctx.spawn(sink.fail(status).map_err(|_| ()));
+    }
 }
 
 fn make_callback<T: Debug + Send + 'static>() -> (Box<FnBox(T) + Send>, oneshot::Receiver<T>) {
     let (tx, rx) = oneshot::channel();
-    let callback = move |resp| {
-        tx.send(resp).unwrap();
-    };
+    let callback = move |resp| { tx.send(resp).unwrap(); };
     (box callback, rx)
 }
 
@@ -400,9 +410,8 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             .collect();
 
         let (cb, future) = make_callback();
-        let res =
-            self.storage
-                .async_rollback(req.take_context(), keys, req.get_start_version(), cb);
+        let res = self.storage
+            .async_rollback(req.take_context(), keys, req.get_start_version(), cb);
         if let Err(e) = res {
             self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
             return;
@@ -688,9 +697,8 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             .start_coarse_timer();
 
         let (cb, future) = make_callback();
-        let res =
-            self.storage
-                .async_raw_put(req.take_context(), req.take_key(), req.take_value(), cb);
+        let res = self.storage
+            .async_raw_put(req.take_context(), req.take_key(), req.take_value(), cb);
         if let Err(e) = res {
             self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
             return;
@@ -758,36 +766,25 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
     }
 
     fn coprocessor(&self, ctx: RpcContext, req: Request, sink: UnarySink<Response>) {
-        /*******
-        let timer = GRPC_MSG_HISTOGRAM_VEC
-            .with_label_values(&["coprocessor"])
-            .start_coarse_timer();
-        *******/
-
-        let deal = |scheduler: &Scheduler<EndPointTask>| {
-            let mut sink_opt = Some(CopResponseSink::Unary(sink));
-            let req_task = match RequestTask::new(req, &mut sink_opt, self.recursion_limit) {
-                Ok(req_task) => req_task,
-                Err(e) => {
-                    let sink = sink_opt.unwrap().take_unary();
-                    let error = box_err!(e);
-                    return Some((sink, error, RpcStatusCode::InvalidArgument));
-                }
-            };
-
-            match scheduler.schedule(EndPointTask::Request(req_task)) {
-                Err(Stopped(EndPointTask::Request(mut req_task))) => {
-                    let sink = req_task.take_on_finish_sink().take_unary();
-                    let error = Error::from(Stopped(EndPointTask::Request(req_task)));
-                    return Some((sink, error, RpcStatusCode::ResourceExhausted));
-                }
-                Ok(_) => return None,
-                _ => unreachable!(),
-            }
-        };
-
-        if let Some((sink, error, code)) = deal(&self.end_point_scheduler) {
+        // TODO: add metrics.
+        if let Some((sink, error, code)) =
+            coprocessor_dispatch(&self.end_point_scheduler, req, self.recursion_limit, sink)
+        {
             self.send_fail_status(ctx, sink, error, code);
+        }
+    }
+
+    fn coprocessor_stream(
+        &self,
+        ctx: RpcContext,
+        req: Request,
+        sink: ServerStreamingSink<Response>,
+    ) {
+        // TODO: add metrics.
+        if let Some((sink, error, code)) =
+            coprocessor_dispatch(&self.end_point_scheduler, req, self.recursion_limit, sink)
+        {
+            self.send_fail_status_to_stream(ctx, sink, error, code);
         }
     }
 
@@ -1030,12 +1027,14 @@ fn extract_committed(err: &storage::Error) -> Option<u64> {
 fn extract_key_error(err: &storage::Error) -> KeyError {
     let mut key_error = KeyError::new();
     match *err {
-        storage::Error::Txn(TxnError::Mvcc(MvccError::KeyIsLocked {
-            ref key,
-            ref primary,
-            ts,
-            ttl,
-        })) => {
+        storage::Error::Txn(
+            TxnError::Mvcc(MvccError::KeyIsLocked {
+                ref key,
+                ref primary,
+                ts,
+                ttl,
+            }),
+        ) => {
             let mut lock_info = LockInfo::new();
             lock_info.set_key(key.to_owned());
             lock_info.set_primary_lock(primary.to_owned());
@@ -1137,5 +1136,38 @@ fn extract_key_errors(res: storage::Result<Vec<storage::Result<()>>>) -> Vec<Key
             })
             .collect(),
         Err(e) => vec![extract_key_error(&e)],
+    }
+}
+
+/// dispatch coprocessor or coprocessor_stream requests.
+/// Return None on success, or return a (Sink, Error, RpcStatusCode) tuple.
+fn coprocessor_dispatch<S>(
+    scheduler: &Scheduler<EndPointTask>,
+    req: Request,
+    recursion_limit: u32,
+    sink: S,
+) -> Option<(S, Error, RpcStatusCode)>
+where
+    S: From<CopResponseSink>,
+    CopResponseSink: From<S>,
+{
+    let mut sink_opt = Some(CopResponseSink::from(sink));
+    let req_task = match RequestTask::new(req, &mut sink_opt, recursion_limit) {
+        Ok(req_task) => req_task,
+        Err(e) => {
+            let sink: S = S::from(sink_opt.unwrap());
+            let error = box_err!(e);
+            return Some((sink, error, RpcStatusCode::InvalidArgument));
+        }
+    };
+
+    match scheduler.schedule(EndPointTask::Request(req_task)) {
+        Err(Stopped(EndPointTask::Request(mut req_task))) => {
+            let sink = S::from(req_task.take_on_finish_sink());
+            let error = Error::from(Stopped(EndPointTask::Request(req_task)));
+            return Some((sink, error, RpcStatusCode::ResourceExhausted));
+        }
+        Ok(_) => return None,
+        _ => unreachable!(),
     }
 }

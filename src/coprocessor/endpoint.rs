@@ -16,7 +16,6 @@ use std::time::Duration;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt::{self, Debug, Display, Formatter};
-use std::mem;
 
 use protobuf::{CodedInputStream, Message as PbMsg};
 use futures::{stream, Future, Stream};
@@ -34,9 +33,8 @@ use kvproto::kvrpcpb::{CommandPri, IsolationLevel};
 use util::time::{duration_to_sec, Instant};
 use util::worker::{BatchRunnable, FutureScheduler, Scheduler};
 use util::collections::HashMap;
-use util::threadpool::{Context, ContextFactory};
 use server::{Config, CopResponseSink};
-use storage::{self, engine, Engine, FlowStatistics, Snapshot, Statistics, StatisticsSummary};
+use storage::{self, engine, Engine, Snapshot, Statistics};
 use storage::engine::Error as EngineError;
 use pd::PdTask;
 
@@ -53,6 +51,7 @@ pub const REQ_TYPE_INDEX: i64 = 102;
 pub const REQ_TYPE_DAG: i64 = 103;
 pub const REQ_TYPE_ANALYZE: i64 = 104;
 pub const BATCH_ROW_COUNT: usize = 64;
+pub const CHUNKS_PER_STREAM: usize = 1024;
 
 // If a request has been handled for more than 60 seconds, the client should
 // be timeout already, so it can be safely aborted.
@@ -80,94 +79,12 @@ pub struct Host {
     running_task_count: Arc<AtomicUsize>,
 }
 
-pub type CopRequestStatistics = HashMap<u64, FlowStatistics>;
-
-pub trait CopSender: Send + Clone {
-    fn send(&self, CopRequestStatistics) -> Result<()>;
-}
-
-struct CopContextFactory {
-    sender: FutureScheduler<PdTask>,
-}
-
-impl ContextFactory<CopContext> for CopContextFactory {
-    fn create(&self) -> CopContext {
-        CopContext {
-            sender: self.sender.clone(),
-            select_stats: Default::default(),
-            index_stats: Default::default(),
-            request_stats: HashMap::default(),
-        }
-    }
-}
-
-struct CopContext {
-    select_stats: StatisticsSummary,
-    index_stats: StatisticsSummary,
-    request_stats: CopRequestStatistics,
-    sender: FutureScheduler<PdTask>,
-}
-
-impl CopContext {
-    fn add_statistics(&mut self, type_str: &str, stats: &Statistics) {
-        self.get_statistics(type_str).add_statistics(stats);
-    }
-
-    fn get_statistics(&mut self, type_str: &str) -> &mut StatisticsSummary {
-        match type_str {
-            STR_REQ_TYPE_SELECT => &mut self.select_stats,
-            STR_REQ_TYPE_INDEX => &mut self.index_stats,
-            _ => {
-                warn!("unknown STR_REQ_TYPE: {}", type_str);
-                &mut self.select_stats
-            }
-        }
-    }
-
-    fn add_statistics_by_region(&mut self, region_id: u64, stats: &Statistics) {
-        let flow_stats = self.request_stats
-            .entry(region_id)
-            .or_insert_with(FlowStatistics::default);
-        flow_stats.add(&stats.write.flow_stats);
-        flow_stats.add(&stats.data.flow_stats);
-    }
-}
-
-impl Context for CopContext {
-    fn on_tick(&mut self) {
-        for type_str in &[STR_REQ_TYPE_SELECT, STR_REQ_TYPE_INDEX] {
-            let this_statistics = self.get_statistics(type_str);
-            if this_statistics.count == 0 {
-                continue;
-            }
-            for (cf, details) in this_statistics.stat.details() {
-                for (tag, count) in details {
-                    COPR_SCAN_DETAILS
-                        .with_label_values(&[type_str, cf, tag])
-                        .inc_by(count as f64)
-                        .unwrap();
-                }
-            }
-            *this_statistics = Default::default();
-        }
-        if !self.request_stats.is_empty() {
-            let mut to_send_stats = HashMap::default();
-            mem::swap(&mut to_send_stats, &mut self.request_stats);
-            if let Err(e) = self.sender.schedule(PdTask::ReadStats {
-                read_stats: to_send_stats,
-            }) {
-                error!("send coprocessor statistics: {:?}", e);
-            };
-        }
-    }
-}
-
 impl Host {
     pub fn new(
         engine: Box<Engine>,
         scheduler: Scheduler<Task>,
         cfg: &Config,
-        _r: FutureScheduler<PdTask>,
+        _: FutureScheduler<PdTask>,
     ) -> Host {
         let create_pool = |name_prefix: &str, size: usize| {
             CpuPoolBuilder::new()
@@ -196,7 +113,7 @@ impl Host {
     fn notify_batch_failed_by_id<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
         debug!("failed to handle batch request: {:?}", e);
         let resp = err_resp(e.into());
-        for t in self.reqs.remove(&batch_id).unwrap() {
+        for mut t in self.reqs.remove(&batch_id).unwrap() {
             t.on_finish.respond(resp.clone());
         }
     }
@@ -220,39 +137,33 @@ impl Host {
             return;
         }
 
-        let (mut req, cop_req, req_ctx, mut on_finish) =
-            (t.req, t.cop_req, t.ctx, Some(t.on_finish));
+        let (mut req, cop_req, req_ctx, mut on_finish) = (t.req, t.cop_req, t.ctx, t.on_finish);
 
         let ranges = req.take_ranges().into_vec();
-        let dispatch = move |on_finish: &mut Option<OnRequestFinish>| {
+        let dispatch = move |on_finish: &mut OnRequestFinish| {
             match cop_req {
                 // TODO: here we don't need Arc.
                 CopRequest::Select(sel) => {
                     let mut ctx = SelectContext::new(sel, snap, Arc::new(req_ctx))?;
                     let res = ctx.handle_request(ranges)?;
-                    let mut on_finish = on_finish.take().unwrap();
                     ctx.collect_statistics_into(&mut on_finish.statistics);
                     Ok(on_finish.respond(res))
                 }
                 CopRequest::DAG(dag) => {
                     let mut ctx = DAGContext::new(dag, ranges, snap, Arc::new(req_ctx))?;
                     let res = ctx.handle_request()?;
-                    let mut on_finish = on_finish.take().unwrap();
                     ctx.collect_statistics_into(&mut on_finish.statistics);
                     Ok(on_finish.respond(res))
                 }
                 CopRequest::Analyze(analyze) => {
-                    let mut ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
-                    let res = ctx.handle_request()?;
-                    let mut on_finish = on_finish.take().unwrap();
-                    ctx.collect_statistics_into(&mut on_finish.statistics);
+                    let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
+                    let res = ctx.handle_request(&mut on_finish.statistics)?;
                     Ok(on_finish.respond(res))
                 }
             }
         };
 
-        let future =
-            dispatch(&mut on_finish).unwrap_or_else(|e| on_finish.take().unwrap().on_error(e));
+        let future = dispatch(&mut on_finish).unwrap_or_else(|e| on_finish.on_error(e));
         pool.spawn(future).forget();
     }
 
@@ -343,9 +254,9 @@ struct OnRequestFinish {
 }
 
 impl OnRequestFinish {
-    fn respond(mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+    fn respond(&mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         self.stop_record_handling();
-        match self.resp_sink {
+        match self.resp_sink.take() {
             Some(CopResponseSink::Unary(sink)) => box sink.success(resp),
             Some(CopResponseSink::Streaming(sink)) => {
                 let write_flags = WriteFlags::default();
@@ -356,7 +267,7 @@ impl OnRequestFinish {
         }
     }
 
-    fn on_error(self, e: Error) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+    fn on_error(&mut self, e: Error) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         let resp = err_resp(e);
         self.respond(resp)
     }
@@ -525,7 +436,7 @@ impl BatchRunnable<Task> for Host {
         let mut grouped_reqs = map![];
         for task in tasks.drain(..) {
             match task {
-                Task::Request(req) => {
+                Task::Request(mut req) => {
                     if let Err(e) = req.check_outdated() {
                         self.pool.spawn(req.on_finish.on_error(e)).forget();
                         continue;
@@ -759,9 +670,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut task = RequestTask::new(
             Request::new(),
-            box move |msg| {
-                tx.send(msg).unwrap();
-            },
+            box move |msg| { tx.send(msg).unwrap(); },
             1000,
         );
         let ctx = ReqContext {

@@ -40,16 +40,30 @@ pub enum CopResponseSink {
     Streaming(ServerStreamingSink<Response>),
 }
 
-impl CopResponseSink {
-    pub fn take_unary(self) -> UnarySink<Response> {
-        match self {
+impl From<UnarySink<Response>> for CopResponseSink {
+    fn from(s: UnarySink<Response>) -> CopResponseSink {
+        CopResponseSink::Unary(s)
+    }
+}
+
+impl From<ServerStreamingSink<Response>> for CopResponseSink {
+    fn from(s: ServerStreamingSink<Response>) -> CopResponseSink {
+        CopResponseSink::Streaming(s)
+    }
+}
+
+impl From<CopResponseSink> for UnarySink<Response> {
+    fn from(s: CopResponseSink) -> UnarySink<Response> {
+        match s {
             CopResponseSink::Unary(sink) => sink,
             _ => unreachable!(),
         }
     }
+}
 
-    pub fn take_streaming(self) -> ServerStreamingSink<Response> {
-        match self {
+impl From<CopResponseSink> for ServerStreamingSink<Response> {
+    fn from(s: CopResponseSink) -> ServerStreamingSink<Response> {
+        match s {
             CopResponseSink::Streaming(sink) => sink,
             _ => unreachable!(),
         }
