@@ -90,7 +90,9 @@ impl<T: RaftStoreRouter + 'static> Service<T> {
 
 fn make_callback<T: Debug + Send + 'static>() -> (Box<FnBox(T) + Send>, oneshot::Receiver<T>) {
     let (tx, rx) = oneshot::channel();
-    let callback = move |resp| { tx.send(resp).unwrap(); };
+    let callback = move |resp| {
+        tx.send(resp).unwrap();
+    };
     (box callback, rx)
 }
 
@@ -398,8 +400,9 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             .collect();
 
         let (cb, future) = make_callback();
-        let res = self.storage
-            .async_rollback(req.take_context(), keys, req.get_start_version(), cb);
+        let res =
+            self.storage
+                .async_rollback(req.take_context(), keys, req.get_start_version(), cb);
         if let Err(e) = res {
             self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
             return;
@@ -685,8 +688,9 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             .start_coarse_timer();
 
         let (cb, future) = make_callback();
-        let res = self.storage
-            .async_raw_put(req.take_context(), req.take_key(), req.take_value(), cb);
+        let res =
+            self.storage
+                .async_raw_put(req.take_context(), req.take_key(), req.take_value(), cb);
         if let Err(e) = res {
             self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
             return;
@@ -754,14 +758,15 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
     }
 
     fn coprocessor(&self, ctx: RpcContext, req: Request, sink: UnarySink<Response>) {
-        let label = "coprocessor";
+        /*******
         let timer = GRPC_MSG_HISTOGRAM_VEC
-            .with_label_values(&[label])
+            .with_label_values(&["coprocessor"])
             .start_coarse_timer();
+        *******/
 
-        let deal = |scheduler: &mut Scheduler<EndPointTask>| {
+        let deal = |scheduler: &Scheduler<EndPointTask>| {
             let mut sink_opt = Some(CopResponseSink::Unary(sink));
-            let mut req_task = match RequestTask::new(req, &mut sink_opt, self.recursion_limit) {
+            let req_task = match RequestTask::new(req, &mut sink_opt, self.recursion_limit) {
                 Ok(req_task) => req_task,
                 Err(e) => {
                     let sink = sink_opt.unwrap().take_unary();
@@ -771,7 +776,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             };
 
             match scheduler.schedule(EndPointTask::Request(req_task)) {
-                Err(Stopped(EndPointTask::Request(req_task))) => {
+                Err(Stopped(EndPointTask::Request(mut req_task))) => {
                     let sink = req_task.take_on_finish_sink().take_unary();
                     let error = Error::from(Stopped(EndPointTask::Request(req_task)));
                     return Some((sink, error, RpcStatusCode::ResourceExhausted));
@@ -781,7 +786,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             }
         };
 
-        if let Some((sink, error, code)) = deal(&mut self.end_point_scheduler) {
+        if let Some((sink, error, code)) = deal(&self.end_point_scheduler) {
             self.send_fail_status(ctx, sink, error, code);
         }
     }
@@ -1025,14 +1030,12 @@ fn extract_committed(err: &storage::Error) -> Option<u64> {
 fn extract_key_error(err: &storage::Error) -> KeyError {
     let mut key_error = KeyError::new();
     match *err {
-        storage::Error::Txn(
-            TxnError::Mvcc(MvccError::KeyIsLocked {
-                ref key,
-                ref primary,
-                ts,
-                ttl,
-            }),
-        ) => {
+        storage::Error::Txn(TxnError::Mvcc(MvccError::KeyIsLocked {
+            ref key,
+            ref primary,
+            ts,
+            ttl,
+        })) => {
             let mut lock_info = LockInfo::new();
             lock_info.set_key(key.to_owned());
             lock_info.set_primary_lock(primary.to_owned());

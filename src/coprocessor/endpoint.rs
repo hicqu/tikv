@@ -19,9 +19,9 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::mem;
 
 use protobuf::{CodedInputStream, Message as PbMsg};
-use futures::{future, stream, Future};
+use futures::{stream, Future, Stream};
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
-use grpc::Error as GrpcError;
+use grpc::{Error as GrpcError, WriteFlags};
 
 use tipb::select::{self, Chunk, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
@@ -34,7 +34,7 @@ use kvproto::kvrpcpb::{CommandPri, IsolationLevel};
 use util::time::{duration_to_sec, Instant};
 use util::worker::{BatchRunnable, FutureScheduler, Scheduler};
 use util::collections::HashMap;
-use util::threadpool::{Context, ContextFactory, ThreadPool, ThreadPoolBuilder};
+use util::threadpool::{Context, ContextFactory};
 use server::{Config, CopResponseSink};
 use storage::{self, engine, Engine, FlowStatistics, Snapshot, Statistics, StatisticsSummary};
 use storage::engine::Error as EngineError;
@@ -167,7 +167,7 @@ impl Host {
         engine: Box<Engine>,
         scheduler: Scheduler<Task>,
         cfg: &Config,
-        r: FutureScheduler<PdTask>,
+        _r: FutureScheduler<PdTask>,
     ) -> Host {
         let create_pool = |name_prefix: &str, size: usize| {
             CpuPoolBuilder::new()
@@ -193,28 +193,21 @@ impl Host {
         self.running_task_count.load(Ordering::Acquire)
     }
 
-    fn notify_batch_failed<E: Into<Error> + Debug>(e: E, reqs: Vec<RequestTask>) {
+    fn notify_batch_failed_by_id<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
         debug!("failed to handle batch request: {:?}", e);
         let resp = err_resp(e.into());
-        for t in reqs {
+        for t in self.reqs.remove(&batch_id).unwrap() {
             t.on_finish.respond(resp.clone());
         }
     }
 
-    fn notify_batch_failed_by_id<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
-        let reqs = self.reqs.remove(&batch_id).unwrap();
-        Host::notify_batch_failed(e, reqs);
-    }
-
     fn handle_request_on_sanpshot(&mut self, snap: Box<Snapshot>, mut t: RequestTask) {
+        t.on_finish.stop_record_waiting();
+
         let pri = t.priority();
         COPR_PENDING_REQS
             .with_label_values(&[t.ctx.get_scan_tag(), get_req_pri_str(pri)])
             .add(1.0);
-
-        if let Err(e) = t.check_outdated() {
-            t.on_finish.on_error(e);
-        }
 
         let pool = match pri {
             CommandPri::Low => &mut self.low_priority_pool,
@@ -222,35 +215,45 @@ impl Host {
             CommandPri::Normal => &mut self.pool,
         };
 
-        let mut on_finish = t.on_finish;
-        on_finish.stop_record_waiting();
-        let (ranges, req_ctx) = (t.req.take_ranges().into_vec(), t.ctx);
+        if let Err(e) = t.check_outdated() {
+            pool.spawn(t.on_finish.on_error(e)).forget();
+            return;
+        }
 
-        let dispatch_request = move || -> Result<_> {
-            match t.cop_req {
+        let (mut req, cop_req, req_ctx, mut on_finish) =
+            (t.req, t.cop_req, t.ctx, Some(t.on_finish));
+
+        let ranges = req.take_ranges().into_vec();
+        let dispatch = move |on_finish: &mut Option<OnRequestFinish>| {
+            match cop_req {
                 // TODO: here we don't need Arc.
                 CopRequest::Select(sel) => {
                     let mut ctx = SelectContext::new(sel, snap, Arc::new(req_ctx))?;
                     let res = ctx.handle_request(ranges)?;
+                    let mut on_finish = on_finish.take().unwrap();
                     ctx.collect_statistics_into(&mut on_finish.statistics);
-                    Ok(t.on_finish.respond(res))
+                    Ok(on_finish.respond(res))
                 }
                 CopRequest::DAG(dag) => {
-                    let ranges = t.req.take_ranges().into_vec();
                     let mut ctx = DAGContext::new(dag, ranges, snap, Arc::new(req_ctx))?;
                     let res = ctx.handle_request()?;
+                    let mut on_finish = on_finish.take().unwrap();
                     ctx.collect_statistics_into(&mut on_finish.statistics);
-                    Ok(t.on_finish.respond(res))
+                    Ok(on_finish.respond(res))
                 }
                 CopRequest::Analyze(analyze) => {
                     let mut ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
                     let res = ctx.handle_request()?;
+                    let mut on_finish = on_finish.take().unwrap();
                     ctx.collect_statistics_into(&mut on_finish.statistics);
-                    Ok(t.on_finish.respond(res))
+                    Ok(on_finish.respond(res))
                 }
             }
         };
-        dispatch_request();
+
+        let future =
+            dispatch(&mut on_finish).unwrap_or_else(|e| on_finish.take().unwrap().on_error(e));
+        pool.spawn(future).forget();
     }
 
     fn handle_snapshot_result(&mut self, id: u64, snapshot: engine::Result<Box<Snapshot>>) {
@@ -263,7 +266,8 @@ impl Host {
         };
 
         if self.running_task_count() >= self.max_running_task_count {
-            self.notify_batch_failed_by_id(Error::Full(self.max_running_task_count), id);
+            let error = Error::Full(self.max_running_task_count);
+            self.notify_batch_failed_by_id(error, id);
             return;
         }
 
@@ -326,7 +330,7 @@ impl ReqContext {
 }
 
 struct OnRequestFinish {
-    resp_sink: CopResponseSink,
+    resp_sink: Option<CopResponseSink>,
     region_id: u64,
     ranges_len: usize,
     first_range: Option<KeyRange>,
@@ -339,14 +343,16 @@ struct OnRequestFinish {
 }
 
 impl OnRequestFinish {
-    fn respond(self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+    fn respond(mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         self.stop_record_handling();
         match self.resp_sink {
-            CopResponseSink::Unary(sink) => box sink.success(resp),
-            CopResponseSink::Streaming(sink) => {
-                let stream = stream::once(resp);
-                box sink.send_all(stream)
+            Some(CopResponseSink::Unary(sink)) => box sink.success(resp),
+            Some(CopResponseSink::Streaming(sink)) => {
+                let write_flags = WriteFlags::default();
+                let stream = stream::once(Ok((resp, write_flags)));
+                box stream.forward(sink).map(|_| ())
             }
+            _ => unreachable!(),
         }
     }
 
@@ -356,7 +362,7 @@ impl OnRequestFinish {
     }
 
     fn stop_record_waiting(&mut self) {
-        if self.wait_time > 0 {
+        if self.wait_time > 0f64 {
             return;
         }
         self.wait_time = duration_to_sec(self.timer.elapsed());
@@ -414,32 +420,34 @@ impl RequestTask {
         resp_sink: &mut Option<CopResponseSink>,
         recursion_limit: u32,
     ) -> Result<RequestTask> {
-        let mut is = CodedInputStream::from_bytes(req.get_data());
-        is.set_recursion_limit(recursion_limit);
-
-        let mut table_scan = false;
-        let (cop_req, start_ts) = match req.get_tp() {
+        let table_scan;
+        let (start_ts, cop_req) = match req.get_tp() {
             tp @ REQ_TYPE_SELECT | tp @ REQ_TYPE_INDEX => {
+                let mut is = CodedInputStream::from_bytes(req.get_data());
+                is.set_recursion_limit(recursion_limit);
                 let mut sel = SelectRequest::new();
                 box_try!(sel.merge_from(&mut is));
                 table_scan = tp == REQ_TYPE_SELECT;
-                (CopRequest::Select(sel), sel.get_start_ts())
+                (sel.get_start_ts(), CopRequest::Select(sel))
             }
             REQ_TYPE_DAG => {
+                let mut is = CodedInputStream::from_bytes(req.get_data());
+                is.set_recursion_limit(recursion_limit);
                 let mut dag = DAGRequest::new();
                 box_try!(dag.merge_from(&mut is));
-
                 table_scan = dag.get_executors()
                     .iter()
                     .next()
                     .map_or(false, |scan| scan.get_tp() == ExecType::TypeTableScan);
-                (CopRequest::DAG(dag), dag.get_start_ts())
+                (dag.get_start_ts(), CopRequest::DAG(dag))
             }
             REQ_TYPE_ANALYZE => {
+                let mut is = CodedInputStream::from_bytes(req.get_data());
+                is.set_recursion_limit(recursion_limit);
                 let mut analyze = AnalyzeReq::new();
                 box_try!(analyze.merge_from(&mut is));
                 table_scan = analyze.get_tp() == AnalyzeType::TypeColumn;
-                (CopRequest::Analyze(analyze), analyze.get_start_ts())
+                (analyze.get_start_ts(), CopRequest::Analyze(analyze))
             }
             tp => return Err(box_err!("unsupported tp {}", tp)),
         };
@@ -453,14 +461,14 @@ impl RequestTask {
             table_scan: table_scan,
         };
         let on_finish = OnRequestFinish {
-            resp_sink: resp_sink.take().unwrap(),
+            resp_sink: resp_sink.take(),
             region_id: req.get_context().get_region_id(),
             ranges_len: req.get_ranges().len(),
-            first_range: req.get_ranges().get(0).clone(),
+            first_range: req.get_ranges().get(0).cloned(),
             scan_tag: req_ctx.get_scan_tag(),
 
             timer: timer,
-            wait_time: 0,
+            wait_time: 0f64,
             start_ts: start_ts,
             statistics: Statistics::default(),
         };
@@ -473,9 +481,6 @@ impl RequestTask {
         })
     }
 
-    pub fn set_on_finish_sink(&mut self, sink: CopResponseSink) {
-        self.on_finish.resp_sink = Some(sink);
-    }
 
     pub fn take_on_finish_sink(&mut self) -> CopResponseSink {
         self.on_finish.resp_sink.take().unwrap()
@@ -522,7 +527,7 @@ impl BatchRunnable<Task> for Host {
             match task {
                 Task::Request(req) => {
                     if let Err(e) = req.check_outdated() {
-                        self.pool.spawn(req.on_error(e)).forget();
+                        self.pool.spawn(req.on_finish.on_error(e)).forget();
                         continue;
                     }
                     let key = req.get_request_key();
@@ -536,15 +541,14 @@ impl BatchRunnable<Task> for Host {
                     self.handle_snapshot_result(q_id, snap_res);
                 },
                 Task::RetryRequests(retry) => for id in retry {
-                    let reqs = self.reqs.remove(&id).unwrap();
-                    let sched = self.sched.clone();
-                    if let Err(e) = self.engine.async_snapshot(
-                        reqs[0].req.get_context(),
-                        box move |(_, res)| sched.schedule(Task::SnapRes(id, res)).unwrap(),
-                    ) {
-                        self.notify_batch_failed(e, reqs);
-                    } else {
-                        self.reqs.insert(id, reqs);
+                    if let Err(e) = {
+                        let ctx = self.reqs[&id][0].req.get_context();
+                        let sched = self.sched.clone();
+                        self.engine.async_snapshot(ctx, box move |(_, res)| {
+                            sched.schedule(Task::SnapRes(id, res)).unwrap()
+                        })
+                    } {
+                        self.notify_batch_failed_by_id(e, id);
                     }
                 },
             }
@@ -572,7 +576,7 @@ impl BatchRunnable<Task> for Host {
             for (id, res) in (start_id..end_id + 1).zip(results) {
                 match res {
                     Some((_, res)) => ready.push((id, res)),
-                    None => retry.push((id,)),
+                    None => retry.push(id),
                 }
             }
 
@@ -597,7 +601,7 @@ impl BatchRunnable<Task> for Host {
                     error!("async snapshot batch failed error {:?}", e);
                     EngineError::Other(box_err!("{:?}", e))
                 });
-                self.notify_batch_failed(err, id);
+                self.notify_batch_failed_by_id(err, id);
             }
         }
     }
@@ -755,7 +759,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut task = RequestTask::new(
             Request::new(),
-            box move |msg| { tx.send(msg).unwrap(); },
+            box move |msg| {
+                tx.send(msg).unwrap();
+            },
             1000,
         );
         let ctx = ReqContext {
