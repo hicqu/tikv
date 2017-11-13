@@ -83,12 +83,17 @@ impl DAGContext {
                     if cur_row_count >= BATCH_ROW_COUNT {
                         self.chunks.push(mem::replace(&mut chunk, Chunk::default()));
                         cur_row_count = 0;
-                    }
-                    if streaming && self.chunks.len() >= CHUNKS_PER_STREAM {
-                        return self.make_response(true);
+                        if streaming && self.chunks.len() >= CHUNKS_PER_STREAM {
+                            return self.make_response(true);
+                        }
                     }
                 }
-                Ok(None) => return self.make_response(false),
+                Ok(None) => {
+                    if cur_row_count > 0 {
+                        self.chunks.push(chunk);
+                    }
+                    return self.make_response(false),
+                }
                 Err(e) => if let Error::Other(_) = e {
                     let mut resp = Response::new();
                     let mut sel_resp = SelectResponse::new();
