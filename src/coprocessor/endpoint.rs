@@ -113,7 +113,7 @@ impl Host {
     fn notify_batch_failed_by_id<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
         debug!("failed to handle batch request: {:?}", e);
         let resp = err_resp(e.into());
-        for mut t in self.reqs.remove(&batch_id).unwrap() {
+        for t in self.reqs.remove(&batch_id).unwrap() {
             t.on_finish.respond(resp.clone());
         }
     }
@@ -138,43 +138,72 @@ impl Host {
         }
 
         let (mut req, cop_req, req_ctx, mut on_finish) = (t.req, t.cop_req, t.ctx, t.on_finish);
-
         let ranges = req.take_ranges().into_vec();
-        let dispatch = move |on_finish: &mut OnRequestFinish| {
-            match cop_req {
-                // TODO: here we don't need Arc.
-                CopRequest::Select(sel) => {
-                    let mut ctx = SelectContext::new(sel, snap, Arc::new(req_ctx))?;
-                    let res = ctx.handle_request(ranges)?;
-                    ctx.collect_statistics_into(&mut on_finish.statistics);
-                    Ok(on_finish.respond(res))
+
+        let dispatch_request = move || match cop_req {
+            // TODO: here we don't need Arc.
+            CopRequest::Select(sel) => {
+                let mut ctx = match SelectContext::new(sel, snap, Arc::new(req_ctx)) {
+                    Ok(ctx) => ctx,
+                    Err(e) => return on_finish.on_error(e),
+                };
+                let resp = ctx.handle_request(ranges);
+                ctx.collect_statistics_into(&mut on_finish.statistics);
+                match resp {
+                    Ok(resp) => on_finish.respond(resp),
+                    Err(e) => on_finish.on_error(e),
                 }
-                CopRequest::DAG(dag) => if !on_finish.is_streaming() {
-                    let mut ctx = DAGContext::new(dag, ranges, snap, Arc::new(req_ctx))?;
-                    let (res, _) = ctx.handle_request(false)?;
+            }
+            CopRequest::DAG(dag) => {
+                let mut ctx = match DAGContext::new(dag, ranges, snap, Arc::new(req_ctx)) {
+                    Ok(ctx) => ctx,
+                    Err(e) => return on_finish.on_error(e),
+                };
+                if !on_finish.is_streaming() {
+                    let resp = ctx.handle_request(false);
                     ctx.collect_statistics_into(&mut on_finish.statistics);
-                    Ok(on_finish.respond(res))
+                    match resp {
+                        Ok((resp, _)) => on_finish.respond(resp),
+                        Err(e) => on_finish.on_error(e),
+                    }
                 } else {
-                    let ctx = DAGContext::new(dag, ranges, snap, Arc::new(req_ctx))?;
-                    let stream = stream::unfold(Some(ctx), |ctx_opt| {
+                    // TODO: write it in a function.
+                    let sink = match on_finish.resp_sink.take() {
+                        Some(CopResponseSink::Streaming(sink)) => sink,
+                        _ => unreachable!(),
+                    };
+                    let stream = stream::unfold(Some(ctx), move |ctx_opt| {
                         ctx_opt.and_then(|mut ctx| match ctx.handle_request(true) {
                             Ok((resp, true)) => Some(future::ok::<_, _>((resp, Some(ctx)))),
-                            Ok((resp, false)) => Some(future::ok::<_, _>((resp, None))),
-                            Err(e) => Some(future::err::<_, _>(e)),
+                            Ok((resp, false)) => {
+                                ctx.collect_statistics_into(&mut on_finish.statistics);
+                                on_finish.stop_record_handling();
+                                Some(future::ok::<_, _>((resp, None)))
+                            }
+                            Err(e) => {
+                                ctx.collect_statistics_into(&mut on_finish.statistics);
+                                on_finish.stop_record_handling();
+                                Some(future::err::<_, _>(e))
+                            }
                         })
                     });
-                    Ok(on_finish.respond_stream(box stream))
-                },
-                CopRequest::Analyze(analyze) => {
-                    let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
-                    let res = ctx.handle_request(&mut on_finish.statistics)?;
-                    Ok(on_finish.respond(res))
+                    box stream
+                        .or_else(|e| future::ok::<_, GrpcError>(err_resp(e)))
+                        .map(|resp| (resp, WriteFlags::default()))
+                        .forward(sink)
+                        .map(|_| ())
+                }
+            }
+            CopRequest::Analyze(analyze) => {
+                let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
+                let resp = ctx.handle_request(&mut on_finish.statistics);
+                match resp {
+                    Ok(resp) => on_finish.respond(resp),
+                    Err(e) => on_finish.on_error(e),
                 }
             }
         };
-
-        let future = dispatch(&mut on_finish).unwrap_or_else(|e| on_finish.on_error(e));
-        pool.spawn(future).forget();
+        pool.spawn_fn(dispatch_request).forget();
     }
 
     fn handle_snapshot_result(&mut self, id: u64, snapshot: engine::Result<Box<Snapshot>>) {
@@ -271,7 +300,7 @@ impl OnRequestFinish {
             _ => unreachable!(),
         }
     }
-    fn respond(&mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+    fn respond(mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         self.stop_record_handling();
         match self.resp_sink.take() {
             Some(CopResponseSink::Unary(sink)) => box sink.success(resp),
@@ -284,24 +313,9 @@ impl OnRequestFinish {
         }
     }
 
-    fn on_error(&mut self, e: Error) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+    fn on_error(self, e: Error) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         let resp = err_resp(e);
         self.respond(resp)
-    }
-
-    fn respond_stream(
-        &mut self,
-        s: Box<Stream<Item = Response, Error = Error> + Send>,
-    ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
-        let sink = match self.resp_sink.take() {
-            Some(CopResponseSink::Streaming(sink)) => sink,
-            _ => unreachable!(),
-        };
-
-        box s.or_else(|e| future::ok::<_, GrpcError>(err_resp(e)))
-            .map(|resp| (resp, WriteFlags::default()))
-            .forward(sink)
-            .map(|_| ())
     }
 
     fn stop_record_waiting(&mut self) {
@@ -468,7 +482,7 @@ impl BatchRunnable<Task> for Host {
         let mut grouped_reqs = map![];
         for task in tasks.drain(..) {
             match task {
-                Task::Request(mut req) => {
+                Task::Request(req) => {
                     if let Err(e) = req.check_outdated() {
                         self.pool.spawn(req.on_finish.on_error(e)).forget();
                         continue;

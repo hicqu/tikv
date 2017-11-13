@@ -92,7 +92,7 @@ impl DAGContext {
                     if cur_row_count > 0 {
                         self.chunks.push(chunk);
                     }
-                    return self.make_response(false),
+                    return self.make_response(false);
                 }
                 Err(e) => if let Error::Other(_) = e {
                     let mut resp = Response::new();
