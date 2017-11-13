@@ -11,12 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::mem;
 use std::sync::Arc;
 
 use tipb::schema::ColumnInfo;
 use tipb::select::{Chunk, DAGRequest, SelectResponse};
 use kvproto::coprocessor::{KeyRange, Response};
-use protobuf::Message as PbMsg;
+use protobuf::{Message as PbMsg, RepeatedField};
 
 use coprocessor::codec::mysql;
 use coprocessor::codec::datum::{Datum, DatumEncoder};
@@ -33,7 +34,7 @@ pub struct DAGContext {
     req_ctx: Arc<ReqContext>,
     exec: Box<Executor>,
     output_offsets: Vec<u32>,
-    streaming_chunks: Vec<Chunks>,
+    chunks: Vec<Chunk>,
 }
 
 impl DAGContext {
@@ -61,12 +62,13 @@ impl DAGContext {
             req_ctx: req_ctx,
             exec: dag_executor.exec,
             output_offsets: req.take_output_offsets(),
+            chunks: Vec::new(),
         })
     }
 
     pub fn handle_request(&mut self, streaming: bool) -> Result<(Response, bool)> {
-        let mut chunk = Chunk::default();
         let mut cur_row_count = 0;
+        let mut chunk = Chunk::default();
         loop {
             match self.exec.next() {
                 Ok(Some(row)) => {
@@ -78,17 +80,15 @@ impl DAGContext {
                         chunk.mut_rows_data().extend_from_slice(&value);
                     }
                     cur_row_count += 1;
-                    if streaming && cur_row_count >= BATCH_ROW_COUNT {
-                        self.streaming_chunks.push(chunk);
-                        if self.streaming_chunks.len() >= CHUNKS_PER_STREAM {
-                            
-                            self.streaming_chunks;
-                            return 
-                        }
-                        return response_from_chunk(chunk, true);
+                    if cur_row_count >= BATCH_ROW_COUNT {
+                        self.chunks.push(mem::replace(&mut chunk, Chunk::default()));
+                        cur_row_count = 0;
+                    }
+                    if streaming && self.chunks.len() >= CHUNKS_PER_STREAM {
+                        return self.make_response(true);
                     }
                 }
-                Ok(None) => return response_from_chunk(chunk, cur_row_count > 0),
+                Ok(None) => return self.make_response(false),
                 Err(e) => if let Error::Other(_) = e {
                     let mut resp = Response::new();
                     let mut sel_resp = SelectResponse::new();
@@ -103,29 +103,21 @@ impl DAGContext {
         }
     }
 
+    fn make_response(&mut self, remain: bool) -> Result<(Response, bool)> {
+        let chunks = mem::replace(&mut self.chunks, Vec::new());
+        let mut resp = Response::new();
+        let mut sel_resp = SelectResponse::new();
+        sel_resp.set_chunks(RepeatedField::from_vec(chunks));
+        let data = box_try!(sel_resp.write_to_bytes());
+        resp.set_data(data);
+        Ok((resp, remain))
+    }
+
     pub fn collect_statistics_into(&mut self, statistics: &mut Statistics) {
         self.exec.collect_statistics_into(statistics);
     }
 }
 
-fn response_from_chunks(chunks: Vec<Chunk>, remain: bool) -> Result<(Response, bool)> {
-    let mut resp = Response::new();
-    let mut sel_resp = SelectResponse::new();
-    sel_resp.set
-    sel_resp.mut_chunks().push(chunk);
-    let data = box_try!(sel_resp.write_to_bytes());
-    resp.set_data(data);
-    Ok(resp, remain)
-}
-
-fn response_from_chunk(chunk: Chunk, remain: bool) -> Result<(Response, bool)> {
-    let mut resp = Response::new();
-    let mut sel_resp = SelectResponse::new();
-    sel_resp.mut_chunks().push(chunk);
-    let data = box_try!(sel_resp.write_to_bytes());
-    resp.set_data(data);
-    Ok(resp, remain)
-}
 
 #[inline]
 fn inflate_cols(row: &Row, cols: &[ColumnInfo], output_offsets: &[u32]) -> Result<Vec<u8>> {

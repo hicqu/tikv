@@ -40,6 +40,15 @@ pub enum CopResponseSink {
     Streaming(ServerStreamingSink<Response>),
 }
 
+impl CopResponseSink {
+    pub fn is_streaming(&self) -> bool {
+        match *self {
+            CopResponseSink::Unary(_) => false,
+            _ => true,
+        }
+    }
+}
+
 impl From<UnarySink<Response>> for CopResponseSink {
     fn from(s: UnarySink<Response>) -> CopResponseSink {
         CopResponseSink::Unary(s)

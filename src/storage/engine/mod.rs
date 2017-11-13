@@ -133,7 +133,7 @@ pub trait Snapshot: Send {
     fn clone(&self) -> Box<Snapshot>;
 }
 
-pub trait Iterator {
+pub trait Iterator: Send {
     fn next(&mut self) -> bool;
     fn prev(&mut self) -> bool;
     fn seek(&mut self, key: &Key) -> Result<bool>;

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt::{self, Debug, Display, Formatter};
 
 use protobuf::{CodedInputStream, Message as PbMsg};
-use futures::{stream, Future, Stream};
+use futures::{future, stream, Future, Stream};
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
 use grpc::{Error as GrpcError, WriteFlags};
 
@@ -149,12 +149,22 @@ impl Host {
                     ctx.collect_statistics_into(&mut on_finish.statistics);
                     Ok(on_finish.respond(res))
                 }
-                CopRequest::DAG(dag) => {
+                CopRequest::DAG(dag) => if !on_finish.is_streaming() {
                     let mut ctx = DAGContext::new(dag, ranges, snap, Arc::new(req_ctx))?;
-                    let res = ctx.handle_request()?;
+                    let (res, _) = ctx.handle_request(false)?;
                     ctx.collect_statistics_into(&mut on_finish.statistics);
                     Ok(on_finish.respond(res))
-                }
+                } else {
+                    let ctx = DAGContext::new(dag, ranges, snap, Arc::new(req_ctx))?;
+                    let stream = stream::unfold(Some(ctx), |ctx_opt| {
+                        ctx_opt.and_then(|mut ctx| match ctx.handle_request(true) {
+                            Ok((resp, true)) => Some(future::ok::<_, _>((resp, Some(ctx)))),
+                            Ok((resp, false)) => Some(future::ok::<_, _>((resp, None))),
+                            Err(e) => Some(future::err::<_, _>(e)),
+                        })
+                    });
+                    Ok(on_finish.respond_stream(box stream))
+                },
                 CopRequest::Analyze(analyze) => {
                     let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
                     let res = ctx.handle_request(&mut on_finish.statistics)?;
@@ -254,6 +264,13 @@ struct OnRequestFinish {
 }
 
 impl OnRequestFinish {
+    fn is_streaming(&self) -> bool {
+        match self.resp_sink.as_ref() {
+            Some(&CopResponseSink::Unary(_)) => false,
+            Some(&CopResponseSink::Streaming(_)) => true,
+            _ => unreachable!(),
+        }
+    }
     fn respond(&mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         self.stop_record_handling();
         match self.resp_sink.take() {
@@ -270,6 +287,21 @@ impl OnRequestFinish {
     fn on_error(&mut self, e: Error) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         let resp = err_resp(e);
         self.respond(resp)
+    }
+
+    fn respond_stream(
+        &mut self,
+        s: Box<Stream<Item = Response, Error = Error> + Send>,
+    ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+        let sink = match self.resp_sink.take() {
+            Some(CopResponseSink::Streaming(sink)) => sink,
+            _ => unreachable!(),
+        };
+
+        box s.or_else(|e| future::ok::<_, GrpcError>(err_resp(e)))
+            .map(|resp| (resp, WriteFlags::default()))
+            .forward(sink)
+            .map(|_| ())
     }
 
     fn stop_record_waiting(&mut self) {

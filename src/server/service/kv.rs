@@ -1139,8 +1139,8 @@ fn extract_key_errors(res: storage::Result<Vec<storage::Result<()>>>) -> Vec<Key
     }
 }
 
-/// dispatch coprocessor or coprocessor_stream requests.
-/// Return None on success, or return a (Sink, Error, RpcStatusCode) tuple.
+/// dispatch `coprocessor` or `coprocessor_stream` requests.
+/// Return None on success, or return a (`Sink`, `Error`, `RpcStatusCode`) tuple.
 fn coprocessor_dispatch<S>(
     scheduler: &Scheduler<EndPointTask>,
     req: Request,
@@ -1165,9 +1165,9 @@ where
         Err(Stopped(EndPointTask::Request(mut req_task))) => {
             let sink = S::from(req_task.take_on_finish_sink());
             let error = Error::from(Stopped(EndPointTask::Request(req_task)));
-            return Some((sink, error, RpcStatusCode::ResourceExhausted));
+            Some((sink, error, RpcStatusCode::ResourceExhausted))
         }
-        Ok(_) => return None,
+        Ok(_) => None,
         _ => unreachable!(),
     }
 }
