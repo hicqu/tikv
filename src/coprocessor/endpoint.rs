@@ -120,10 +120,12 @@ impl Host {
 
     fn handle_request_on_sanpshot(&mut self, snap: Box<Snapshot>, mut t: RequestTask) {
         t.on_finish.stop_record_waiting();
-
         let pri = t.priority();
+
+        let scan_tag = t.ctx.get_scan_tag();
+        let pri_str = get_req_pri_str(pri);
         COPR_PENDING_REQS
-            .with_label_values(&[t.ctx.get_scan_tag(), get_req_pri_str(pri)])
+            .with_label_values(&[scan_tag, pri_str])
             .add(1.0);
 
         let pool = match pri {
@@ -206,6 +208,9 @@ impl Host {
             }
         };
         pool.spawn_fn(dispatch_request).forget();
+        COPR_PENDING_REQS
+            .with_label_values(&[scan_tag, pri_str])
+            .dec()
     }
 
     fn handle_snapshot_result(&mut self, id: u64, snapshot: engine::Result<Box<Snapshot>>) {
