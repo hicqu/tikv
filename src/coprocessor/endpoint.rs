@@ -223,7 +223,9 @@ impl Host {
             return;
         }
 
-        for req in self.reqs.remove(&id).unwrap() {
+        for mut req in self.reqs.remove(&id).unwrap() {
+            let running_task_count = self.running_task_count.clone();
+            req.on_finish.attach_task_count(running_task_count);
             self.handle_request_on_sanpshot(snap.clone(), req);
         }
     }
@@ -499,13 +501,11 @@ impl BatchRunnable<Task> for Host {
         let mut grouped_reqs = map![];
         for task in tasks.drain(..) {
             match task {
-                Task::Request(mut req) => {
+                Task::Request(req) => {
                     if let Err(e) = req.check_outdated() {
                         self.pool.spawn(req.on_finish.on_error(e)).forget();
                         continue;
                     }
-                    let running_task_count = self.running_task_count.clone();
-                    req.on_finish.attach_task_count(running_task_count);
                     let key = req.get_request_key();
                     grouped_reqs.entry(key).or_insert_with(Vec::new).push(req);
                 }
