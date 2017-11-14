@@ -187,3 +187,19 @@ macro_rules! try_opt {
         }
     });
 }
+
+#[macro_export]
+macro_rules! atomic_load {
+    ($atomic: expr) => {{
+        use ::std::sync::atomic::Ordering as AtomicOrdering;
+        ($atomic).load(AtomicOrdering::Acquire)
+    }}
+}
+
+#[macro_export]
+macro_rules! atomic_add {
+    ($atomic: expr, $rhs: expr) => {{
+        use ::std::sync::atomic::Ordering as AtomicOrdering;
+        ($atomic).fetch_add($rhs, AtomicOrdering::Release)
+    }}
+}
