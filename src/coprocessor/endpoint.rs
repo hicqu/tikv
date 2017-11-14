@@ -499,7 +499,7 @@ impl BatchRunnable<Task> for Host {
         let mut grouped_reqs = map![];
         for task in tasks.drain(..) {
             match task {
-                Task::Request(req) => {
+                Task::Request(mut req) => {
                     if let Err(e) = req.check_outdated() {
                         self.pool.spawn(req.on_finish.on_error(e)).forget();
                         continue;
