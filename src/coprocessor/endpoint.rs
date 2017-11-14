@@ -177,11 +177,13 @@ impl Host {
                             Ok((resp, true)) => Some(future::ok::<_, _>((resp, Some(ctx)))),
                             Ok((resp, false)) => {
                                 ctx.collect_statistics_into(&mut on_finish.statistics);
+                                on_finish.running_task_count.fetch_sub(1);
                                 on_finish.stop_record_handling();
                                 Some(future::ok::<_, _>((resp, None)))
                             }
                             Err(e) => {
                                 ctx.collect_statistics_into(&mut on_finish.statistics);
+                                on_finish.running_task_count.fetch_sub(1);
                                 on_finish.stop_record_handling();
                                 Some(future::err::<_, _>(e))
                             }
@@ -290,6 +292,7 @@ struct OnRequestFinish {
     wait_time: f64,
     start_ts: u64,
     statistics: Statistics,
+    running_task_count: Arc<AtomicUsize>,
 }
 
 impl OnRequestFinish {
@@ -301,6 +304,7 @@ impl OnRequestFinish {
         }
     }
     fn respond(mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+        self.running_task_count.fetch_sub(1, Ordering::Release);
         self.stop_record_handling();
         match self.resp_sink.take() {
             Some(CopResponseSink::Unary(sink)) => box sink.success(resp),
