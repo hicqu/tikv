@@ -177,13 +177,13 @@ impl Host {
                             Ok((resp, true)) => Some(future::ok::<_, _>((resp, Some(ctx)))),
                             Ok((resp, false)) => {
                                 ctx.collect_statistics_into(&mut on_finish.statistics);
-                                on_finish.running_task_count.fetch_sub(1);
+                                on_finish.sub_task_count();
                                 on_finish.stop_record_handling();
                                 Some(future::ok::<_, _>((resp, None)))
                             }
                             Err(e) => {
                                 ctx.collect_statistics_into(&mut on_finish.statistics);
-                                on_finish.running_task_count.fetch_sub(1);
+                                on_finish.sub_task_count();
                                 on_finish.stop_record_handling();
                                 Some(future::err::<_, _>(e))
                             }
@@ -283,6 +283,7 @@ impl ReqContext {
 
 struct OnRequestFinish {
     resp_sink: Option<CopResponseSink>,
+    running_task_count: Option<Arc<AtomicUsize>>,
     region_id: u64,
     ranges_len: usize,
     first_range: Option<KeyRange>,
@@ -292,7 +293,6 @@ struct OnRequestFinish {
     wait_time: f64,
     start_ts: u64,
     statistics: Statistics,
-    running_task_count: Arc<AtomicUsize>,
 }
 
 impl OnRequestFinish {
@@ -303,8 +303,20 @@ impl OnRequestFinish {
             _ => unreachable!(),
         }
     }
+
+    fn attach_task_count(&mut self, running_task_count: Arc<AtomicUsize>) {
+        running_task_count.fetch_add(1, Ordering::Release);
+        self.running_task_count = Some(running_task_count);
+    }
+
+    fn sub_task_count(&mut self) {
+        if let Some(count) = self.running_task_count.take() {
+            count.fetch_sub(1, Ordering::Release);
+        }
+    }
+
     fn respond(mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
-        self.running_task_count.fetch_sub(1, Ordering::Release);
+        self.sub_task_count();
         self.stop_record_handling();
         match self.resp_sink.take() {
             Some(CopResponseSink::Unary(sink)) => box sink.success(resp),
@@ -423,6 +435,7 @@ impl RequestTask {
         };
         let on_finish = OnRequestFinish {
             resp_sink: resp_sink.take(),
+            running_task_count: None,
             region_id: req.get_context().get_region_id(),
             ranges_len: req.get_ranges().len(),
             first_range: req.get_ranges().get(0).cloned(),
@@ -491,9 +504,10 @@ impl BatchRunnable<Task> for Host {
                         self.pool.spawn(req.on_finish.on_error(e)).forget();
                         continue;
                     }
+                    let running_task_count = self.running_task_count.clone();
+                    req.on_finish.attach_task_count(running_task_count);
                     let key = req.get_request_key();
                     grouped_reqs.entry(key).or_insert_with(Vec::new).push(req);
-                    self.running_task_count.fetch_add(1, Ordering::Release);
                 }
                 Task::SnapRes(q_id, snap_res) => {
                     self.handle_snapshot_result(q_id, snap_res);
