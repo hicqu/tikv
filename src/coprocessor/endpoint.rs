@@ -194,7 +194,7 @@ impl Host {
             CommandPri::Normal => &mut self.pool,
         };
 
-        let mut statistics = Statistics::default();
+        let statistics = Statistics::default();
         let cop_context = self.cop_context.clone();
 
         if let Err(e) = t.check_outdated() {
@@ -213,7 +213,7 @@ impl Host {
                     Err(e) => return on_finish.on_error(e, &statistics, cop_context),
                 };
                 let resp = ctx.handle_request(ranges);
-                ctx.collect_statistics_into(&mut statistics);
+                ctx.collect_statistics_into(&statistics);
                 match resp {
                     Ok(resp) => on_finish.respond(resp, &statistics, cop_context),
                     Err(e) => on_finish.on_error(e, &statistics, cop_context),
@@ -226,7 +226,7 @@ impl Host {
                 };
                 if !on_finish.is_streaming() {
                     let resp = ctx.handle_request(false);
-                    ctx.collect_statistics_into(&mut statistics);
+                    ctx.collect_statistics_into(&statistics);
                     match resp {
                         Ok((resp, _)) => on_finish.respond(resp, &statistics, cop_context),
                         Err(e) => on_finish.on_error(e, &statistics, cop_context),
@@ -252,7 +252,7 @@ impl Host {
             }
             CopRequest::Analyze(analyze) => {
                 let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
-                let resp = ctx.handle_request(&mut statistics);
+                let resp = ctx.handle_request(&statistics);
                 match resp {
                     Ok(resp) => on_finish.respond(resp, &statistics, cop_context),
                     Err(e) => on_finish.on_error(e, &statistics, cop_context),
@@ -906,52 +906,6 @@ mod tests {
             .unwrap();
         assert!(!resp.get_other_error().is_empty());
         assert_eq!(resp.get_other_error(), super::OUTDATED_ERROR_MSG);
-    }
-
-    #[test]
-    fn test_too_many_reqs() {
-        let mut worker = Worker::new("test-endpoint");
-        let engine = engine::new_local_engine(TEMP_DIR, &[]).unwrap();
-        let mut cfg = Config::default();
-        cfg.end_point_concurrency = 1;
-        let pd_worker = FutureWorker::new("test-pd-worker");
-        let mut end_point = Host::new(engine, worker.scheduler(), &cfg, pd_worker.scheduler());
-        end_point.max_running_task_count = 3;
-        worker.start_batch(end_point, 30).unwrap();
-
-        let mut rx_vec = Vec::with_capacity(120);
-        for pos in 0..30 * 4 {
-            let mut req = Request::new();
-            req.set_tp(REQ_TYPE_DAG);
-            req.mut_context().set_region_id(pos % 5);
-            if pos % 3 == 0 {
-                req.mut_context().set_priority(CommandPri::Low);
-            } else if pos % 3 == 1 {
-                req.mut_context().set_priority(CommandPri::Normal);
-            } else {
-                req.mut_context().set_priority(CommandPri::High);
-            }
-
-            let (tx, rx) = mpsc::channel(1);
-            let mut cop_resp_sink_opt = Some(CopResponseSink::TestChannel(tx));
-            let task = RequestTask::new(req, &mut cop_resp_sink_opt, 1000).unwrap();
-            worker.schedule(Task::Request(task)).unwrap();
-            rx_vec.push(rx);
-        }
-        for i in 0..120 {
-            let resp = wheel()
-                .build()
-                .timeout(future::poll_fn(|| rx_vec[i].poll()), Duration::from_secs(3))
-                .wait()
-                .unwrap()
-                .unwrap();
-            if !resp.has_region_error() {
-                continue;
-            }
-            assert!(resp.get_region_error().has_server_is_busy());
-            return;
-        }
-        panic!("suppose to get ServerIsBusy error.");
     }
 
     #[test]
