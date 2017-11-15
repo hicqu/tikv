@@ -118,7 +118,7 @@ impl DAGContext {
         Ok((resp, remain))
     }
 
-    pub fn collect_statistics_into(&mut self, statistics: &mut Statistics) {
+    pub fn collect_statistics_into(&mut self, statistics: &Statistics) {
         self.exec.collect_statistics_into(statistics);
     }
 }

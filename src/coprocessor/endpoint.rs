@@ -11,10 +11,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::usize;
+use std::{mem, usize};
 use std::time::Duration;
+use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::fmt::{self, Debug, Display, Formatter};
 
 use protobuf::{CodedInputStream, Message as PbMsg};
@@ -34,7 +35,7 @@ use util::time::{duration_to_sec, Instant};
 use util::worker::{BatchRunnable, FutureScheduler, Scheduler};
 use util::collections::HashMap;
 use server::{Config, CopResponseSink};
-use storage::{self, engine, Engine, Snapshot, Statistics};
+use storage::{self, engine, Engine, FlowStatistics, Snapshot, Statistics, StatisticsSummary};
 use storage::engine::Error as EngineError;
 use pd::PdTask;
 
@@ -67,6 +68,55 @@ const OUTDATED_ERROR_MSG: &'static str = "request outdated.";
 
 const ENDPOINT_IS_BUSY: &'static str = "endpoint is busy";
 
+type CopRequestStatistics = RefCell<HashMap<u64, FlowStatistics>>;
+
+struct CopContext {
+    select_stats: StatisticsSummary,
+    index_stats: StatisticsSummary,
+    request_stats: (AtomicBool, CopRequestStatistics),
+}
+
+unsafe impl Sync for CopContext {}
+
+impl CopContext {
+    fn new() -> Self {
+        CopContext {
+            select_stats: StatisticsSummary::default(),
+            index_stats: StatisticsSummary::default(),
+            request_stats: (AtomicBool::new(false), RefCell::new(map![])),
+        }
+    }
+
+    fn get_statistics(&self, type_str: &str) -> &StatisticsSummary {
+        match type_str {
+            STR_REQ_TYPE_SELECT => &self.select_stats,
+            STR_REQ_TYPE_INDEX => &self.index_stats,
+            _ => {
+                warn!("unknown STR_REQ_TYPE: {}", type_str);
+                &self.select_stats
+            }
+        }
+    }
+
+    fn add_statistics(&self, type_str: &str, stats: &Statistics) {
+        self.get_statistics(type_str).add_statistics(stats);
+    }
+
+    fn add_statistics_by_region(&self, region_id: u64, stats: &Statistics) {
+        let locked = &self.request_stats.0;
+        while locked.compare_and_swap(false, true, Ordering::AcqRel) {}
+
+        let mut request_stats = self.request_stats.1.borrow_mut();
+        let flow_stats = request_stats
+            .entry(region_id)
+            .or_insert_with(FlowStatistics::default);
+        flow_stats.add(&stats.write.flow_stats);
+        flow_stats.add(&stats.data.flow_stats);
+
+        locked.compare_and_swap(true, false, Ordering::AcqRel);
+    }
+}
+
 pub struct Host {
     engine: Box<Engine>,
     sched: Scheduler<Task>,
@@ -77,6 +127,8 @@ pub struct Host {
     high_priority_pool: CpuPool,
     max_running_task_count: usize,
     running_task_count: Arc<AtomicUsize>,
+    cop_context: Arc<CopContext>,
+    pd_task_sender: FutureScheduler<PdTask>,
 }
 
 impl Host {
@@ -84,7 +136,7 @@ impl Host {
         engine: Box<Engine>,
         scheduler: Scheduler<Task>,
         cfg: &Config,
-        _: FutureScheduler<PdTask>,
+        pd_task_sender: FutureScheduler<PdTask>,
     ) -> Host {
         let create_pool = |name_prefix: &str, size: usize| {
             CpuPoolBuilder::new()
@@ -103,6 +155,8 @@ impl Host {
             high_priority_pool: create_pool("endpoint-high-pool", cfg.end_point_concurrency),
             max_running_task_count: cfg.end_point_max_tasks,
             running_task_count: Arc::new(AtomicUsize::new(0)),
+            cop_context: Arc::new(CopContext::new()),
+            pd_task_sender: pd_task_sender,
         }
     }
 
@@ -114,14 +168,18 @@ impl Host {
         debug!("failed to handle batch request: {:?}", e);
         let resp = err_resp(e.into());
         for t in self.reqs.remove(&batch_id).unwrap() {
-            t.on_finish.respond(resp.clone());
+            t.on_finish.respond(
+                resp.clone(),
+                &Statistics::default(),
+                self.cop_context.clone(),
+            );
         }
     }
 
     fn handle_request_on_sanpshot(&mut self, snap: Box<Snapshot>, mut t: RequestTask) {
         t.on_finish.stop_record_waiting();
-        let pri = t.priority();
 
+        let pri = t.priority();
         let scan_tag = t.ctx.get_scan_tag();
         let pri_str = get_req_pri_str(pri);
         COPR_PENDING_REQS
@@ -134,76 +192,68 @@ impl Host {
             CommandPri::Normal => &mut self.pool,
         };
 
+        let mut statistics = Statistics::default();
+        let cop_context = self.cop_context.clone();
+
         if let Err(e) = t.check_outdated() {
-            pool.spawn(t.on_finish.on_error(e)).forget();
+            let future = t.on_finish.on_error(e, &statistics, cop_context);
+            pool.spawn(future).forget();
             return;
         }
 
-        let (mut req, cop_req, req_ctx, mut on_finish) = (t.req, t.cop_req, t.ctx, t.on_finish);
+        let (mut req, cop_req, req_ctx, on_finish) = (t.req, t.cop_req, t.ctx, t.on_finish);
         let ranges = req.take_ranges().into_vec();
-
         let dispatch_request = move || match cop_req {
             // TODO: here we don't need Arc.
             CopRequest::Select(sel) => {
                 let mut ctx = match SelectContext::new(sel, snap, Arc::new(req_ctx)) {
                     Ok(ctx) => ctx,
-                    Err(e) => return on_finish.on_error(e),
+                    Err(e) => return on_finish.on_error(e, &statistics, cop_context),
                 };
                 let resp = ctx.handle_request(ranges);
-                ctx.collect_statistics_into(&mut on_finish.statistics);
+                ctx.collect_statistics_into(&mut statistics);
                 match resp {
-                    Ok(resp) => on_finish.respond(resp),
-                    Err(e) => on_finish.on_error(e),
+                    Ok(resp) => on_finish.respond(resp, &statistics, cop_context),
+                    Err(e) => on_finish.on_error(e, &statistics, cop_context),
                 }
             }
             CopRequest::DAG(dag) => {
                 let mut ctx = match DAGContext::new(dag, ranges, snap, Arc::new(req_ctx)) {
                     Ok(ctx) => ctx,
-                    Err(e) => return on_finish.on_error(e),
+                    Err(e) => return on_finish.on_error(e, &statistics, cop_context),
                 };
                 if !on_finish.is_streaming() {
                     let resp = ctx.handle_request(false);
-                    ctx.collect_statistics_into(&mut on_finish.statistics);
+                    ctx.collect_statistics_into(&mut statistics);
                     match resp {
-                        Ok((resp, _)) => on_finish.respond(resp),
-                        Err(e) => on_finish.on_error(e),
+                        Ok((resp, _)) => on_finish.respond(resp, &statistics, cop_context),
+                        Err(e) => on_finish.on_error(e, &statistics, cop_context),
                     }
                 } else {
-                    // TODO: write it in a function.
-                    let sink = match on_finish.resp_sink.take() {
-                        Some(CopResponseSink::Streaming(sink)) => sink,
-                        _ => unreachable!(),
-                    };
+                    let statistics = Arc::new(statistics);
+                    let statistics_in_stream = statistics.clone();
                     let stream = stream::unfold(Some(ctx), move |ctx_opt| {
                         ctx_opt.and_then(|mut ctx| match ctx.handle_request(true) {
                             Ok((resp, true)) => Some(future::ok::<_, _>((resp, Some(ctx)))),
                             Ok((resp, false)) => {
-                                ctx.collect_statistics_into(&mut on_finish.statistics);
-                                on_finish.sub_task_count();
-                                on_finish.stop_record_handling();
+                                ctx.collect_statistics_into(&statistics_in_stream);
                                 Some(future::ok::<_, _>((resp, None)))
                             }
                             Err(e) => {
-                                ctx.collect_statistics_into(&mut on_finish.statistics);
-                                on_finish.sub_task_count();
-                                on_finish.stop_record_handling();
+                                ctx.collect_statistics_into(&statistics_in_stream);
                                 Some(future::err::<_, _>(e))
                             }
                         })
                     });
-                    box stream
-                        .or_else(|e| future::ok::<_, GrpcError>(err_resp(e)))
-                        .map(|resp| (resp, WriteFlags::default().buffer_hint(true)))
-                        .forward(sink)
-                        .map(|_| ())
+                    on_finish.respond_stream(box stream, statistics, cop_context)
                 }
             }
             CopRequest::Analyze(analyze) => {
                 let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
-                let resp = ctx.handle_request(&mut on_finish.statistics);
+                let resp = ctx.handle_request(&mut statistics);
                 match resp {
-                    Ok(resp) => on_finish.respond(resp),
-                    Err(e) => on_finish.on_error(e),
+                    Ok(resp) => on_finish.respond(resp, &statistics, cop_context),
+                    Err(e) => on_finish.on_error(e, &statistics, cop_context),
                 }
             }
         };
@@ -233,6 +283,14 @@ impl Host {
             req.on_finish.attach_task_count(running_task_count);
             self.handle_request_on_sanpshot(snap.clone(), req);
         }
+    }
+
+    fn on_error_quickly(&mut self, req: RequestTask, e: Error) {
+        let statistics = Statistics::default();
+        let cop_context = self.cop_context.clone();
+        self.pool
+            .spawn(req.on_finish.on_error(e, &statistics, cop_context))
+            .forget();
     }
 }
 
@@ -299,7 +357,6 @@ struct OnRequestFinish {
     timer: Instant,
     wait_time: f64,
     start_ts: u64,
-    statistics: Statistics,
 }
 
 impl OnRequestFinish {
@@ -322,9 +379,14 @@ impl OnRequestFinish {
         }
     }
 
-    fn respond(mut self, resp: Response) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+    fn respond(
+        mut self,
+        resp: Response,
+        statistics: &Statistics,
+        cop_context: Arc<CopContext>,
+    ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         self.sub_task_count();
-        self.stop_record_handling();
+        self.stop_record_handling(statistics, cop_context);
         match self.resp_sink.take() {
             Some(CopResponseSink::Unary(sink)) => box sink.success(resp),
             Some(CopResponseSink::Streaming(sink)) => {
@@ -336,9 +398,35 @@ impl OnRequestFinish {
         }
     }
 
-    fn on_error(self, e: Error) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+    fn on_error(
+        self,
+        e: Error,
+        statistics: &Statistics,
+        cop_context: Arc<CopContext>,
+    ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         let resp = err_resp(e);
-        self.respond(resp)
+        self.respond(resp, statistics, cop_context)
+    }
+
+    fn respond_stream(
+        mut self,
+        stream: Box<Stream<Item = Response, Error = Error> + Send>,
+        statistics: Arc<Statistics>,
+        cop_context: Arc<CopContext>,
+    ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
+        // TODO: write it in a function.
+        let sink = match self.resp_sink.take() {
+            Some(CopResponseSink::Streaming(sink)) => sink,
+            _ => unreachable!(),
+        };
+        box stream
+            .or_else(|e| future::ok::<_, GrpcError>(err_resp(e)))
+            .map(|resp| (resp, WriteFlags::default().buffer_hint(true)))
+            .forward(sink)
+            .map(move |_| {
+                self.sub_task_count();
+                self.stop_record_handling(&statistics, cop_context);
+            })
     }
 
     fn stop_record_waiting(&mut self) {
@@ -351,7 +439,7 @@ impl OnRequestFinish {
             .observe(self.wait_time);
     }
 
-    fn stop_record_handling(&mut self) {
+    fn stop_record_handling(&mut self, statistics: &Statistics, cop_context: Arc<CopContext>) {
         self.stop_record_waiting();
         let handle_time = duration_to_sec(self.timer.elapsed());
 
@@ -365,7 +453,7 @@ impl OnRequestFinish {
 
         COPR_SCAN_KEYS
             .with_label_values(&[self.scan_tag])
-            .observe(self.statistics.total_op_count() as f64);
+            .observe(statistics.total_op_count() as f64);
 
         if handle_time > SLOW_QUERY_LOWER_BOUND {
             info!(
@@ -376,12 +464,15 @@ impl OnRequestFinish {
                 self.scan_tag,
                 handle_time,
                 self.wait_time,
-                self.statistics.total_op_count(),
-                self.statistics.total_processed(),
+                statistics.total_op_count(),
+                statistics.total_processed(),
                 self.ranges_len,
                 self.first_range,
             );
         }
+
+        cop_context.add_statistics(self.scan_tag, statistics);
+        cop_context.add_statistics_by_region(self.region_id, statistics);
     }
 }
 
@@ -451,7 +542,6 @@ impl RequestTask {
             timer: timer,
             wait_time: 0f64,
             start_ts: start_ts,
-            statistics: Statistics::default(),
         };
 
         Ok(RequestTask {
@@ -508,7 +598,7 @@ impl BatchRunnable<Task> for Host {
             match task {
                 Task::Request(req) => {
                     if let Err(e) = req.check_outdated() {
-                        self.pool.spawn(req.on_finish.on_error(e)).forget();
+                        self.on_error_quickly(req, e);
                         continue;
                     }
                     let key = req.get_request_key();
@@ -582,6 +672,42 @@ impl BatchRunnable<Task> for Host {
                     EngineError::Other(box_err!("{:?}", e))
                 });
                 self.notify_batch_failed_by_id(err, id);
+            }
+        }
+    }
+
+    fn run_periodic(&mut self) {
+        for type_str in &[STR_REQ_TYPE_SELECT, STR_REQ_TYPE_INDEX] {
+            let this_statistics = self.cop_context.get_statistics(type_str);
+            if atomic_load!(this_statistics.count) == 0 {
+                continue;
+            }
+            for (cf, details) in this_statistics.stat.take_details() {
+                for (tag, count) in details {
+                    COPR_SCAN_DETAILS
+                        .with_label_values(&[type_str, cf, tag])
+                        .inc_by(count as f64)
+                        .unwrap();
+                }
+            }
+            this_statistics.count.store(0, Ordering::Release);
+        }
+
+        let mut to_send_stats = HashMap::default();
+
+        let locked = &self.cop_context.request_stats.0;
+        while locked.compare_and_swap(false, true, Ordering::AcqRel) {}
+        let mut request_stats = self.cop_context.request_stats.1.borrow_mut();
+        if !request_stats.is_empty() {
+            mem::swap(&mut to_send_stats, &mut request_stats);
+        }
+        locked.compare_and_swap(true, false, Ordering::AcqRel);
+
+        if !to_send_stats.is_empty() {
+            if let Err(e) = self.pd_task_sender.schedule(PdTask::ReadStats {
+                read_stats: to_send_stats,
+            }) {
+                error!("send coprocessor statistics: {:?}", e);
             }
         }
     }

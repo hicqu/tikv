@@ -203,3 +203,11 @@ macro_rules! atomic_add {
         ($atomic).fetch_add($rhs, AtomicOrdering::Release)
     }}
 }
+
+#[macro_export]
+macro_rules! atomic_swap {
+    ($atomic: expr, $v: expr) => {{
+        use ::std::sync::atomic::Ordering as AtomicOrdering;
+        ($atomic).swap($v, AtomicOrdering::Release)
+    }}
+}

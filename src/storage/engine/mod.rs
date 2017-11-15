@@ -219,6 +219,26 @@ impl CFStatistics {
         ]
     }
 
+    /// Take the total op count and reset them to default.
+    pub fn take_total_op_count(&self) -> usize {
+        atomic_swap!(self.get, 0) + atomic_swap!(self.next, 0) + atomic_swap!(self.seek, 0) +
+            atomic_swap!(self.seek_for_prev, 0)
+    }
+
+    /// Take the details and reset them to default.
+    pub fn take_details(&self) -> Vec<(&str, usize)> {
+        vec![
+            (STAT_TOTAL, self.take_total_op_count()),
+            (STAT_PROCESSED, atomic_swap!(self.processed, 0)),
+            (STAT_GET, atomic_swap!(self.get, 0)),
+            (STAT_NEXT, atomic_swap!(self.next, 0)),
+            (STAT_PREV, atomic_swap!(self.prev, 0)),
+            (STAT_SEEK, atomic_swap!(self.seek, 0)),
+            (STAT_SEEK_FOR_PREV, atomic_swap!(self.seek_for_prev, 0)),
+            (STAT_OVER_SEEK_BOUND, atomic_swap!(self.over_seek_bound, 0)),
+        ]
+    }
+
     pub fn add(&self, other: &Self) {
         atomic_add!(self.processed, atomic_load!(other.processed));
         atomic_add!(self.get, atomic_load!(other.get));
@@ -256,6 +276,14 @@ impl Statistics {
         ]
     }
 
+    pub fn take_details(&self) -> Vec<(&str, Vec<(&str, usize)>)> {
+        vec![
+            (CF_DEFAULT, self.data.take_details()),
+            (CF_LOCK, self.lock.take_details()),
+            (CF_WRITE, self.write.take_details()),
+        ]
+    }
+
     pub fn add(&self, other: &Self) {
         self.lock.add(&other.lock);
         self.write.add(&other.write);
@@ -266,13 +294,13 @@ impl Statistics {
 #[derive(Default)]
 pub struct StatisticsSummary {
     pub stat: Statistics,
-    pub count: u64,
+    pub count: AtomicUsize,
 }
 
 impl StatisticsSummary {
-    pub fn add_statistics(&mut self, v: &Statistics) {
+    pub fn add_statistics(&self, v: &Statistics) {
         self.stat.add(v);
-        self.count += 1;
+        atomic_add!(self.count, 1);
     }
 }
 
