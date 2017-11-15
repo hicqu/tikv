@@ -649,10 +649,9 @@ impl BatchRunnable<Task> for Host {
                 req.on_finish.attach_task_count(running_task_count);
             }
 
-            let id = self.last_req_id;
-            batch.push(reqs[0].req.get_context().clone());
-            self.reqs.insert(id, reqs);
             self.last_req_id += 1;
+            batch.push(reqs[0].req.get_context().clone());
+            self.reqs.insert(self.last_req_id, reqs);
         }
         let end_id = self.last_req_id;
 
