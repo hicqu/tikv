@@ -24,6 +24,8 @@ pub mod resolve;
 pub mod snap;
 
 use grpc::{ServerStreamingSink, UnarySink};
+#[cfg(test)]
+use futures::sync::mpsc::Sender;
 
 use kvproto::coprocessor::Response;
 
@@ -38,6 +40,8 @@ pub use self::raft_client::RaftClient;
 pub enum CopResponseSink {
     Unary(UnarySink<Response>),
     Streaming(ServerStreamingSink<Response>),
+    #[cfg(test)]
+    TestChannel(Sender<Response>),
 }
 
 impl CopResponseSink {

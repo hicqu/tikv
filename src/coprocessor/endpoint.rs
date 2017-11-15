@@ -22,6 +22,8 @@ use protobuf::{CodedInputStream, Message as PbMsg};
 use futures::{future, stream, Future, Stream};
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
 use grpc::{Error as GrpcError, WriteFlags};
+#[cfg(test)]
+use futures::Sink;
 
 use tipb::select::{self, Chunk, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
@@ -394,6 +396,10 @@ impl OnRequestFinish {
                 let stream = stream::once(Ok((resp, write_flags)));
                 box stream.forward(sink).map(|_| ())
             }
+            #[cfg(test)]
+            Some(CopResponseSink::TestChannel(ch)) => box ch.send(resp)
+                .map(|_| ())
+                .map_err(|e| panic!("error: {}", e)),
             _ => unreachable!(),
         }
     }
@@ -414,7 +420,6 @@ impl OnRequestFinish {
         statistics: Arc<Statistics>,
         cop_context: Arc<CopContext>,
     ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
-        // TODO: write it in a function.
         let sink = match self.resp_sink.take() {
             Some(CopResponseSink::Streaming(sink)) => sink,
             _ => unreachable!(),
@@ -828,9 +833,12 @@ pub fn get_req_pri_str(pri: CommandPri) -> &'static str {
 mod tests {
     use super::*;
     use storage::engine::{self, TEMP_DIR};
-    use std::sync::*;
     use std::thread;
     use std::time::Duration;
+
+    use futures::{future, Future, Stream};
+    use futures::sync::mpsc;
+    use tokio_timer::{wheel, Timer};
 
     use kvproto::coprocessor::Request;
     use tipb::select::DAGRequest;
@@ -862,24 +870,31 @@ mod tests {
         let pd_worker = FutureWorker::new("test-pd-worker");
         let end_point = Host::new(engine, worker.scheduler(), &cfg, pd_worker.scheduler());
         worker.start_batch(end_point, 30).unwrap();
-        let (tx, rx) = mpsc::channel();
-        let mut task = RequestTask::new(
-            Request::new(),
-            box move |msg| { tx.send(msg).unwrap(); },
-            1000,
-        );
-        let ctx = ReqContext {
+
+        let mut req = Request::new();
+        req.set_tp(REQ_TYPE_DAG);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut cop_resp_sink_opt = Some(CopResponseSink::TestChannel(tx));
+        let mut task = RequestTask::new(req, &mut cop_resp_sink_opt, 1000).unwrap();
+        task.ctx = ReqContext {
             deadline: task.ctx.deadline - Duration::from_secs(super::REQUEST_MAX_HANDLE_SECS),
             isolation_level: task.ctx.isolation_level,
             fill_cache: task.ctx.fill_cache,
             table_scan: task.ctx.table_scan,
         };
-        task.ctx = Arc::new(ctx);
         worker.schedule(Task::Request(task)).unwrap();
-        let resp = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        let resp = wheel()
+            .build()
+            .timeout(future::poll_fn(|| rx.poll()), Duration::from_secs(3))
+            .wait()
+            .unwrap()
+            .unwrap();
         assert!(!resp.get_other_error().is_empty());
         assert_eq!(resp.get_other_error(), super::OUTDATED_ERROR_MSG);
     }
+
     #[test]
     fn test_too_many_reqs() {
         let mut worker = Worker::new("test-endpoint");
@@ -890,10 +905,11 @@ mod tests {
         let mut end_point = Host::new(engine, worker.scheduler(), &cfg, pd_worker.scheduler());
         end_point.max_running_task_count = 3;
         worker.start_batch(end_point, 30).unwrap();
-        let (tx, rx) = mpsc::channel();
+
+        let mut rx_vec = Vec::with_capacity(120);
         for pos in 0..30 * 4 {
-            let tx = tx.clone();
             let mut req = Request::new();
+            req.set_tp(REQ_TYPE_DAG);
             if pos % 3 == 0 {
                 req.mut_context().set_priority(CommandPri::Low);
             } else if pos % 3 == 1 {
@@ -901,18 +917,20 @@ mod tests {
             } else {
                 req.mut_context().set_priority(CommandPri::High);
             }
-            let task = RequestTask::new(
-                req,
-                box move |msg| {
-                    thread::sleep(Duration::from_millis(100));
-                    let _ = tx.send(msg);
-                },
-                1000,
-            );
+
+            let (tx, rx) = mpsc::channel(10);
+            let mut cop_resp_sink_opt = Some(CopResponseSink::TestChannel(tx));
+            let task = RequestTask::new(req, &mut cop_resp_sink_opt, 1000).unwrap();
             worker.schedule(Task::Request(task)).unwrap();
+            rx_vec.push(rx);
         }
-        for _ in 0..120 {
-            let resp = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        for i in 0..120 {
+            let resp = wheel()
+                .build()
+                .timeout(future::poll_fn(|| rx_vec[i].poll()), Duration::from_secs(1))
+                .wait()
+                .unwrap()
+                .unwrap();
             if !resp.has_region_error() {
                 continue;
             }
@@ -922,6 +940,8 @@ mod tests {
         panic!("suppose to get ServerIsBusy error.");
     }
 
+    /// Ignore for CpuPool can't set stack size now.
+    #[ignore]
     #[test]
     fn test_stack_guard() {
         let mut expr = Expr::new();
