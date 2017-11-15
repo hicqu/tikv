@@ -107,14 +107,14 @@ impl CopContext {
     fn add_statistics_by_region(&self, region_id: u64, stats: &Statistics) {
         let locked = &self.request_stats.0;
         while locked.compare_and_swap(false, true, Ordering::AcqRel) {}
-
-        let mut request_stats = self.request_stats.1.borrow_mut();
-        let flow_stats = request_stats
-            .entry(region_id)
-            .or_insert_with(FlowStatistics::default);
-        flow_stats.add(&stats.write.flow_stats);
-        flow_stats.add(&stats.data.flow_stats);
-
+        {
+            let mut request_stats = self.request_stats.1.borrow_mut();
+            let flow_stats = request_stats
+                .entry(region_id)
+                .or_insert_with(FlowStatistics::default);
+            flow_stats.add(&stats.write.flow_stats);
+            flow_stats.add(&stats.data.flow_stats);
+        }
         locked.compare_and_swap(true, false, Ordering::AcqRel);
     }
 }
@@ -280,9 +280,7 @@ impl Host {
             return;
         }
 
-        for mut req in self.reqs.remove(&id).unwrap() {
-            let running_task_count = self.running_task_count.clone();
-            req.on_finish.attach_task_count(running_task_count);
+        for req in self.reqs.remove(&id).unwrap() {
             self.handle_request_on_sanpshot(snap.clone(), req);
         }
     }
@@ -314,12 +312,14 @@ impl Display for Task {
     }
 }
 
+#[derive(Debug)]
 enum CopRequest {
     Select(SelectRequest),
     DAG(DAGRequest),
     Analyze(AnalyzeReq),
 }
 
+#[derive(Debug)]
 pub struct ReqContext {
     // The deadline before which the task should be responded.
     pub deadline: Instant,
@@ -348,6 +348,7 @@ impl ReqContext {
     }
 }
 
+#[derive(Debug)]
 struct OnRequestFinish {
     resp_sink: Option<CopResponseSink>,
     running_task_count: Option<Arc<AtomicUsize>>,
@@ -399,7 +400,7 @@ impl OnRequestFinish {
             #[cfg(test)]
             Some(CopResponseSink::TestChannel(ch)) => box ch.send(resp)
                 .map(|_| ())
-                .map_err(|e| panic!("error: {}", e)),
+                .or_else(|_| future::ok::<_, _>(())),
             _ => unreachable!(),
         }
     }
@@ -481,6 +482,7 @@ impl OnRequestFinish {
     }
 }
 
+#[derive(Debug)]
 pub struct RequestTask {
     req: Request,
     cop_req: CopRequest,
@@ -595,8 +597,6 @@ impl Display for RequestTask {
 }
 
 impl BatchRunnable<Task> for Host {
-    // TODO: limit pending reqs
-    #[allow(for_kv_map)]
     fn run_batch(&mut self, tasks: &mut Vec<Task>) {
         let mut grouped_reqs = map![];
         for task in tasks.drain(..) {
@@ -635,12 +635,24 @@ impl BatchRunnable<Task> for Host {
 
         let mut batch = Vec::with_capacity(grouped_reqs.len());
         let start_id = self.last_req_id + 1;
-        for (_, reqs) in grouped_reqs {
-            self.last_req_id += 1;
+        for (_, mut reqs) in grouped_reqs {
+            let max_running_task_count = self.max_running_task_count;
+            if self.running_task_count() >= max_running_task_count {
+                for req in reqs {
+                    self.on_error_quickly(req, Error::Full(max_running_task_count));
+                }
+                continue;
+            }
+
+            for req in &mut reqs {
+                let running_task_count = self.running_task_count.clone();
+                req.on_finish.attach_task_count(running_task_count);
+            }
+
             let id = self.last_req_id;
-            let ctx = reqs[0].req.get_context().clone();
-            batch.push(ctx);
+            batch.push(reqs[0].req.get_context().clone());
             self.reqs.insert(id, reqs);
+            self.last_req_id += 1;
         }
         let end_id = self.last_req_id;
 
@@ -702,9 +714,11 @@ impl BatchRunnable<Task> for Host {
 
         let locked = &self.cop_context.request_stats.0;
         while locked.compare_and_swap(false, true, Ordering::AcqRel) {}
-        let mut request_stats = self.cop_context.request_stats.1.borrow_mut();
-        if !request_stats.is_empty() {
-            mem::swap(&mut to_send_stats, &mut request_stats);
+        {
+            let mut request_stats = self.cop_context.request_stats.1.borrow_mut();
+            if !request_stats.is_empty() {
+                mem::swap(&mut to_send_stats, &mut request_stats);
+            }
         }
         locked.compare_and_swap(true, false, Ordering::AcqRel);
 
@@ -833,12 +847,11 @@ pub fn get_req_pri_str(pri: CommandPri) -> &'static str {
 mod tests {
     use super::*;
     use storage::engine::{self, TEMP_DIR};
-    use std::thread;
     use std::time::Duration;
 
     use futures::{future, Future, Stream};
     use futures::sync::mpsc;
-    use tokio_timer::{wheel, Timer};
+    use tokio_timer::wheel;
 
     use kvproto::coprocessor::Request;
     use tipb::select::DAGRequest;
@@ -910,6 +923,7 @@ mod tests {
         for pos in 0..30 * 4 {
             let mut req = Request::new();
             req.set_tp(REQ_TYPE_DAG);
+            req.mut_context().set_region_id(pos % 5);
             if pos % 3 == 0 {
                 req.mut_context().set_priority(CommandPri::Low);
             } else if pos % 3 == 1 {
@@ -918,7 +932,7 @@ mod tests {
                 req.mut_context().set_priority(CommandPri::High);
             }
 
-            let (tx, rx) = mpsc::channel(10);
+            let (tx, rx) = mpsc::channel(1);
             let mut cop_resp_sink_opt = Some(CopResponseSink::TestChannel(tx));
             let task = RequestTask::new(req, &mut cop_resp_sink_opt, 1000).unwrap();
             worker.schedule(Task::Request(task)).unwrap();
@@ -927,7 +941,7 @@ mod tests {
         for i in 0..120 {
             let resp = wheel()
                 .build()
-                .timeout(future::poll_fn(|| rx_vec[i].poll()), Duration::from_secs(1))
+                .timeout(future::poll_fn(|| rx_vec[i].poll()), Duration::from_secs(3))
                 .wait()
                 .unwrap()
                 .unwrap();
@@ -940,8 +954,6 @@ mod tests {
         panic!("suppose to get ServerIsBusy error.");
     }
 
-    /// Ignore for CpuPool can't set stack size now.
-    #[ignore]
     #[test]
     fn test_stack_guard() {
         let mut expr = Expr::new();
@@ -957,18 +969,16 @@ mod tests {
         let mut req = Request::new();
         req.set_tp(REQ_TYPE_DAG);
         req.set_data(dag.write_to_bytes().unwrap());
-        RequestTask::new(req.clone(), box move |_| unreachable!(), 100);
-        RequestTask::new(
-            req,
-            box move |res| {
-                let s = format!("{:?}", res);
-                assert!(
-                    s.contains("Recursion"),
-                    "parse should fail due to recursion limit {}",
-                    s
-                );
-            },
-            5,
+
+        let (tx, _) = mpsc::channel(10);
+        let mut cop_resp_sink_opt = Some(CopResponseSink::TestChannel(tx));
+        let err = RequestTask::new(req, &mut cop_resp_sink_opt, 5).unwrap_err();
+        let s = format!("{:?}", err);
+        assert!(
+            s.contains("Recursion"),
+            "parse should fail due to recursion limit {}",
+            s
         );
+        assert!(cop_resp_sink_opt.is_some());
     }
 }

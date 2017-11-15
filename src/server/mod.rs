@@ -23,6 +23,8 @@ pub mod node;
 pub mod resolve;
 pub mod snap;
 
+use std::fmt;
+
 use grpc::{ServerStreamingSink, UnarySink};
 #[cfg(test)]
 use futures::sync::mpsc::Sender;
@@ -79,6 +81,17 @@ impl From<CopResponseSink> for ServerStreamingSink<Response> {
         match s {
             CopResponseSink::Streaming(sink) => sink,
             _ => unreachable!(),
+        }
+    }
+}
+
+impl fmt::Debug for CopResponseSink {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            CopResponseSink::Unary(_) => write!(f, "Grpc UnarySink"),
+            CopResponseSink::Streaming(_) => write!(f, "Grpc ServerStreamingSink"),
+            #[cfg(test)]
+            CopResponseSink::TestChannel(_) => write!(f, "Test Sender"),
         }
     }
 }
