@@ -25,7 +25,7 @@ use grpc::{Error as GrpcError, WriteFlags};
 #[cfg(test)]
 use futures::Sink;
 
-use tipb::select::{self, Chunk, DAGRequest, SelectRequest};
+use tipb::select::{self, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
 use tipb::executor::ExecType;
 use tipb::schema::ColumnInfo;
@@ -53,8 +53,6 @@ pub const REQ_TYPE_SELECT: i64 = 101;
 pub const REQ_TYPE_INDEX: i64 = 102;
 pub const REQ_TYPE_DAG: i64 = 103;
 pub const REQ_TYPE_ANALYZE: i64 = 104;
-pub const BATCH_ROW_COUNT: usize = 64;
-pub const CHUNKS_PER_STREAM: usize = 64;
 
 // If a request has been handled for more than 60 seconds, the client should
 // be timeout already, so it can be safely aborted.
@@ -129,6 +127,8 @@ pub struct Host {
     high_priority_pool: CpuPool,
     max_running_task_count: usize,
     running_task_count: Arc<AtomicUsize>,
+    batch_row_limit: usize,
+    chunks_per_stream: usize,
     cop_context: Arc<CopContext>,
     pd_task_sender: FutureScheduler<PdTask>,
 }
@@ -156,6 +156,8 @@ impl Host {
             low_priority_pool: create_pool("endpoint-low-pool", cfg.end_point_concurrency),
             high_priority_pool: create_pool("endpoint-high-pool", cfg.end_point_concurrency),
             max_running_task_count: cfg.end_point_max_tasks,
+            batch_row_limit: cfg.end_point_batch_row_limit,
+            chunks_per_stream: cfg.end_point_chunks_per_stream,
             running_task_count: Arc::new(AtomicUsize::new(0)),
             cop_context: Arc::new(CopContext::new()),
             pd_task_sender: pd_task_sender,
@@ -205,13 +207,17 @@ impl Host {
 
         let (mut req, cop_req, req_ctx, on_finish) = (t.req, t.cop_req, t.ctx, t.on_finish);
         let ranges = req.take_ranges().into_vec();
+        let batch_row_limit = self.batch_row_limit;
+        let chunks_per_stream = self.chunks_per_stream;
+
         let dispatch_request = move || match cop_req {
             // TODO: here we don't need Arc.
             CopRequest::Select(sel) => {
-                let mut ctx = match SelectContext::new(sel, snap, Arc::new(req_ctx)) {
-                    Ok(ctx) => ctx,
-                    Err(e) => return on_finish.on_error(e, &statistics, cop_context),
-                };
+                let mut ctx =
+                    match SelectContext::new(sel, snap, Arc::new(req_ctx), batch_row_limit) {
+                        Ok(ctx) => ctx,
+                        Err(e) => return on_finish.on_error(e, &statistics, cop_context),
+                    };
                 let resp = ctx.handle_request(ranges);
                 ctx.collect_statistics_into(&statistics);
                 match resp {
@@ -220,10 +226,18 @@ impl Host {
                 }
             }
             CopRequest::DAG(dag) => {
-                let mut ctx = match DAGContext::new(dag, ranges, snap, Arc::new(req_ctx)) {
+                let mut ctx = match DAGContext::new(
+                    dag,
+                    ranges,
+                    snap,
+                    Arc::new(req_ctx),
+                    batch_row_limit,
+                    chunks_per_stream,
+                ) {
                     Ok(ctx) => ctx,
                     Err(e) => return on_finish.on_error(e, &statistics, cop_context),
                 };
+
                 if !on_finish.is_streaming() {
                     let resp = ctx.handle_request(false);
                     ctx.collect_statistics_into(&statistics);
@@ -813,18 +827,6 @@ pub fn get_pk(col: &ColumnInfo, h: i64) -> Datum {
     } else {
         Datum::I64(h)
     }
-}
-
-#[inline]
-pub fn get_chunk(chunks: &mut Vec<Chunk>) -> &mut Chunk {
-    if chunks
-        .last()
-        .map_or(true, |chunk| chunk.get_rows_meta().len() >= BATCH_ROW_COUNT)
-    {
-        let chunk = Chunk::new();
-        chunks.push(chunk);
-    }
-    chunks.last_mut().unwrap()
 }
 
 pub const STR_REQ_TYPE_SELECT: &'static str = "select";

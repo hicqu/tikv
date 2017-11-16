@@ -23,7 +23,7 @@ use coprocessor::codec::mysql;
 use coprocessor::codec::datum::{Datum, DatumEncoder};
 use coprocessor::select::xeval::EvalContext;
 use coprocessor::{Error, Result};
-use coprocessor::endpoint::{get_pk, to_pb_error, ReqContext, BATCH_ROW_COUNT, CHUNKS_PER_STREAM};
+use coprocessor::endpoint::{get_pk, to_pb_error, ReqContext};
 use storage::{Snapshot, SnapshotStore, Statistics};
 
 use super::executor::{build_exec, Executor, Row};
@@ -34,6 +34,8 @@ pub struct DAGContext {
     req_ctx: Arc<ReqContext>,
     exec: Box<Executor>,
     output_offsets: Vec<u32>,
+    batch_row_limit: usize,
+    chunks_per_stream: usize,
     chunks: Vec<Chunk>,
 }
 
@@ -43,6 +45,8 @@ impl DAGContext {
         ranges: Vec<KeyRange>,
         snap: Box<Snapshot>,
         req_ctx: Arc<ReqContext>,
+        batch_row_limit: usize,
+        chunks_per_stream: usize,
     ) -> Result<DAGContext> {
         let eval_ctx = Arc::new(box_try!(EvalContext::new(
             req.get_time_zone_offset(),
@@ -62,38 +66,40 @@ impl DAGContext {
             req_ctx: req_ctx,
             exec: dag_executor.exec,
             output_offsets: req.take_output_offsets(),
+            batch_row_limit: batch_row_limit,
+            chunks_per_stream: chunks_per_stream,
             chunks: Vec::new(),
         })
     }
 
     pub fn handle_request(&mut self, streaming: bool) -> Result<(Response, bool)> {
-        let mut cur_row_count = 0;
-        let mut chunk = Chunk::default();
+        let mut record_cnt = 0;
         loop {
             match self.exec.next() {
                 Ok(Some(row)) => {
                     self.req_ctx.check_if_outdated()?;
+                    let mut stream_result = None;
+                    if self.chunks.is_empty() || record_cnt >= self.batch_row_limit {
+                        if streaming && self.chunks.len() >= self.chunks_per_stream {
+                            stream_result = Some(self.make_response(true));
+                        }
+                        self.chunks.push(Chunk::new());
+                        record_cnt = 0;
+                    }
+                    record_cnt += 1;
+
+                    let chunk = self.chunks.last_mut().unwrap();
                     if self.has_aggr {
                         chunk.mut_rows_data().extend_from_slice(&row.data.value);
                     } else {
                         let value = inflate_cols(&row, &self.columns, &self.output_offsets)?;
                         chunk.mut_rows_data().extend_from_slice(&value);
                     }
-                    cur_row_count += 1;
-                    if cur_row_count >= BATCH_ROW_COUNT {
-                        self.chunks.push(mem::replace(&mut chunk, Chunk::default()));
-                        cur_row_count = 0;
-                        if streaming && self.chunks.len() >= CHUNKS_PER_STREAM {
-                            return self.make_response(true);
-                        }
+                    if let Some(stream_result) = stream_result {
+                        return stream_result;
                     }
                 }
-                Ok(None) => {
-                    if cur_row_count > 0 {
-                        self.chunks.push(chunk);
-                    }
-                    return self.make_response(false);
-                }
+                Ok(None) => return self.make_response(false),
                 Err(e) => if let Error::Other(_) = e {
                     let mut resp = Response::new();
                     let mut sel_resp = SelectResponse::new();

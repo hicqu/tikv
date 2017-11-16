@@ -22,6 +22,7 @@ pub mod transport;
 pub mod node;
 pub mod resolve;
 pub mod snap;
+pub mod debug;
 
 use std::fmt;
 
