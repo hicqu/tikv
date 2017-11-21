@@ -23,8 +23,6 @@ use futures::{future, stream, Future, Sink, Stream};
 use futures::sync::mpsc;
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
 use grpc::{Error as GrpcError, WriteFlags};
-#[cfg(test)]
-use futures::Sink;
 
 use tipb::select::{self, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
@@ -104,7 +102,7 @@ impl CopContext {
     }
 
     fn add_statistics_by_region(&mut self, region_id: u64, stats: &Statistics) {
-        let mut flow_stats = self.request_stats
+        let flow_stats = self.request_stats
             .entry(region_id)
             .or_insert_with(FlowStatistics::default);
         flow_stats.add(&stats.write.flow_stats);
@@ -143,6 +141,7 @@ impl Host {
 
         let (stats_tx, stats_rx) = mpsc::channel(cfg.end_point_max_tasks);
         let cop_ctx = CopContext::new();
+        let pd_periodic = Duration::from_secs(1);
 
         let future = stats_rx.fold(cop_ctx, move |mut cop_ctx, (region, scan_tag, stats)| {
             cop_ctx.add_statistics(scan_tag, &stats);
@@ -164,14 +163,13 @@ impl Host {
                 this_statistics.count = 0;
             }
 
-            if cop_ctx.timer.elapsed() > Duration::from_secs(1) {
-                if !cop_ctx.request_stats.is_empty() {
-                    let pd_task = PdTask::ReadStats {
-                        read_stats: mem::replace(&mut cop_ctx.request_stats, map![]),
-                    };
-                    if let Err(e) = pd_task_sender.schedule(pd_task) {
-                        error!("send coprocessor statistics: {:?}", e);
-                    }
+            if cop_ctx.timer.elapsed() > pd_periodic && !cop_ctx.request_stats.is_empty() {
+                cop_ctx.timer = Instant::now_coarse();
+                let pd_task = PdTask::ReadStats {
+                    read_stats: mem::replace(&mut cop_ctx.request_stats, map![]),
+                };
+                if let Err(e) = pd_task_sender.schedule(pd_task) {
+                    error!("send coprocessor statistics: {:?}", e);
                 }
             }
             future::ok::<_, ()>(cop_ctx)
