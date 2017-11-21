@@ -13,16 +13,18 @@
 
 use std::{mem, usize};
 use std::time::Duration;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
 use std::boxed::FnBox;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt::{self, Debug, Display, Formatter};
 
 use protobuf::{CodedInputStream, Message as PbMsg};
+use grpc::{Error as GrpcError, WriteFlags};
 use futures::{future, stream, Future, Stream};
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
-use grpc::{Error as GrpcError, WriteFlags};
+#[cfg(test)]
+use futures::Sink;
 
 use tipb::select::{self, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
@@ -147,27 +149,14 @@ unsafe impl Sync for CopContext {}
 
 #[derive(Clone)]
 struct CopContextPool {
-    cop_ctxs: Arc<RwLock<HashMap<usize, CopContext>>>,
+    cop_ctxs: Arc<HashMap<usize, CopContext>>,
 }
 
 impl CopContextPool {
-    fn new() -> CopContextPool {
-        CopContextPool {
-            cop_ctxs: Arc::new(RwLock::new(map![])),
-        }
-    }
-
-    // Add a thread id into the pool.
-    fn add(&self, thread_id: usize, pd_task_sender: FutureScheduler<PdTask>) {
-        let cop_ctx = CopContext(RefCell::new(_CopContext::new(pd_task_sender)));
-        self.cop_ctxs.write().unwrap().insert(thread_id, cop_ctx);
-    }
-
     // Must run in CpuPool.
     fn collect(&self, region_id: u64, scan_tag: &str, stats: &Statistics) {
         let thread_id = ::thread_id::get();
-        let cop_ctxs = self.cop_ctxs.read().unwrap();
-        let cop_ctx = cop_ctxs.get(&thread_id).unwrap();
+        let cop_ctx = self.cop_ctxs.get(&thread_id).unwrap();
         cop_ctx.0.borrow_mut().collect(region_id, scan_tag, stats);
     }
 }
@@ -194,17 +183,23 @@ impl Host {
         pd_task_sender: FutureScheduler<PdTask>,
     ) -> Host {
         let create_pool = |name_prefix: &str, size: usize| {
-            let cop_ctx_pool = CopContextPool::new();
+            let cop_ctxs = Arc::new(Mutex::new(Some(map![])));
             let cpu_pool = {
-                let cop_ctx_pool = cop_ctx_pool.clone();
-                let pd_task_sender = pd_task_sender.clone();
+                let cop_ctxs = cop_ctxs.clone();
+                let sender = pd_task_sender.clone();
                 CpuPoolBuilder::new()
                     .name_prefix(name_prefix)
                     .pool_size(size)
                     .after_start(move || {
-                        cop_ctx_pool.add(::thread_id::get(), pd_task_sender.clone())
+                        let cop_ctx = CopContext(RefCell::new(_CopContext::new(sender.clone())));
+                        let mut cop_ctxs_locked = cop_ctxs.lock().unwrap();
+                        let cop_ctxs = cop_ctxs_locked.as_mut().unwrap();
+                        cop_ctxs.insert(::thread_id::get(), cop_ctx);
                     })
                     .create()
+            };
+            let cop_ctx_pool = CopContextPool {
+                cop_ctxs: Arc::new(cop_ctxs.lock().unwrap().take().unwrap()),
             };
             (cpu_pool, cop_ctx_pool)
         };
