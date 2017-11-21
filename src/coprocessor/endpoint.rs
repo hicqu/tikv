@@ -113,25 +113,24 @@ impl _CopContext {
         self.add_statistics(scan_tag, stats);
         self.add_statistics_by_region(region_id, stats);
 
-        for type_str in &[STR_REQ_TYPE_SELECT, STR_REQ_TYPE_INDEX] {
-            let this_statistics = self.get_statistics(type_str);
-            if this_statistics.count == 0 {
-                continue;
-            }
-            for (cf, details) in this_statistics.stat.details() {
-                for (tag, count) in details {
-                    COPR_SCAN_DETAILS
-                        .with_label_values(&[type_str, cf, tag])
-                        .inc_by(count as f64)
-                        .unwrap();
+        let new_timer = Instant::now();
+        if new_timer.duration_since(self.timer) > Duration::from_secs(1) {
+            self.timer = new_timer;
+            for type_str in &[STR_REQ_TYPE_SELECT, STR_REQ_TYPE_INDEX] {
+                let this_statistics = self.get_statistics(type_str);
+                if this_statistics.count == 0 {
+                    continue;
                 }
+                for (cf, details) in this_statistics.stat.details() {
+                    for (tag, count) in details {
+                        COPR_SCAN_DETAILS
+                            .with_label_values(&[type_str, cf, tag])
+                            .inc_by(count as f64)
+                            .unwrap();
+                    }
+                }
+                this_statistics.count = 0;
             }
-            this_statistics.count = 0;
-        }
-
-        let pd_periodic = Duration::from_secs(1);
-        if self.timer.elapsed() > pd_periodic && !self.request_stats.is_empty() {
-            self.timer = Instant::now_coarse();
             let pd_task = PdTask::ReadStats {
                 read_stats: mem::replace(&mut self.request_stats, map![]),
             };
@@ -166,15 +165,13 @@ impl CopContextPool {
 
     // Must run in CpuPool.
     fn collect(&self, region_id: u64, scan_tag: &str, stats: &Statistics) {
+        let timer = Instant::now();
         let thread_id = ::thread_id::get();
         let cop_ctxs = self.cop_ctxs.read().unwrap();
         let cop_ctx = cop_ctxs.get(&thread_id).unwrap();
-        cop_ctx.0.borrow_mut().collect(region_id, scan_tag, &stats);
+        cop_ctx.0.borrow_mut().collect(region_id, scan_tag, stats);
     }
 }
-
-
-unsafe impl Sync for CopContextPool {}
 
 pub struct Host {
     engine: Box<Engine>,
@@ -235,8 +232,9 @@ impl Host {
     fn notify_batch_failed_by_id<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
         debug!("failed to handle batch request: {:?}", e);
         let resp = err_resp(e.into());
+        let stats = Statistics::default();
         for t in self.reqs.remove(&batch_id).unwrap() {
-            t.on_finish.respond(resp.clone(), None, None);
+            t.on_finish.respond(resp.clone(), &stats, None);
         }
     }
 
@@ -257,10 +255,11 @@ impl Host {
         };
 
         let pool = &mut pool_and_ctx_pool.0;
-        let ctx_pool = pool_and_ctx_pool.1.clone();
+        let ctx_pool = Some(pool_and_ctx_pool.1.clone());
+        let mut statistics = Statistics::default();
 
         if let Err(e) = t.check_outdated() {
-            let future = t.on_finish.on_error(e, None, None);
+            let future = t.on_finish.on_error(e, &statistics, None);
             pool.spawn(future).forget();
             return;
         }
@@ -269,7 +268,6 @@ impl Host {
         let ranges = req.take_ranges().into_vec();
         let batch_row_limit = self.batch_row_limit;
         let chunks_per_stream = self.chunks_per_stream;
-        let mut statistics = Statistics::default();
 
         let dispatch_request = move || match cop_req {
             // TODO: here we don't need Arc.
@@ -277,13 +275,13 @@ impl Host {
                 let mut ctx =
                     match SelectContext::new(sel, snap, Arc::new(req_ctx), batch_row_limit) {
                         Ok(ctx) => ctx,
-                        Err(e) => return on_finish.on_error(e, None, None),
+                        Err(e) => return on_finish.on_error(e, &statistics, None),
                     };
                 let resp = ctx.handle_request(ranges);
                 ctx.collect_statistics_into(&mut statistics);
                 match resp {
-                    Ok(resp) => on_finish.respond(resp, Some(statistics), Some(ctx_pool)),
-                    Err(e) => on_finish.on_error(e, Some(statistics), Some(ctx_pool)),
+                    Ok(resp) => on_finish.respond(resp, &statistics, ctx_pool),
+                    Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
                 }
             }
             CopRequest::DAG(dag) => {
@@ -296,15 +294,15 @@ impl Host {
                     chunks_per_stream,
                 ) {
                     Ok(ctx) => ctx,
-                    Err(e) => return on_finish.on_error(e, None, None),
+                    Err(e) => return on_finish.on_error(e, &statistics, None),
                 };
 
                 if !on_finish.is_streaming() {
                     let resp = ctx.handle_request(false);
                     ctx.collect_statistics_into(&mut statistics);
                     match resp {
-                        Ok((resp, _)) => on_finish.respond(resp, Some(statistics), Some(ctx_pool)),
-                        Err(e) => on_finish.on_error(e, Some(statistics), Some(ctx_pool)),
+                        Ok((resp, _)) => on_finish.respond(resp, &statistics, ctx_pool),
+                        Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
                     }
                 } else {
                     let statistics = Arc::new(Mutex::new(statistics));
@@ -325,15 +323,15 @@ impl Host {
                             }
                         })
                     });
-                    on_finish.respond_stream(box stream, statistics, Some(ctx_pool))
+                    on_finish.respond_stream(box stream, statistics, ctx_pool)
                 }
             }
             CopRequest::Analyze(analyze) => {
                 let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
                 let resp = ctx.handle_request(&mut statistics);
                 match resp {
-                    Ok(resp) => on_finish.respond(resp, Some(statistics), Some(ctx_pool)),
-                    Err(e) => on_finish.on_error(e, Some(statistics), Some(ctx_pool)),
+                    Ok(resp) => on_finish.respond(resp, &statistics, ctx_pool),
+                    Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
                 }
             }
         };
@@ -358,10 +356,9 @@ impl Host {
     }
 
     fn on_error_quickly(&mut self, req: RequestTask, e: Error) {
-        self.pool
-            .0
-            .spawn(req.on_finish.on_error(e, None, None))
-            .forget();
+        let stats = Statistics::default();
+        let pool = &mut self.pool.0;
+        pool.spawn(req.on_finish.on_error(e, &stats, None)).forget();
     }
 }
 
@@ -473,7 +470,7 @@ impl OnRequestFinish {
     fn respond(
         mut self,
         resp: Response,
-        statistics: Option<Statistics>,
+        statistics: &Statistics,
         ctx_pool: Option<CopContextPool>,
     ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         self.sub_task_count();
@@ -497,7 +494,7 @@ impl OnRequestFinish {
     fn on_error(
         self,
         e: Error,
-        statistics: Option<Statistics>,
+        statistics: &Statistics,
         ctx_pool: Option<CopContextPool>,
     ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         let resp = err_resp(e);
@@ -519,8 +516,8 @@ impl OnRequestFinish {
             .forward(sink)
             .map(move |_| {
                 self.sub_task_count();
-                let stats = Some(statistics.lock().unwrap().clone());
-                self.stop_record_handling(stats, ctx_pool);
+                let stats = statistics.lock().unwrap();
+                self.stop_record_handling(&*stats, ctx_pool);
                 self.update_metric();
             })
     }
@@ -535,11 +532,7 @@ impl OnRequestFinish {
             .observe(self.wait_time);
     }
 
-    fn stop_record_handling(
-        &mut self,
-        statistics: Option<Statistics>,
-        ctx_pool: Option<CopContextPool>,
-    ) {
+    fn stop_record_handling(&mut self, stats: &Statistics, ctx_pool: Option<CopContextPool>) {
         self.stop_record_waiting();
         let handle_time = duration_to_sec(self.timer.elapsed());
 
@@ -551,11 +544,9 @@ impl OnRequestFinish {
             .with_label_values(&[self.scan_tag])
             .observe(handle_time - self.wait_time);
 
-        let total_op_count = statistics.as_ref().map_or(0, |s| s.total_op_count());
-
         COPR_SCAN_KEYS
             .with_label_values(&[self.scan_tag])
-            .observe(total_op_count as f64);
+            .observe(stats.total_op_count() as f64);
 
         if handle_time > SLOW_QUERY_LOWER_BOUND {
             info!(
@@ -566,15 +557,14 @@ impl OnRequestFinish {
                 self.scan_tag,
                 handle_time,
                 self.wait_time,
-                total_op_count,
-                statistics.as_ref().map_or(0, |s| s.total_processed()),
+                stats.total_op_count(),
+                stats.total_processed(),
                 self.ranges_len,
                 self.first_range,
             );
         }
         if let Some(ctx_pool) = ctx_pool {
-            let stats = statistics.unwrap_or_default();
-            ctx_pool.collect(self.region_id, self.scan_tag, &stats);
+            ctx_pool.collect(self.region_id, self.scan_tag, stats);
         }
     }
 }
