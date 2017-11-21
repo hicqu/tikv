@@ -13,14 +13,14 @@
 
 use std::{mem, usize};
 use std::time::Duration;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::cell::RefCell;
 use std::boxed::FnBox;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt::{self, Debug, Display, Formatter};
 
 use protobuf::{CodedInputStream, Message as PbMsg};
-use futures::{future, stream, Future, Sink, Stream};
-use futures::sync::mpsc;
+use futures::{future, stream, Future, Stream};
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
 use grpc::{Error as GrpcError, WriteFlags};
 
@@ -67,22 +67,22 @@ const OUTDATED_ERROR_MSG: &'static str = "request outdated.";
 
 const ENDPOINT_IS_BUSY: &'static str = "endpoint is busy";
 
-struct CopContext {
+struct _CopContext {
     select_stats: StatisticsSummary,
     index_stats: StatisticsSummary,
     request_stats: HashMap<u64, FlowStatistics>,
     timer: Instant,
+    pd_task_sender: FutureScheduler<PdTask>,
 }
 
-unsafe impl Sync for CopContext {}
-
-impl CopContext {
-    fn new() -> Self {
-        CopContext {
+impl _CopContext {
+    fn new(pd_task_sender: FutureScheduler<PdTask>) -> Self {
+        _CopContext {
             select_stats: StatisticsSummary::default(),
             index_stats: StatisticsSummary::default(),
             request_stats: map![],
             timer: Instant::now_coarse(),
+            pd_task_sender: pd_task_sender,
         }
     }
 
@@ -108,17 +108,82 @@ impl CopContext {
         flow_stats.add(&stats.write.flow_stats);
         flow_stats.add(&stats.data.flow_stats);
     }
+
+    fn collect(&mut self, region_id: u64, scan_tag: &str, stats: &Statistics) {
+        self.add_statistics(scan_tag, stats);
+        self.add_statistics_by_region(region_id, stats);
+
+        for type_str in &[STR_REQ_TYPE_SELECT, STR_REQ_TYPE_INDEX] {
+            let this_statistics = self.get_statistics(type_str);
+            if this_statistics.count == 0 {
+                continue;
+            }
+            for (cf, details) in this_statistics.stat.details() {
+                for (tag, count) in details {
+                    COPR_SCAN_DETAILS
+                        .with_label_values(&[type_str, cf, tag])
+                        .inc_by(count as f64)
+                        .unwrap();
+                }
+            }
+            this_statistics.count = 0;
+        }
+
+        let pd_periodic = Duration::from_secs(1);
+        if self.timer.elapsed() > pd_periodic && !self.request_stats.is_empty() {
+            self.timer = Instant::now_coarse();
+            let pd_task = PdTask::ReadStats {
+                read_stats: mem::replace(&mut self.request_stats, map![]),
+            };
+            if let Err(e) = self.pd_task_sender.schedule(pd_task) {
+                error!("send coprocessor statistics: {:?}", e);
+            }
+        }
+    }
 }
+
+struct CopContext(RefCell<_CopContext>);
+
+unsafe impl Sync for CopContext {}
+
+#[derive(Clone)]
+struct CopContextPool {
+    cop_ctxs: Arc<RwLock<HashMap<usize, CopContext>>>,
+}
+
+impl CopContextPool {
+    fn new() -> CopContextPool {
+        CopContextPool {
+            cop_ctxs: Arc::new(RwLock::new(map![])),
+        }
+    }
+
+    // Add a thread id into the pool.
+    fn add(&self, thread_id: usize, pd_task_sender: FutureScheduler<PdTask>) {
+        let cop_ctx = CopContext(RefCell::new(_CopContext::new(pd_task_sender)));
+        self.cop_ctxs.write().unwrap().insert(thread_id, cop_ctx);
+    }
+
+    // Must run in CpuPool.
+    fn collect(&self, region_id: u64, scan_tag: &str, stats: &Statistics) {
+        let thread_id = ::thread_id::get();
+        let cop_ctxs = self.cop_ctxs.read().unwrap();
+        let cop_ctx = cop_ctxs.get(&thread_id).unwrap();
+        cop_ctx.0.borrow_mut().collect(region_id, scan_tag, &stats);
+    }
+}
+
+
+unsafe impl Sync for CopContextPool {}
 
 pub struct Host {
     engine: Box<Engine>,
     sched: Scheduler<Task>,
     reqs: HashMap<u64, Vec<RequestTask>>,
     last_req_id: u64,
-    pool: CpuPool,
-    low_priority_pool: CpuPool,
-    high_priority_pool: CpuPool,
-    stats_sender: mpsc::Sender<(u64, &'static str, Statistics)>,
+    pool: (CpuPool, CopContextPool),
+    low_priority_pool: (CpuPool, CopContextPool),
+    high_priority_pool: (CpuPool, CopContextPool),
     max_running_task_count: usize,
     running_task_count: Arc<AtomicUsize>,
     batch_row_limit: usize,
@@ -133,50 +198,20 @@ impl Host {
         pd_task_sender: FutureScheduler<PdTask>,
     ) -> Host {
         let create_pool = |name_prefix: &str, size: usize| {
-            CpuPoolBuilder::new()
-                .name_prefix(name_prefix)
-                .pool_size(size)
-                .create()
+            let cop_ctx_pool = CopContextPool::new();
+            let cpu_pool = {
+                let cop_ctx_pool = cop_ctx_pool.clone();
+                let pd_task_sender = pd_task_sender.clone();
+                CpuPoolBuilder::new()
+                    .name_prefix(name_prefix)
+                    .pool_size(size)
+                    .after_start(move || {
+                        cop_ctx_pool.add(::thread_id::get(), pd_task_sender.clone())
+                    })
+                    .create()
+            };
+            (cpu_pool, cop_ctx_pool)
         };
-
-        let (stats_tx, stats_rx) = mpsc::channel(cfg.end_point_max_tasks);
-        let cop_ctx = CopContext::new();
-        let pd_periodic = Duration::from_secs(1);
-
-        let future = stats_rx.fold(cop_ctx, move |mut cop_ctx, (region, scan_tag, stats)| {
-            cop_ctx.add_statistics(scan_tag, &stats);
-            cop_ctx.add_statistics_by_region(region, &stats);
-
-            for type_str in &[STR_REQ_TYPE_SELECT, STR_REQ_TYPE_INDEX] {
-                let this_statistics = cop_ctx.get_statistics(type_str);
-                if this_statistics.count == 0 {
-                    continue;
-                }
-                for (cf, details) in this_statistics.stat.details() {
-                    for (tag, count) in details {
-                        COPR_SCAN_DETAILS
-                            .with_label_values(&[type_str, cf, tag])
-                            .inc_by(count as f64)
-                            .unwrap();
-                    }
-                }
-                this_statistics.count = 0;
-            }
-
-            if cop_ctx.timer.elapsed() > pd_periodic && !cop_ctx.request_stats.is_empty() {
-                cop_ctx.timer = Instant::now_coarse();
-                let pd_task = PdTask::ReadStats {
-                    read_stats: mem::replace(&mut cop_ctx.request_stats, map![]),
-                };
-                if let Err(e) = pd_task_sender.schedule(pd_task) {
-                    error!("send coprocessor statistics: {:?}", e);
-                }
-            }
-            future::ok::<_, ()>(cop_ctx)
-        });
-
-        let low_priority_pool = create_pool("endpoint-low-pool", cfg.end_point_concurrency);
-        low_priority_pool.spawn(future).forget();
 
         Host {
             engine: engine,
@@ -184,9 +219,8 @@ impl Host {
             reqs: HashMap::default(),
             last_req_id: 0,
             pool: create_pool("endpoint-normal-pool", cfg.end_point_concurrency),
-            low_priority_pool: low_priority_pool,
+            low_priority_pool: create_pool("endpoint-low-pool", cfg.end_point_concurrency),
             high_priority_pool: create_pool("endpoint-high-pool", cfg.end_point_concurrency),
-            stats_sender: stats_tx,
             max_running_task_count: cfg.end_point_max_tasks,
             batch_row_limit: cfg.end_point_batch_row_limit,
             chunks_per_stream: cfg.end_point_chunks_per_stream,
@@ -216,11 +250,14 @@ impl Host {
             .with_label_values(&[scan_tag, pri_str])
             .add(1.0);
 
-        let pool = match pri {
+        let pool_and_ctx_pool = match pri {
             CommandPri::Low => &mut self.low_priority_pool,
             CommandPri::High => &mut self.high_priority_pool,
             CommandPri::Normal => &mut self.pool,
         };
+
+        let pool = &mut pool_and_ctx_pool.0;
+        let ctx_pool = pool_and_ctx_pool.1.clone();
 
         if let Err(e) = t.check_outdated() {
             let future = t.on_finish.on_error(e, None, None);
@@ -232,9 +269,7 @@ impl Host {
         let ranges = req.take_ranges().into_vec();
         let batch_row_limit = self.batch_row_limit;
         let chunks_per_stream = self.chunks_per_stream;
-
         let mut statistics = Statistics::default();
-        let stats_sender = self.stats_sender.clone();
 
         let dispatch_request = move || match cop_req {
             // TODO: here we don't need Arc.
@@ -247,8 +282,8 @@ impl Host {
                 let resp = ctx.handle_request(ranges);
                 ctx.collect_statistics_into(&mut statistics);
                 match resp {
-                    Ok(resp) => on_finish.respond(resp, Some(statistics), Some(stats_sender)),
-                    Err(e) => on_finish.on_error(e, Some(statistics), Some(stats_sender)),
+                    Ok(resp) => on_finish.respond(resp, Some(statistics), Some(ctx_pool)),
+                    Err(e) => on_finish.on_error(e, Some(statistics), Some(ctx_pool)),
                 }
             }
             CopRequest::DAG(dag) => {
@@ -268,10 +303,8 @@ impl Host {
                     let resp = ctx.handle_request(false);
                     ctx.collect_statistics_into(&mut statistics);
                     match resp {
-                        Ok((resp, _)) => {
-                            on_finish.respond(resp, Some(statistics), Some(stats_sender))
-                        }
-                        Err(e) => on_finish.on_error(e, Some(statistics), Some(stats_sender)),
+                        Ok((resp, _)) => on_finish.respond(resp, Some(statistics), Some(ctx_pool)),
+                        Err(e) => on_finish.on_error(e, Some(statistics), Some(ctx_pool)),
                     }
                 } else {
                     let statistics = Arc::new(Mutex::new(statistics));
@@ -292,15 +325,15 @@ impl Host {
                             }
                         })
                     });
-                    on_finish.respond_stream(box stream, statistics, Some(stats_sender))
+                    on_finish.respond_stream(box stream, statistics, Some(ctx_pool))
                 }
             }
             CopRequest::Analyze(analyze) => {
                 let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
                 let resp = ctx.handle_request(&mut statistics);
                 match resp {
-                    Ok(resp) => on_finish.respond(resp, Some(statistics), Some(stats_sender)),
-                    Err(e) => on_finish.on_error(e, Some(statistics), Some(stats_sender)),
+                    Ok(resp) => on_finish.respond(resp, Some(statistics), Some(ctx_pool)),
+                    Err(e) => on_finish.on_error(e, Some(statistics), Some(ctx_pool)),
                 }
             }
         };
@@ -326,6 +359,7 @@ impl Host {
 
     fn on_error_quickly(&mut self, req: RequestTask, e: Error) {
         self.pool
+            .0
             .spawn(req.on_finish.on_error(e, None, None))
             .forget();
     }
@@ -440,10 +474,10 @@ impl OnRequestFinish {
         mut self,
         resp: Response,
         statistics: Option<Statistics>,
-        stats_sender: Option<mpsc::Sender<(u64, &'static str, Statistics)>>,
+        ctx_pool: Option<CopContextPool>,
     ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         self.sub_task_count();
-        self.stop_record_handling(statistics, stats_sender);
+        self.stop_record_handling(statistics, ctx_pool);
         self.update_metric();
         match self.resp_sink.take() {
             Some(CopResponseSink::Unary(sink)) => box sink.success(resp),
@@ -464,17 +498,17 @@ impl OnRequestFinish {
         self,
         e: Error,
         statistics: Option<Statistics>,
-        sender: Option<mpsc::Sender<(u64, &'static str, Statistics)>>,
+        ctx_pool: Option<CopContextPool>,
     ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         let resp = err_resp(e);
-        self.respond(resp, statistics, sender)
+        self.respond(resp, statistics, ctx_pool)
     }
 
     fn respond_stream(
         mut self,
         stream: Box<Stream<Item = Response, Error = GrpcError> + Send>,
         statistics: Arc<Mutex<Statistics>>,
-        sender: Option<mpsc::Sender<(u64, &'static str, Statistics)>>,
+        ctx_pool: Option<CopContextPool>,
     ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
         let sink = match self.resp_sink.take() {
             Some(CopResponseSink::Streaming(sink)) => sink,
@@ -486,7 +520,7 @@ impl OnRequestFinish {
             .map(move |_| {
                 self.sub_task_count();
                 let stats = Some(statistics.lock().unwrap().clone());
-                self.stop_record_handling(stats, sender);
+                self.stop_record_handling(stats, ctx_pool);
                 self.update_metric();
             })
     }
@@ -504,7 +538,7 @@ impl OnRequestFinish {
     fn stop_record_handling(
         &mut self,
         statistics: Option<Statistics>,
-        stats_sender: Option<mpsc::Sender<(u64, &'static str, Statistics)>>,
+        ctx_pool: Option<CopContextPool>,
     ) {
         self.stop_record_waiting();
         let handle_time = duration_to_sec(self.timer.elapsed());
@@ -538,12 +572,9 @@ impl OnRequestFinish {
                 self.first_range,
             );
         }
-        if let Some(sender) = stats_sender {
+        if let Some(ctx_pool) = ctx_pool {
             let stats = statistics.unwrap_or_default();
-            sender
-                .send((self.region_id, self.scan_tag, stats))
-                .wait()
-                .unwrap();
+            ctx_pool.collect(self.region_id, self.scan_tag, &stats);
         }
     }
 }
