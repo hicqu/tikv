@@ -165,7 +165,6 @@ impl CopContextPool {
 
     // Must run in CpuPool.
     fn collect(&self, region_id: u64, scan_tag: &str, stats: &Statistics) {
-        let timer = Instant::now();
         let thread_id = ::thread_id::get();
         let cop_ctxs = self.cop_ctxs.read().unwrap();
         let cop_ctx = cop_ctxs.get(&thread_id).unwrap();
