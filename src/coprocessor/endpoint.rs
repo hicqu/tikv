@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{mem, usize};
+use std::{mem, thread, usize};
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
@@ -115,7 +115,7 @@ impl _CopContext {
         self.add_statistics(scan_tag, stats);
         self.add_statistics_by_region(region_id, stats);
 
-        let new_timer = Instant::now();
+        let new_timer = Instant::now_coarse();
         if new_timer.duration_since(self.timer) > Duration::from_secs(1) {
             self.timer = new_timer;
             for type_str in &[STR_REQ_TYPE_SELECT, STR_REQ_TYPE_INDEX] {
@@ -183,7 +183,7 @@ impl Host {
         pd_task_sender: FutureScheduler<PdTask>,
     ) -> Host {
         let create_pool = |name_prefix: &str, size: usize| {
-            let cop_ctxs = Arc::new(Mutex::new(Some(map![])));
+            let cop_ctxs = Arc::new(Mutex::new((map![], 0)));
             let cpu_pool = {
                 let cop_ctxs = cop_ctxs.clone();
                 let sender = pd_task_sender.clone();
@@ -191,17 +191,25 @@ impl Host {
                     .name_prefix(name_prefix)
                     .pool_size(size)
                     .after_start(move || {
+                        let thread_id = ::thread_id::get();
                         let cop_ctx = CopContext(RefCell::new(_CopContext::new(sender.clone())));
-                        let mut cop_ctxs_locked = cop_ctxs.lock().unwrap();
-                        let cop_ctxs = cop_ctxs_locked.as_mut().unwrap();
-                        cop_ctxs.insert(::thread_id::get(), cop_ctx);
+                        let mut map_counter = cop_ctxs.lock().unwrap();
+                        map_counter.0.insert(thread_id, cop_ctx);
+                        map_counter.1 += 1;
                     })
                     .create()
             };
-            let cop_ctx_pool = CopContextPool {
-                cop_ctxs: Arc::new(cop_ctxs.lock().unwrap().take().unwrap()),
-            };
-            (cpu_pool, cop_ctx_pool)
+            loop {
+                thread::sleep(Duration::from_millis(10));
+                let mut map_counter = cop_ctxs.lock().unwrap();
+                if map_counter.1 >= size {
+                    let cop_ctxs = mem::replace(&mut map_counter.0, map![]);
+                    let cop_ctx_pool = CopContextPool {
+                        cop_ctxs: Arc::new(cop_ctxs),
+                    };
+                    return (cpu_pool, cop_ctx_pool);
+                }
+            }
         };
 
         Host {
