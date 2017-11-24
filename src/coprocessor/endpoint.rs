@@ -22,6 +22,8 @@ use std::fmt::{self, Debug, Display, Formatter};
 use protobuf::{CodedInputStream, Message as PbMsg};
 use grpc::{Error as GrpcError, WriteFlags};
 use futures::{future, stream, Future, Stream};
+use futures::future::Executor;
+use futures::sync::mpsc::{self, SpawnHandle};
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
 #[cfg(test)]
 use futures::Sink;
@@ -269,76 +271,101 @@ impl Host {
         let (mut req, cop_req, req_ctx, on_finish) = (t.req, t.cop_req, t.ctx, t.on_finish);
         let ranges = req.take_ranges().into_vec();
         let batch_row_limit = self.batch_row_limit;
-        let chunks_per_stream = self.chunks_per_stream;
 
-        let dispatch_request = move || {
-            match cop_req {
-                // TODO: here we don't need Arc.
-                CopRequest::Select(sel) => {
-                    let mut ctx =
-                        match SelectContext::new(sel, snap, Arc::new(req_ctx), batch_row_limit) {
-                            Ok(ctx) => ctx,
-                            Err(e) => return on_finish.on_error(e, &statistics, ctx_pool),
-                        };
-                    let resp = ctx.handle_request(ranges);
-                    ctx.collect_statistics_into(&mut statistics);
-                    match resp {
-                        Ok(resp) => on_finish.respond(resp, &statistics, ctx_pool),
-                        Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
-                    }
-                }
+        if on_finish.is_streaming() {
+            let chunks_per_stream = self.chunks_per_stream;
+            let get = move || match cop_req {
                 CopRequest::DAG(dag) => {
-                    let mut ctx = match DAGContext::new(
+                    let mut ctx = DAGContext::new(
                         dag,
                         ranges,
                         snap,
-                        Arc::new(req_ctx),
+                        req_ctx,
                         batch_row_limit,
                         chunks_per_stream,
-                    ) {
-                        Ok(ctx) => ctx,
-                        Err(e) => return on_finish.on_error(e, &statistics, ctx_pool),
-                    };
-
-                    if !on_finish.is_streaming() {
-                        let resp = ctx.handle_request(false);
-                        ctx.collect_statistics_into(&mut statistics);
-                        match resp {
-                            Ok((resp, _)) => on_finish.respond(resp, &statistics, ctx_pool),
-                            Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
-                        }
-                    } else {
-                        /*****************
+                        )?;
                     let stream = stream::unfold(Some(ctx), move |ctx_opt| {
-                        ctx_opt.and_then(|mut ctx| match ctx.handle_request(true) {
-                            Ok((resp, true)) => Some(future::ok::<_, _>((resp, Some(ctx)))),
-                            Ok((resp, false)) => {
-                                let mut stats = Statistics::default();
-                                ctx.collect_statistics_into(&mut stats);
-                                ctx_pool.collect(1, "scan_tag", &stats); // TODO: real region_id.
-                                Some(future::ok::<_, _>((resp, None)))
-                            }
-                            Err(e) => {
+                        ctx_opt.and_then(|mut ctx| {
+                            let (resp, remian) = ctx.handle_request(true).unwrap_or_else(|e| (err_resp(e), false));
+                            if remian {
+                                Some(future::ok::<_, _>((resp, Some(ctx))))
+                            } else {
                                 let mut stats = Statistics::default();
                                 ctx.collect_statistics_into(&mut stats);
                                 ctx_pool.collect(1, "scan_tag", &stats); // TODO: real region_id.
                                 Some(future::ok::<_, _>((err_resp(e), None)))
                             }
+                        }
+                            
+                            match ctx.handle_request(true) {
+                            Ok((resp, true)) => Some(future::ok::<_, _>((resp, Some(ctx)))),
+                            Ok((resp, false)) => {
+                                // let mut stats = Statistics::default();
+                                // ctx.collect_statistics_into(&mut stats);
+                                // ctx_pool.collect(1, "scan_tag", &stats); // TODO: real region_id.
+                                Some(future::ok::<_, _>((resp, None)))
+                            }
+                            Err(e) => {
+                                // let mut stats = Statistics::default();
+                                // ctx.collect_statistics_into(&mut stats);
+                                // ctx_pool.collect(1, "scan_tag", &stats); // TODO: real region_id.
+                                Some(future::ok::<_, _>((err_resp(e), None)))
+                            }
                         })
                     });
-                    on_finish.respond_stream(box stream, statistics, ctx_pool)
-                    *****************/
-                    }
+                    let stream = mpsc::spawn(stream, &stream_pool, 16);
+                    on_finish.respond_stream(stream);
                 }
-                CopRequest::Analyze(analyze) => {
-                    let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
-                    let resp = ctx.handle_request(&mut statistics);
+            }
+        }
+
+
+        let stream_pool = pool.clone();
+        let dispatch_request = move || match cop_req {
+            // TODO: here we don't need Arc.
+            CopRequest::Select(sel) => {
+                let mut ctx = match SelectContext::new(sel, snap, req_ctx, batch_row_limit) {
+                    Ok(ctx) => ctx,
+                    Err(e) => return on_finish.on_error(e, &statistics, ctx_pool),
+                };
+                let resp = ctx.handle_request(ranges);
+                ctx.collect_statistics_into(&mut statistics);
+                match resp {
+                    Ok(resp) => on_finish.respond(resp, &statistics, ctx_pool),
+                    Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
+                }
+            }
+            CopRequest::DAG(dag) => {
+                let mut ctx = match DAGContext::new(
+                    dag,
+                    ranges,
+                    snap,
+                    req_ctx,
+                    batch_row_limit,
+                    chunks_per_stream,
+                ) {
+                    Ok(ctx) => ctx,
+                    Err(e) => return on_finish.on_error(e, &statistics, ctx_pool),
+                };
+
+                if !on_finish.is_streaming() {
+                    let resp = ctx.handle_request(false);
+                    ctx.collect_statistics_into(&mut statistics);
                     match resp {
-                        Ok(resp) => on_finish.respond(resp, &statistics, ctx_pool),
+                        Ok((resp, _)) => on_finish.respond(resp, &statistics, ctx_pool),
                         Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
                     }
+                } else {
                 }
-            };
+            }
+            CopRequest::Analyze(analyze) => {
+                let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
+                let resp = ctx.handle_request(&mut statistics);
+                match resp {
+                    Ok(resp) => on_finish.respond(resp, &statistics, ctx_pool),
+                    Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
+                }
+            }
         };
         pool.spawn_fn(|| {
             dispatch_request();
@@ -465,28 +492,13 @@ impl OnRequestFinish {
         self.respond(resp, stats, ctx_pool)
     }
 
-    /*****************************************
-    fn respond_stream(
-        mut self,
-        stream: Box<Stream<Item = Response, Error = GrpcError> + Send>,
-        statistics: Arc<Mutex<Statistics>>,
-        ctx_pool: Option<CopContextPool>,
-    ) -> Box<Future<Item = (), Error = GrpcError> + Send> {
-        let sink = match self.resp_sink.take() {
-            Some(CopResponseSink::Streaming(sink)) => sink,
+    fn respond_stream(mut self, stream: SpawnHandle<Response, GrpcError>) {
+        match self.on_resp {
+            OnResponse::Streaming(cb) => cb(stream),
             _ => unreachable!(),
         };
-        box stream
-            .map(|resp| (resp, WriteFlags::default().buffer_hint(true)))
-            .forward(sink)
-            .map(move |_| {
-                self.sub_task_count();
-                let stats = statistics.lock().unwrap();
-                self.stop_record_handling(&*stats, ctx_pool);
-                self.update_metric();
-            })
+        // TODO: stop_record_handling
     }
-    *****************************************/
 
     fn stop_record_waiting(&mut self) {
         if self.wait_time > 0f64 {
