@@ -29,7 +29,7 @@ use kvproto::kvrpcpb::*;
 use kvproto::coprocessor::*;
 use kvproto::errorpb::{Error as RegionError, ServerIsBusy};
 
-use util::worker::{Scheduler, Stopped};
+use util::worker::Scheduler;
 use util::collections::HashMap;
 use util::buf::PipeBuffer;
 use storage::{self, Key, Mutation, Options, Storage, Value};
@@ -39,7 +39,7 @@ use storage::engine::Error as EngineError;
 use server::transport::RaftStoreRouter;
 use server::snap::Task as SnapTask;
 use server::metrics::*;
-use server::{CopResponseSink, Error};
+use server::{Error, OnResponse};
 use raftstore::store::Msg as StoreMessage;
 use coprocessor::{EndPointTask, RequestTask};
 
@@ -766,15 +766,49 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
     }
 
     fn coprocessor(&self, ctx: RpcContext, req: Request, sink: UnarySink<Response>) {
-        let scheduler = &self.end_point_scheduler;
-        let recursion_limit = self.recursion_limit;
-        if let Some((sink, error, code)) =
-            coprocessor_dispatch(scheduler, req, recursion_limit, sink, "coprocessor")
-        {
-            self.send_fail_status(ctx, sink, error, code);
+        let (cb, future) = make_callback();
+        let on_resp = OnResponse::Unary(cb);
+        let req_task = match RequestTask::new(req, on_resp, self.recursion_limit) {
+            Ok(req_task) => req_task,
+            Err(e) => {
+                let error = box_err!(e);
+                let code = RpcStatusCode::InvalidArgument;
+                return self.send_fail_status(ctx, sink, error, code);
+            }
+        };
+
+        let task = EndPointTask::Request(req_task);
+        if let Err(e) = self.end_point_scheduler.schedule(task) {
+            let error = Error::from(e);
+            let code = RpcStatusCode::ResourceExhausted;
+            return self.send_fail_status(ctx, sink, error, code);
         }
+
+        let label = "coprocessor";
+        let timer = GRPC_MSG_HISTOGRAM_VEC
+            .with_label_values(&[label])
+            .start_coarse_timer();
+
+        let future = future
+            .map_err(Error::from)
+            .and_then(|resp| sink.success(resp).map_err(Error::from))
+            .map(|_| timer.observe_duration())
+            .map_err(move |e| {
+                debug!("{} failed: {:?}", label, e);
+                GRPC_MSG_FAIL_COUNTER.with_label_values(&[label]).inc();
+            });
+        ctx.spawn(future);
     }
 
+    fn coprocessor_stream(
+        &self,
+        ctx: RpcContext,
+        req: Request,
+        sink: ServerStreamingSink<Response>,
+    ) {
+    }
+
+    /*********************************
     fn coprocessor_stream(
         &self,
         ctx: RpcContext,
@@ -789,6 +823,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             self.send_fail_status_to_stream(ctx, sink, error, code);
         }
     }
+    *********************************/
 
     fn raft(
         &self,
@@ -1141,6 +1176,7 @@ fn extract_key_errors(res: storage::Result<Vec<storage::Result<()>>>) -> Vec<Key
     }
 }
 
+/********************************************
 /// dispatch `coprocessor` or `coprocessor_stream` requests.
 /// Return None on success, or return a (`Sink`, `Error`, `RpcStatusCode`) tuple.
 fn coprocessor_dispatch<S>(
@@ -1182,3 +1218,4 @@ where
         _ => unreachable!(),
     }
 }
+********************************************/
