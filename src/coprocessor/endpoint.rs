@@ -15,18 +15,14 @@ use std::{mem, thread, usize};
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
-use std::boxed::FnBox;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt::{self, Debug, Display, Formatter};
 
 use protobuf::{CodedInputStream, Message as PbMsg};
-use grpc::{Error as GrpcError, WriteFlags};
-use futures::{future, stream, Future, Stream};
-use futures::future::Executor;
-use futures::sync::mpsc::{self, SpawnHandle};
+use grpc::Error as GrpcError;
+use futures::{future, stream};
+use futures::sync::mpsc;
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
-#[cfg(test)]
-use futures::Sink;
 
 use tipb::select::{self, DAGRequest, SelectRequest};
 use tipb::analyze::{AnalyzeReq, AnalyzeType};
@@ -235,105 +231,51 @@ impl Host {
         self.running_task_count.load(Ordering::Acquire)
     }
 
-    fn notify_batch_failed_by_id<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
+    fn notify_batch_failed<E: Into<Error> + Debug>(&mut self, e: E, batch_id: u64) {
         debug!("failed to handle batch request: {:?}", e);
         let resp = err_resp(e.into());
-        let stats = Statistics::default();
         for t in self.reqs.remove(&batch_id).unwrap() {
-            t.on_finish.respond(resp.clone(), &stats, None);
+            t.on_resp.respond(resp.clone());
         }
     }
 
-    fn handle_request_on_sanpshot(&mut self, snap: Box<Snapshot>, mut t: RequestTask) {
-        t.on_finish.stop_record_waiting();
+    fn handle_request(&mut self, snap: Box<Snapshot>, mut t: RequestTask) {
+        t.metrics.stop_record_waiting();
+        if let Err(e) = t.check_outdated() {
+            return t.on_resp.respond(err_resp(e));
+        }
 
-        let pri = t.priority();
-        let scan_tag = t.ctx.get_scan_tag();
-        let pri_str = get_req_pri_str(pri);
-        COPR_PENDING_REQS
-            .with_label_values(&[scan_tag, pri_str])
-            .add(1.0);
-
-        let pool_and_ctx_pool = match pri {
+        let pool_and_ctx_pool = match t.req.get_context().get_priority() {
             CommandPri::Low => &mut self.low_priority_pool,
             CommandPri::High => &mut self.high_priority_pool,
             CommandPri::Normal => &mut self.pool,
         };
-
         let pool = &mut pool_and_ctx_pool.0;
-        let ctx_pool = Some(pool_and_ctx_pool.1.clone());
-        let mut statistics = Statistics::default();
+        let ctx_pool = pool_and_ctx_pool.1.clone();
+        let running_task_count = self.running_task_count.clone();
 
-        if let Err(e) = t.check_outdated() {
-            return t.on_finish.on_error(e, &statistics, None);
-        }
-
-        let (mut req, cop_req, req_ctx, on_finish) = (t.req, t.cop_req, t.ctx, t.on_finish);
+        let (mut req, cop_req, req_ctx, on_resp) = (t.req, t.cop_req, t.ctx, t.on_resp);
+        let mut metrics = t.metrics;
         let ranges = req.take_ranges().into_vec();
         let batch_row_limit = self.batch_row_limit;
+        let chunks_per_stream = self.chunks_per_stream;
+        let mut statistics = Statistics::default();
 
-        if on_finish.is_streaming() {
-            let chunks_per_stream = self.chunks_per_stream;
-            let get = move || match cop_req {
-                CopRequest::DAG(dag) => {
-                    let mut ctx = DAGContext::new(
-                        dag,
-                        ranges,
-                        snap,
-                        req_ctx,
-                        batch_row_limit,
-                        chunks_per_stream,
-                        )?;
-                    let stream = stream::unfold(Some(ctx), move |ctx_opt| {
-                        ctx_opt.and_then(|mut ctx| {
-                            let (resp, remian) = ctx.handle_request(true).unwrap_or_else(|e| (err_resp(e), false));
-                            if remian {
-                                Some(future::ok::<_, _>((resp, Some(ctx))))
-                            } else {
-                                let mut stats = Statistics::default();
-                                ctx.collect_statistics_into(&mut stats);
-                                ctx_pool.collect(1, "scan_tag", &stats); // TODO: real region_id.
-                                Some(future::ok::<_, _>((err_resp(e), None)))
-                            }
-                        }
-                            
-                            match ctx.handle_request(true) {
-                            Ok((resp, true)) => Some(future::ok::<_, _>((resp, Some(ctx)))),
-                            Ok((resp, false)) => {
-                                // let mut stats = Statistics::default();
-                                // ctx.collect_statistics_into(&mut stats);
-                                // ctx_pool.collect(1, "scan_tag", &stats); // TODO: real region_id.
-                                Some(future::ok::<_, _>((resp, None)))
-                            }
-                            Err(e) => {
-                                // let mut stats = Statistics::default();
-                                // ctx.collect_statistics_into(&mut stats);
-                                // ctx_pool.collect(1, "scan_tag", &stats); // TODO: real region_id.
-                                Some(future::ok::<_, _>((err_resp(e), None)))
-                            }
-                        })
-                    });
-                    let stream = mpsc::spawn(stream, &stream_pool, 16);
-                    on_finish.respond_stream(stream);
-                }
-            }
-        }
-
-
-        let stream_pool = pool.clone();
-        let dispatch_request = move || match cop_req {
-            // TODO: here we don't need Arc.
+        match cop_req {
             CopRequest::Select(sel) => {
                 let mut ctx = match SelectContext::new(sel, snap, req_ctx, batch_row_limit) {
                     Ok(ctx) => ctx,
-                    Err(e) => return on_finish.on_error(e, &statistics, ctx_pool),
+                    Err(e) => return on_resp.respond(err_resp(e)),
                 };
-                let resp = ctx.handle_request(ranges);
-                ctx.collect_statistics_into(&mut statistics);
-                match resp {
-                    Ok(resp) => on_finish.respond(resp, &statistics, ctx_pool),
-                    Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
-                }
+                let do_request = move || {
+                    let resp = ctx.handle_request(ranges).unwrap_or_else(err_resp);
+                    ctx.collect_statistics_into(&mut statistics);
+                    metrics.stop_record_handling(&statistics);
+                    ctx_pool.collect(metrics.region_id, metrics.scan_tag, &statistics);
+                    running_task_count.fetch_sub(1, Ordering::Release);
+                    future::ok::<_, ()>(on_resp.respond(resp))
+                };
+                pool.spawn_fn(do_request).forget();
             }
             CopRequest::DAG(dag) => {
                 let mut ctx = match DAGContext::new(
@@ -345,51 +287,60 @@ impl Host {
                     chunks_per_stream,
                 ) {
                     Ok(ctx) => ctx,
-                    Err(e) => return on_finish.on_error(e, &statistics, ctx_pool),
+                    Err(e) => return on_resp.respond(err_resp(e)),
                 };
+                if !on_resp.is_streaming() {
+                    let do_request = move || {
+                        let res = ctx.handle_request(false).map(|(resp, _)| resp);
+                        let resp = res.unwrap_or_else(err_resp);
 
-                if !on_finish.is_streaming() {
-                    let resp = ctx.handle_request(false);
-                    ctx.collect_statistics_into(&mut statistics);
-                    match resp {
-                        Ok((resp, _)) => on_finish.respond(resp, &statistics, ctx_pool),
-                        Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
-                    }
-                } else {
+                        ctx.collect_statistics_into(&mut statistics);
+                        metrics.stop_record_handling(&statistics);
+                        ctx_pool.collect(metrics.region_id, metrics.scan_tag, &statistics);
+                        running_task_count.fetch_sub(1, Ordering::Release);
+                        future::ok::<_, ()>(on_resp.respond(resp))
+                    };
+                    return pool.spawn_fn(do_request).forget();
                 }
+                let s = stream::unfold(Some(ctx), move |ctx_opt| {
+                    ctx_opt.and_then(|mut ctx| {
+                        let (resp, remain) = ctx.handle_request(true)
+                            .unwrap_or_else(|e| (err_resp(e), false));
+                        if remain {
+                            return Some(future::ok::<_, GrpcError>((resp, Some(ctx))));
+                        }
+                        let mut stats = Statistics::default();
+                        ctx.collect_statistics_into(&mut stats);
+                        metrics.stop_record_handling(&stats);
+                        ctx_pool.collect(metrics.region_id, metrics.scan_tag, &stats);
+                        running_task_count.fetch_sub(1, Ordering::Release);
+                        Some(future::ok::<_, GrpcError>((resp, None)))
+                    })
+                });
+                on_resp.respond_stream(box mpsc::spawn(s, pool, 16));
             }
             CopRequest::Analyze(analyze) => {
                 let ctx = AnalyzeContext::new(analyze, ranges, snap, &req_ctx);
-                let resp = ctx.handle_request(&mut statistics);
-                match resp {
-                    Ok(resp) => on_finish.respond(resp, &statistics, ctx_pool),
-                    Err(e) => on_finish.on_error(e, &statistics, ctx_pool),
-                }
+                let do_request = move || {
+                    let resp = ctx.handle_request(&mut statistics).unwrap_or_else(err_resp);
+                    metrics.stop_record_handling(&statistics);
+                    ctx_pool.collect(metrics.region_id, metrics.scan_tag, &statistics);
+                    running_task_count.fetch_sub(1, Ordering::Release);
+                    future::ok::<_, ()>(on_resp.respond(resp))
+                };
+                pool.spawn_fn(do_request).forget();
             }
-        };
-        pool.spawn_fn(|| {
-            dispatch_request();
-            future::ok::<(), ()>(())
-        }).forget();
-        COPR_PENDING_REQS
-            .with_label_values(&[scan_tag, pri_str])
-            .dec()
+        }
     }
 
     fn handle_snapshot_result(&mut self, id: u64, snapshot: engine::Result<Box<Snapshot>>) {
         let snap = match snapshot {
             Ok(s) => s,
-            Err(e) => return self.notify_batch_failed_by_id(e, id),
+            Err(e) => return self.notify_batch_failed(e, id),
         };
-
         for req in self.reqs.remove(&id).unwrap() {
-            self.handle_request_on_sanpshot(snap.clone(), req);
+            self.handle_request(snap.clone(), req);
         }
-    }
-
-    fn on_error_quickly(&mut self, req: RequestTask, e: Error) {
-        let stats = Statistics::default();
-        req.on_finish.on_error(e, &stats, None);
     }
 }
 
@@ -447,59 +398,19 @@ impl ReqContext {
     }
 }
 
-struct OnRequestFinish {
-    on_resp: OnResponse,
-    running_task_count: Option<Arc<AtomicUsize>>,
+#[derive(Debug)]
+struct CopMetrics {
     region_id: u64,
     ranges_len: usize,
     first_range: Option<KeyRange>,
     scan_tag: &'static str,
-
+    pri_str: &'static str,
     timer: Instant,
     wait_time: f64,
     start_ts: u64,
 }
 
-impl Debug for OnRequestFinish {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "OnRequestFinish: region {}, on_resp {:?}",
-            self.region_id,
-            self.on_resp
-        )
-    }
-}
-
-impl OnRequestFinish {
-    fn is_streaming(&self) -> bool {
-        match self.on_resp {
-            OnResponse::Unary(_) => false,
-            OnResponse::Streaming(_) => true,
-        }
-    }
-
-    fn respond(mut self, resp: Response, stats: &Statistics, ctx_pool: Option<CopContextPool>) {
-        self.stop_record_handling(stats, ctx_pool);
-        match self.on_resp {
-            OnResponse::Unary(cb) => cb(resp),
-            _ => unreachable!(),
-        };
-    }
-
-    fn on_error(self, e: Error, stats: &Statistics, ctx_pool: Option<CopContextPool>) {
-        let resp = err_resp(e);
-        self.respond(resp, stats, ctx_pool)
-    }
-
-    fn respond_stream(mut self, stream: SpawnHandle<Response, GrpcError>) {
-        match self.on_resp {
-            OnResponse::Streaming(cb) => cb(stream),
-            _ => unreachable!(),
-        };
-        // TODO: stop_record_handling
-    }
-
+impl CopMetrics {
     fn stop_record_waiting(&mut self) {
         if self.wait_time > 0f64 {
             return;
@@ -508,12 +419,15 @@ impl OnRequestFinish {
         COPR_REQ_WAIT_TIME
             .with_label_values(&[self.scan_tag])
             .observe(self.wait_time);
+
+        COPR_PENDING_REQS
+            .with_label_values(&[self.scan_tag, self.pri_str])
+            .add(1.0);
     }
 
-    fn stop_record_handling(&mut self, stats: &Statistics, ctx_pool: Option<CopContextPool>) {
+    fn stop_record_handling(&mut self, stats: &Statistics) {
         self.stop_record_waiting();
         let handle_time = duration_to_sec(self.timer.elapsed());
-
         COPR_REQ_HISTOGRAM_VEC
             .with_label_values(&[self.scan_tag])
             .observe(handle_time);
@@ -525,6 +439,10 @@ impl OnRequestFinish {
         COPR_SCAN_KEYS
             .with_label_values(&[self.scan_tag])
             .observe(stats.total_op_count() as f64);
+
+        COPR_PENDING_REQS
+            .with_label_values(&[self.scan_tag, self.pri_str])
+            .dec();
 
         if handle_time > SLOW_QUERY_LOWER_BOUND {
             info!(
@@ -541,13 +459,6 @@ impl OnRequestFinish {
                 self.first_range,
             );
         }
-        if let Some(ctx_pool) = ctx_pool {
-            ctx_pool.collect(self.region_id, self.scan_tag, stats);
-        }
-
-        if let Some(task_count) = self.running_task_count.as_mut() {
-            task_count.fetch_sub(1, Ordering::Release);
-        }
     }
 }
 
@@ -556,7 +467,8 @@ pub struct RequestTask {
     req: Request,
     cop_req: CopRequest,
     ctx: ReqContext,
-    on_finish: OnRequestFinish,
+    on_resp: OnResponse,
+    metrics: CopMetrics,
 }
 
 impl RequestTask {
@@ -601,14 +513,12 @@ impl RequestTask {
             fill_cache: !req.get_context().get_not_fill_cache(),
             table_scan: table_scan,
         };
-        let on_finish = OnRequestFinish {
-            on_resp: on_resp,
-            running_task_count: None,
+        let metrics = CopMetrics {
             region_id: req.get_context().get_region_id(),
             ranges_len: req.get_ranges().len(),
             first_range: req.get_ranges().get(0).cloned(),
             scan_tag: req_ctx.get_scan_tag(),
-
+            pri_str: get_req_pri_str(req.get_context().get_priority()),
             timer: timer,
             wait_time: 0f64,
             start_ts: start_ts,
@@ -618,7 +528,8 @@ impl RequestTask {
             req: req,
             cop_req: cop_req,
             ctx: req_ctx,
-            on_finish: on_finish,
+            on_resp: on_resp,
+            metrics: metrics,
         })
     }
 
@@ -660,7 +571,7 @@ impl BatchRunnable<Task> for Host {
             match task {
                 Task::Request(req) => {
                     if let Err(e) = req.check_outdated() {
-                        self.on_error_quickly(req, e);
+                        req.on_resp.respond(err_resp(e));
                         continue;
                     }
                     let key = req.get_request_key();
@@ -680,7 +591,7 @@ impl BatchRunnable<Task> for Host {
                             sched.schedule(Task::SnapRes(id, res)).unwrap()
                         })
                     } {
-                        self.notify_batch_failed_by_id(e, id);
+                        self.notify_batch_failed(e, id);
                     }
                 },
             }
@@ -692,20 +603,19 @@ impl BatchRunnable<Task> for Host {
 
         let mut batch = Vec::with_capacity(grouped_reqs.len());
         let start_id = self.last_req_id + 1;
-        for (_, mut reqs) in grouped_reqs {
+        for (_, reqs) in grouped_reqs {
             let max_running_task_count = self.max_running_task_count;
             if self.running_task_count() >= max_running_task_count {
                 for req in reqs {
-                    self.on_error_quickly(req, Error::Full(max_running_task_count));
+                    let resp = err_resp(Error::Full(max_running_task_count));
+                    req.on_resp.respond(resp);
                 }
                 continue;
             }
 
-            for req in &mut reqs {
+            for _ in &reqs {
                 self.running_task_count.fetch_add(1, Ordering::Release);
-                req.on_finish.running_task_count = Some(self.running_task_count.clone());
             }
-
             self.last_req_id += 1;
             batch.push(reqs[0].req.get_context().clone());
             self.reqs.insert(self.last_req_id, reqs);
@@ -744,7 +654,7 @@ impl BatchRunnable<Task> for Host {
                     error!("async snapshot batch failed error {:?}", e);
                     EngineError::Other(box_err!("{:?}", e))
                 });
-                self.notify_batch_failed_by_id(err, id);
+                self.notify_batch_failed(err, id);
             }
         }
     }
@@ -854,10 +764,7 @@ mod tests {
     use super::*;
     use storage::engine::{self, TEMP_DIR};
     use std::time::Duration;
-
-    use futures::{future, Future, Stream};
-    use futures::sync::mpsc;
-    use tokio_timer::wheel;
+    use std::sync::mpsc;
 
     use kvproto::coprocessor::Request;
     use tipb::select::DAGRequest;
@@ -892,24 +799,13 @@ mod tests {
 
         let mut req = Request::new();
         req.set_tp(REQ_TYPE_DAG);
+        let (tx, rx) = mpsc::channel();
+        let on_resp = OnResponse::Unary(box move |msg| tx.send(msg).unwrap());
+        let mut task = RequestTask::new(req, on_resp, 1000).unwrap();
+        task.ctx.deadline -= Duration::from_secs(super::REQUEST_MAX_HANDLE_SECS);
 
-        let (tx, mut rx) = mpsc::channel(1);
-        let mut task = RequestTask::new(req, 1000).unwrap();
-        task.set_on_finish_sink(CopResponseSink::TestChannel(tx));
-        task.ctx = ReqContext {
-            deadline: task.ctx.deadline - Duration::from_secs(super::REQUEST_MAX_HANDLE_SECS),
-            isolation_level: task.ctx.isolation_level,
-            fill_cache: task.ctx.fill_cache,
-            table_scan: task.ctx.table_scan,
-        };
         worker.schedule(Task::Request(task)).unwrap();
-
-        let resp = wheel()
-            .build()
-            .timeout(future::poll_fn(|| rx.poll()), Duration::from_secs(3))
-            .wait()
-            .unwrap()
-            .unwrap();
+        let resp = rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(!resp.get_other_error().is_empty());
         assert_eq!(resp.get_other_error(), super::OUTDATED_ERROR_MSG);
     }
@@ -930,7 +826,7 @@ mod tests {
         req.set_tp(REQ_TYPE_DAG);
         req.set_data(dag.write_to_bytes().unwrap());
 
-        let err = RequestTask::new(req, 5).unwrap_err();
+        let err = RequestTask::new(req, OnResponse::Unary(box |_| ()), 5).unwrap_err();
         let s = format!("{:?}", err);
         assert!(
             s.contains("Recursion"),

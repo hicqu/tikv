@@ -27,10 +27,8 @@ pub mod debug;
 use std::fmt;
 use std::boxed::FnBox;
 
-use grpc::{Error as GrpcError, ServerStreamingSink, UnarySink};
-#[cfg(test)]
-use futures::sync::mpsc::Sender;
-use futures::sync::mpsc::SpawnHandle;
+use grpc::Error as GrpcError;
+use futures::{stream, Stream};
 
 use kvproto::coprocessor::Response;
 
@@ -42,9 +40,37 @@ pub use self::node::{create_raft_storage, Node};
 pub use self::resolve::{PdStoreAddrResolver, StoreAddrResolver};
 pub use self::raft_client::RaftClient;
 
+pub type ResponseStream = Box<Stream<Item = Response, Error = GrpcError> + Send>;
+
 pub enum OnResponse {
     Unary(Box<FnBox(Response) + Send>),
-    Streaming(Box<FnBox(SpawnHandle<Response, GrpcError>) + Send>),
+    Streaming(Box<FnBox(ResponseStream) + Send>),
+}
+
+impl OnResponse {
+    pub fn is_streaming(&self) -> bool {
+        match *self {
+            OnResponse::Unary(_) => false,
+            OnResponse::Streaming(_) => true,
+        }
+    }
+
+    pub fn respond(self, resp: Response) {
+        match self {
+            OnResponse::Unary(cb) => cb(resp),
+            OnResponse::Streaming(cb) => {
+                let s = box stream::once::<_, GrpcError>(Ok(resp));
+                cb(s as ResponseStream);
+            }
+        }
+    }
+
+    pub fn respond_stream(self, s: ResponseStream) {
+        match self {
+            OnResponse::Streaming(cb) => cb(s),
+            OnResponse::Unary(_) => unreachable!(),
+        }
+    }
 }
 
 impl fmt::Debug for OnResponse {
