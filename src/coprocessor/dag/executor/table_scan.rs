@@ -151,9 +151,9 @@ impl Executor for TableScanExecutor {
 impl Drop for TableScanExecutor {
     fn drop(&mut self) {
         let scan_counter = COPR_GET_OR_SCAN_COUNT.with_label_values(&["range"]);
-        scan_counter.inc_by(self.row_count.0);
+        scan_counter.inc_by(self.row_count.0 as f64);
         let point_counter = COPR_GET_OR_SCAN_COUNT.with_label_values(&["point"]);
-        point_counter.inc_by(self.row_count.1);
+        point_counter.inc_by(self.row_count.1 as f64);
     }
 }
 
