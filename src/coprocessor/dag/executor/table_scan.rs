@@ -34,6 +34,7 @@ pub struct TableScanExecutor {
     col_ids: HashSet<i64>,
     key_ranges: IntoIter<KeyRange>,
     scanner: Option<Scanner>,
+    row_count: (usize, usize),
     last_key: Option<Vec<u8>>,
 }
 
@@ -63,13 +64,14 @@ impl TableScanExecutor {
             col_ids: col_ids,
             key_ranges: key_ranges.into_iter(),
             scanner: None,
+            row_count: (0, 0),
             last_key: None,
         }
     }
 
     fn get_row_from_range_scanner(&mut self) -> Result<Option<Row>> {
         if let Some(scanner) = self.scanner.as_mut() {
-            COPR_GET_OR_SCAN_COUNT.with_label_values(&["range"]).inc();
+            self.row_count.0 += 1;
             let (key, value) = match scanner.next_row()? {
                 Some((key, value)) => (key, value),
                 None => return Ok(None),
@@ -114,7 +116,7 @@ impl Executor for TableScanExecutor {
 
             if let Some(range) = self.key_ranges.next() {
                 if is_point(&range) {
-                    COPR_GET_OR_SCAN_COUNT.with_label_values(&["point"]).inc();
+                    self.row_count.1 += 1;
                     if let Some(row) = self.get_row_from_point(range)? {
                         return Ok(Some(row));
                     }
@@ -143,6 +145,15 @@ impl Executor for TableScanExecutor {
 
     fn take_last_key(&mut self) -> Option<Vec<u8>> {
         self.last_key.take()
+    }
+}
+
+impl Drop for TableScanExecutor {
+    fn drop(&mut self) {
+        let scan_counter = COPR_GET_OR_SCAN_COUNT.with_label_values(&["range"]);
+        scan_counter.inc_by(self.row_count.0);
+        let point_counter = COPR_GET_OR_SCAN_COUNT.with_label_values(&["point"]);
+        point_counter.inc_by(self.row_count.1);
     }
 }
 
