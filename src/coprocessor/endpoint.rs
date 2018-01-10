@@ -295,10 +295,10 @@ impl ReqContext {
     }
 
     pub fn check_if_outdated(&self) -> Result<()> {
-        let now = Instant::now_coarse();
-        if self.deadline <= now {
-            return Err(Error::Outdated(self.deadline, now, self.get_scan_tag()));
-        }
+        let _ = Instant::now_coarse();
+        // if self.deadline <= now {
+        //     return Err(Error::Outdated(self.deadline, now, self.get_scan_tag()));
+        // }
         Ok(())
     }
 }
@@ -315,10 +315,15 @@ pub struct RequestTask {
     ctx: Arc<ReqContext>,
 }
 
+lazy_static! {
+    static ref mock_start: Instant = Instant::now_coarse();
+    static ref mock_deadline: Instant = *mock_start + Duration::from_secs(REQUEST_MAX_HANDLE_SECS);
+    static ref mock_wait_time: f64 = 1f64;
+    static ref mock_handle_time: f64 = 1f64;
+}
+
 impl RequestTask {
     pub fn new(req: Request, on_resp: OnResponse, recursion_limit: u32) -> RequestTask {
-        let timer = Instant::now_coarse();
-        let deadline = timer + Duration::from_secs(REQUEST_MAX_HANDLE_SECS);
         let mut start_ts = None;
         let tp = req.get_tp();
         let mut table_scan = false;
@@ -357,7 +362,7 @@ impl RequestTask {
             _ => Err(box_err!("unsupported tp {}", tp)),
         };
         let req_ctx = ReqContext {
-            deadline: deadline,
+            deadline: *mock_deadline,
             isolation_level: req.get_context().get_isolation_level(),
             fill_cache: !req.get_context().get_not_fill_cache(),
             table_scan: table_scan,
@@ -366,7 +371,7 @@ impl RequestTask {
             req: req,
             start_ts: start_ts,
             wait_time: None,
-            timer: timer,
+            timer: *mock_start,
             statistics: Default::default(),
             scan_counter: ScanCounter::default(),
             on_resp: on_resp,
@@ -384,7 +389,7 @@ impl RequestTask {
         if self.wait_time.is_some() {
             return;
         }
-        let wait_time = duration_to_sec(self.timer.elapsed());
+        let wait_time = *mock_wait_time;
         COPR_REQ_WAIT_TIME
             .with_label_values(&[self.ctx.get_scan_tag()])
             .observe(wait_time);
@@ -394,7 +399,7 @@ impl RequestTask {
     fn stop_record_handling(&mut self) -> Option<ExecDetails> {
         self.stop_record_waiting();
 
-        let query_time = duration_to_sec(self.timer.elapsed());
+        let query_time = *mock_wait_time + *mock_handle_time;
         let type_str = self.ctx.get_scan_tag();
         COPR_REQ_HISTOGRAM_VEC
             .with_label_values(&[type_str])
