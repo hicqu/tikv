@@ -1477,7 +1477,7 @@ fn handle_select(end_point: &Worker<EndPointTask>, req: Request) -> SelectRespon
 
 fn handle_streaming_select(end_point: &Worker<EndPointTask>, req: Request) -> Vec<StreamResponse> {
     let (tx, rx) = mpsc::channel();
-    let on_resp = OnResponse::Streaming(box move |s| for r in Stream::wait(s) {
+    let on_resp = OnResponse::Streaming(box move |s, _| for r in Stream::wait(s) {
         let resp: Response = r.unwrap();
         assert!(!resp.get_data().is_empty());
         let mut stream_resp = StreamResponse::new();
