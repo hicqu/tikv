@@ -158,11 +158,13 @@ struct CopContextPool {
 }
 
 impl CopContextPool {
-    // Must run in CpuPool.
     fn collect(&self, region_id: u64, scan_tag: &str, stats: CopStats) {
         let thread_id = thread::current().id();
-        let cop_ctx = self.cop_ctxs.get(&thread_id).unwrap();
-        cop_ctx.0.borrow_mut().collect(region_id, scan_tag, stats);
+        if let Some(cop_ctx) = self.cop_ctxs.get(&thread_id) {
+            // If the request is failed before enter into CpuPool,
+            // we don't need to collect anything.
+            cop_ctx.0.borrow_mut().collect(region_id, scan_tag, stats);
+        }
     }
 }
 
