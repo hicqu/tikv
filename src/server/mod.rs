@@ -69,7 +69,6 @@ impl<T: Send + Debug + 'static> OnResponse<T> {
     }
 }
 
-
 impl<T> Debug for OnResponse<T> {
     fn fmt(&self, f: &mut Formatter) -> FormatResult {
         match *self {
