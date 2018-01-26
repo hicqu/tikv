@@ -18,7 +18,7 @@ use std::time::*;
 use fail;
 use tikv::util::config::*;
 
-use raftstore::node::new_node_cluster;
+use raftstore::node::{new_node_cluster, NodeCluster};
 use raftstore::util::*;
 
 #[test]
@@ -65,4 +65,31 @@ fn test_overlap_cleanup() {
         }
     }
     fail::remove(gen_snapshot_fp);
+}
+
+#[test]
+#[cfg(not(feature = "no-fail"))]
+fn test_snapshot_fail_between_save() {
+    let _guard = ::setup();
+
+    let mut cluster = new_node_cluster(0, 3);
+    let region_id = cluster.run_conf_change();
+
+    let simulator = NodeCluster::new(Arc::clone(&cluster.pd_client));
+    let mut dup_cluster = cluster.twin_cluster_on(simulator);
+
+    thread::spawn(move || {
+        let pd_client = Arc::clone(&cluster.pd_client);
+        pd_client.must_add_peer(region_id, new_peer(2, 2));
+
+        cluster.must_put(b"k1", b"v1");
+        must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+
+        fail::cfg("raft_between_save", "sleep(1000000)").unwrap();
+        pd_client.must_add_peer(region_id, new_peer(3, 3));
+    });
+
+    fail::cfg("raft_between_save", "off").unwrap();
+    dup_cluster.start();
+    must_get_equal(&dup_cluster.get_engine(3), b"k1", b"v1");
 }

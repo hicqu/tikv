@@ -86,7 +86,7 @@ pub trait Simulator {
 pub struct Cluster<T: Simulator> {
     pub cfg: TiKvConfig,
     leaders: HashMap<u64, metapb::Peer>,
-    paths: Vec<TempDir>,
+    paths: Vec<Arc<TempDir>>,
     dbs: Vec<Engines>,
 
     // node id -> {db, raft_db} engine.
@@ -114,10 +114,25 @@ impl<T: Simulator> Cluster<T> {
             sim: sim,
             pd_client: pd_client,
         };
-
         c.create_engines(count, cfs);
-
         c
+    }
+
+    #[allow(dead_code)]
+    #[cfg(not(feature = "no-fail"))]
+    pub fn twin_cluster_on(&self, sim: T) -> Cluster<T> {
+        Cluster {
+            cfg: self.cfg.clone(),
+            leaders: self.leaders.clone(),
+            paths: self.paths.iter().map(|d| Arc::clone(d)).collect(),
+            dbs: self.dbs.iter().map(|e| e.clone()).collect(),
+            engines: self.engines
+                .iter()
+                .map(|(id, eng)| (*id, eng.clone()))
+                .collect(),
+            sim: Arc::new(RwLock::new(sim)),
+            pd_client: Arc::clone(&self.pd_client),
+        }
     }
 
     pub fn id(&self) -> u64 {
@@ -126,7 +141,8 @@ impl<T: Simulator> Cluster<T> {
 
     fn create_engines(&mut self, count: usize, cfs: &[&str]) {
         for _ in 0..count {
-            self.paths.push(TempDir::new("test_cluster").unwrap());
+            let path = Arc::new(TempDir::new("test_cluster").unwrap());
+            self.paths.push(path);
         }
 
         let mut kv_cfs = vec![];
