@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use protobuf::{self, RepeatedField};
 
 use rocksdb::{Kv, SeekKey, WriteBatch, WriteOptions, DB};
-use kvproto::metapb::Region;
+use kvproto::metapb::{Peer, Region};
 use kvproto::kvrpcpb::{LockInfo, MvccInfo, Op, ValueInfo, WriteInfo};
 use kvproto::debugpb::DB as DBType;
 use kvproto::eraftpb::Entry;
@@ -30,11 +30,11 @@ use raft::{self, RawNode};
 use raftstore::store::{keys, CacheQueryStats, Engines, Iterable, Peekable, PeerStorage};
 use raftstore::store::{init_apply_state, init_raft_state, write_peer_state};
 use raftstore::store::util as raftstore_util;
-use raftstore::store::engine::IterOption;
+use raftstore::store::engine::{IterOption, Mutable};
 use storage::{is_short_value, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use storage::types::{truncate_ts, Key};
 use storage::mvcc::{Lock, Write, WriteType};
-use util::escape;
+use util::{escape, unescape};
 use util::config::ReadableSize;
 use util::rocksdb::{compact_range, get_cf_handle};
 use util::worker::Worker;
@@ -345,6 +345,50 @@ impl Debugger {
             }
         }
         Ok(res)
+    }
+
+    pub fn impl_set_all_meta_for_ucloud(&self) {
+        // restore region 15 to 100_000_015 and recover it from log.
+        let engine = self.engines.kv_engine.as_ref();
+        let cf_raft = engine.cf_handle(CF_RAFT).unwrap();
+        for &region_id in &[15, 11, 19] {
+            let region_state_key = keys::region_state_key(15);
+            let region_state = engine
+                .get_msg_cf::<RegionLocalState>(CF_RAFT, &region_state_key)
+                .expect("get region local state fail")
+                .unwrap();
+
+            let apply_state_key = keys::apply_state_key(15);
+            let apply_state = engine
+                .get_msg_cf::<RaftApplyState>(CF_RAFT, &apply_state_key)
+                .expect("get raft apply state fail")
+                .unwrap();
+
+            let (old_region_state, old_apply_state) = match region_id {
+                15 => init_region_15(),
+                11 => init_region_11(),
+                19 => init_region_19(),
+                _ => unreachable!(),
+            };
+
+            let new_region_id = region_id + 100_000_000;
+
+            let new_region_state_key = keys::region_state_key(new_region_id);
+            engine
+                .put_msg_cf(cf_raft, &new_region_state_key, &region_state)
+                .unwrap();
+            let new_apply_state_key = keys::apply_state_key(new_region_id);
+            engine
+                .put_msg_cf(cf_raft, &new_apply_state_key, &apply_state)
+                .unwrap();
+
+            engine
+                .put_msg_cf(cf_raft, &region_state_key, &old_region_state)
+                .unwrap();
+            engine
+                .put_msg_cf(cf_raft, &apply_state_key, &old_apply_state)
+                .unwrap();
+        }
     }
 
     fn get_store_id(&self) -> Result<u64> {
@@ -854,4 +898,89 @@ mod tests {
             assert_eq!(region_id, (10 + i) as u64);
         }
     }
+}
+
+fn init_region_15() -> (RegionLocalState, RaftApplyState) {
+    let start_key = r#"t\200\000\000\000\000\000\000\377\337_i\200\000\000\000\000\377\000\000\004\001SALE\377S_LE\377ADS\377\000\000\000\000\000\372\001r\377ecovery\377\377\000\000\000\000\000\000\000\000\377\367\003\200\000\000\000\000\034\377QB\000\000\000\000\000\000\371"#;
+    let end_key = r#"t\200\000\000\000\000\000\000\377\337_i\200\000\000\000\000\377\000\000\004\001SALE\377S_LE\377ADS\377\000\000\000\000\000\372\001t\377eleClai\377\377m\000\000\000\000\000\000\000\377\370\003\200\000\000\000\000\032\377\000$\000\000\000\000\000\000\371"#;
+
+    let mut region_state = RegionLocalState::new();
+    region_state.set_state(PeerState::Normal);
+    region_state.mut_region().set_id(15);
+    region_state.mut_region().set_start_key(unescape(start_key));
+    region_state.mut_region().set_start_key(unescape(end_key));
+    region_state.mut_region().mut_region_epoch().set_conf_ver(3);
+    region_state.mut_region().mut_region_epoch().set_version(57);
+
+    for &(id, store_id) in &[(16, 1), (17, 5), (18, 4)] {
+        let mut peer = Peer::new();
+        peer.set_id(id);
+        peer.set_store_id(store_id);
+        region_state.mut_region().mut_peers().push(peer);
+    }
+
+    let mut apply_state = RaftApplyState::new();
+    apply_state.set_applied_index(24047);
+    apply_state.mut_truncated_state().set_index(24045);
+    apply_state.mut_truncated_state().set_term(6);
+
+    (region_state, apply_state)
+}
+
+fn init_region_11() -> (RegionLocalState, RaftApplyState) {
+    let start_key = r#"t\200\000\000\000\000\000\000\377\307_i\200\000\000\000\000\377\000\000\002\000\003\200\000\000\377\000\000)\235c\000\000\000\374"#;
+    let end_key = r#"t\200\000\000\000\000\000\000\377\307_i\200\000\000\000\000\377\000\000\002\004\000\000\000\000\377\000\000\007\r\003\200\000\000\377\000\000\004\240=\000\000\000\374"#;
+
+    let mut region_state = RegionLocalState::new();
+    region_state.set_state(PeerState::Normal);
+    region_state.mut_region().set_id(11);
+    region_state.mut_region().set_start_key(unescape(start_key));
+    region_state.mut_region().set_start_key(unescape(end_key));
+    region_state.mut_region().mut_region_epoch().set_conf_ver(3);
+    region_state.mut_region().mut_region_epoch().set_version(60);
+
+    for &(id, store_id) in &[(12, 1), (13, 5), (14, 4)] {
+        let mut peer = Peer::new();
+        peer.set_id(id);
+        peer.set_store_id(store_id);
+        region_state.mut_region().mut_peers().push(peer);
+    }
+
+    let mut apply_state = RaftApplyState::new();
+    apply_state.set_applied_index(21773);
+    apply_state.mut_truncated_state().set_index(21771);
+    apply_state.mut_truncated_state().set_term(6);
+
+    (region_state, apply_state)
+}
+
+fn init_region_19() -> (RegionLocalState, RaftApplyState) {
+    let start_key = r#"t\200\000\000\000\000\000\001\377,_r\200\000\000\000\001\377\331h&\000\000\000\000\000\372"#;
+    let end_key = r#"t\200\000\000\000\000\000\001\377,_r\200\000\000\000\001\377\334u\223\000\000\000\000\000\372"#;
+
+    let mut region_state = RegionLocalState::new();
+    region_state.set_state(PeerState::Normal);
+    region_state.mut_region().set_id(19);
+    region_state.mut_region().set_start_key(unescape(start_key));
+    region_state.mut_region().set_start_key(unescape(end_key));
+    region_state.mut_region().mut_region_epoch().set_conf_ver(3);
+    region_state
+        .mut_region()
+        .mut_region_epoch()
+        .set_version(214);
+
+    for &(id, store_id) in &[(20, 1), (21, 5), (22, 4)] {
+        let mut peer = Peer::new();
+        peer.set_id(id);
+        peer.set_store_id(store_id);
+        region_state.mut_region().mut_peers().push(peer);
+    }
+
+    let mut apply_state = RaftApplyState::new();
+    // TODO: Can't find "compact_log" log for region 19.
+    apply_state.set_applied_index(5);
+    apply_state.mut_truncated_state().set_index(5);
+    apply_state.mut_truncated_state().set_term(5);
+
+    (region_state, apply_state)
 }

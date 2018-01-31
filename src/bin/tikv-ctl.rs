@@ -367,6 +367,12 @@ trait DebugExecutor {
         self.do_compact(db, cf, from, to);
     }
 
+    fn set_all_meta_for_ucloud(&self) {
+        self.impl_set_all_meta_for_ucloud();
+    }
+
+    fn impl_set_all_meta_for_ucloud(&self);
+
     fn print_bad_regions(&self);
 
     fn set_region_tombstone_after_remove_peer(
@@ -511,6 +517,10 @@ impl DebugExecutor for DebugClient {
     fn print_bad_regions(&self) {
         unimplemented!("only avaliable for local mode");
     }
+
+    fn impl_set_all_meta_for_ucloud(&self) {
+        unimplemented!("only avaliable for local mode");
+    }
 }
 
 impl DebugExecutor for Debugger {
@@ -578,6 +588,10 @@ impl DebugExecutor for Debugger {
             return;
         }
         println!("all regions are healthy")
+    }
+
+    fn impl_set_all_meta_for_ucloud(&self) {
+        self.impl_set_all_meta_for_ucloud();
     }
 }
 
@@ -894,8 +908,9 @@ fn main() {
                         .help("PD endpoints"),
                 ),
         )
+        .subcommand(SubCommand::with_name("bad-regions").about("get all regions with corrupt raft"))
         .subcommand(
-            SubCommand::with_name("bad-regions").about("get all regions with corrupt raft"),
+            SubCommand::with_name("set-all-meta").about("set-all-meta for a special problem"),
         );
     let matches = app.clone().get_matches();
 
@@ -990,6 +1005,8 @@ fn main() {
         debug_executor.set_region_tombstone_after_remove_peer(mgr, &cfg, region);
     } else if matches.subcommand_matches("bad-regions").is_some() {
         debug_executor.print_bad_regions();
+    } else if matches.subcommand_matches("set-all-meta").is_some() {
+        debug_executor.set_all_meta_for_ucloud();
     } else {
         let _ = app.print_help();
     }
