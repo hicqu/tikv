@@ -371,19 +371,25 @@ impl Debugger {
                 _ => unreachable!(),
             };
 
-            let new_region_id = region_id + 100_000_000;
+            if old_region_state.get_start_key() == region_state.get_start_key()
+                && old_region_state.get_end_key() == region_state.get_end_key()
+            {
+                // If key ranges are equal, don't need to do anything.
+                continue;
+            }
 
+            let new_region_id = region_id + 100_000_000;
             let new_region_state_key = keys::region_state_key(new_region_id);
             engine
                 .put_msg_cf(cf_raft, &new_region_state_key, &region_state)
                 .unwrap();
+            engine
+                .put_msg_cf(cf_raft, &region_state_key, &old_region_state)
+                .unwrap();
+
             let new_apply_state_key = keys::apply_state_key(new_region_id);
             engine
                 .put_msg_cf(cf_raft, &new_apply_state_key, &apply_state)
-                .unwrap();
-
-            engine
-                .put_msg_cf(cf_raft, &region_state_key, &old_region_state)
                 .unwrap();
             engine
                 .put_msg_cf(cf_raft, &apply_state_key, &old_apply_state)
@@ -920,7 +926,7 @@ fn init_region_15() -> (RegionLocalState, RaftApplyState) {
     }
 
     let mut apply_state = RaftApplyState::new();
-    apply_state.set_applied_index(24047);
+    apply_state.set_applied_index(24087);
     apply_state.mut_truncated_state().set_index(24045);
     apply_state.mut_truncated_state().set_term(6);
 
@@ -947,7 +953,7 @@ fn init_region_11() -> (RegionLocalState, RaftApplyState) {
     }
 
     let mut apply_state = RaftApplyState::new();
-    apply_state.set_applied_index(21773);
+    apply_state.set_applied_index(21793);
     apply_state.mut_truncated_state().set_index(21771);
     apply_state.mut_truncated_state().set_term(6);
 
@@ -977,7 +983,6 @@ fn init_region_19() -> (RegionLocalState, RaftApplyState) {
     }
 
     let mut apply_state = RaftApplyState::new();
-    // TODO: Can't find "compact_log" log for region 19.
     apply_state.set_applied_index(5);
     apply_state.mut_truncated_state().set_index(5);
     apply_state.mut_truncated_state().set_term(5);
