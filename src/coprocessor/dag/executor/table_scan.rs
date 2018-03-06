@@ -11,109 +11,150 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::vec::IntoIter;
+
 use kvproto::coprocessor::KeyRange;
 use tipb::executor::TableScan;
 
-use util::collections::HashSet;
-use storage::{SnapshotStore, Statistics};
 use coprocessor::codec::table;
-use coprocessor::endpoint::{is_point, prefix_next};
-use coprocessor::Result;
-use coprocessor::metrics::*;
+use coprocessor::endpoint::is_point;
+use coprocessor::{Error, Result};
+use storage::{Key, SnapshotStore};
+use util::collections::HashSet;
 
-use super::{Executor, Row};
-use super::scanner::Scanner;
+use super::{Executor, ExecutorMetrics, Row};
+use super::scanner::{ScanOn, Scanner};
 
-
-pub struct TableScanExecutor<'a> {
+pub struct TableScanExecutor {
+    store: SnapshotStore,
     desc: bool,
     col_ids: HashSet<i64>,
-    cursor: usize,
-    key_ranges: Vec<KeyRange>,
-    scanner: Scanner<'a>,
+    key_ranges: IntoIter<KeyRange>,
+    scanner: Option<Scanner>,
+    last_key: Option<Vec<u8>>,
+    count: i64,
+    metrics: ExecutorMetrics,
+    first_collect: bool,
 }
 
-impl<'a> TableScanExecutor<'a> {
+impl TableScanExecutor {
     pub fn new(
         meta: &TableScan,
         mut key_ranges: Vec<KeyRange>,
-        store: SnapshotStore<'a>,
-        statistics: &'a mut Statistics,
-    ) -> TableScanExecutor<'a> {
+        store: SnapshotStore,
+    ) -> Result<TableScanExecutor> {
+        box_try!(table::check_table_ranges(&key_ranges));
         let col_ids = meta.get_columns()
             .iter()
             .filter(|c| !c.get_pk_handle())
             .map(|c| c.get_column_id())
             .collect();
+
         let desc = meta.get_desc();
         if desc {
             key_ranges.reverse();
         }
-        let scanner = Scanner::new(store, desc, false, statistics);
-        COPR_EXECUTOR_COUNT.with_label_values(&["tblscan"]).inc();
-        TableScanExecutor {
+
+        Ok(TableScanExecutor {
+            store: store,
             desc: desc,
             col_ids: col_ids,
-            scanner: scanner,
-            key_ranges: key_ranges,
-            cursor: Default::default(),
+            key_ranges: key_ranges.into_iter(),
+            scanner: None,
+            last_key: None,
+            count: 0,
+            metrics: Default::default(),
+            first_collect: true,
+        })
+    }
+
+    fn get_row_from_range_scanner(&mut self) -> Result<Option<Row>> {
+        if let Some(scanner) = self.scanner.as_mut() {
+            self.metrics.scan_counter.inc_range();
+            let (key, value) = match scanner.next_row()? {
+                Some((key, value)) => (key, value),
+                None => return Ok(None),
+            };
+            let row_data = box_try!(table::cut_row(value, &self.col_ids));
+            let h = box_try!(table::decode_handle(&key));
+            self.last_key = Some(key);
+            return Ok(Some(Row::new(h, row_data)));
         }
+        Ok(None)
     }
 
-    fn get_row_from_range(&mut self) -> Result<Option<Row>> {
-        let range = &self.key_ranges[self.cursor];
-        let kv = self.scanner.next_row(range)?;
-        let (key, value) = match kv {
-            Some((key, value)) => (key, value),
-            None => return Ok(None),
-        };
-        let h = box_try!(table::decode_handle(&key));
-        let row_data = box_try!(table::cut_row(value, &self.col_ids));
-        let seek_key = if self.desc {
-            box_try!(table::truncate_as_row_key(&key)).to_vec()
-        } else {
-            prefix_next(&key)
-        };
-        self.scanner.set_seek_key(Some(seek_key));
-        Ok(Some(Row::new(h, row_data)))
-    }
-
-    fn get_row_from_point(&mut self) -> Result<Option<Row>> {
-        let key = self.key_ranges[self.cursor].get_start();
-        let value = self.scanner.get_row(key)?;
+    fn get_row_from_point(&mut self, mut range: KeyRange) -> Result<Option<Row>> {
+        let key = range.take_start();
+        let value = self.store
+            .get(&Key::from_raw(&key), &mut self.metrics.cf_stats)?;
         if let Some(value) = value {
             let values = box_try!(table::cut_row(value, &self.col_ids));
-            let h = box_try!(table::decode_handle(key));
+            let h = box_try!(table::decode_handle(&key));
+            self.last_key = Some(key);
             return Ok(Some(Row::new(h, values)));
         }
         Ok(None)
     }
+
+    fn new_scanner(&self, range: KeyRange) -> Result<Scanner> {
+        Scanner::new(
+            &self.store,
+            ScanOn::Table,
+            self.desc,
+            self.col_ids.is_empty(),
+            range,
+        ).map_err(Error::from)
+    }
 }
 
-impl<'a> Executor for TableScanExecutor<'a> {
+impl Executor for TableScanExecutor {
     fn next(&mut self) -> Result<Option<Row>> {
-        while self.cursor < self.key_ranges.len() {
-            if is_point(&self.key_ranges[self.cursor]) {
-                CORP_GET_OR_SCAN_COUNT.with_label_values(&["point"]).inc();
-                let data = self.get_row_from_point()?;
-                self.scanner.set_seek_key(None);
-                self.cursor += 1;
-                if data.is_some() {
-                    return Ok(data);
-                }
-                continue;
+        loop {
+            if let Some(row) = self.get_row_from_range_scanner()? {
+                self.count += 1;
+                return Ok(Some(row));
             }
 
-            let data = self.get_row_from_range()?;
-            if data.is_none() {
-                CORP_GET_OR_SCAN_COUNT.with_label_values(&["range"]).inc();
-                self.scanner.set_seek_key(None);
-                self.cursor += 1;
+            if let Some(range) = self.key_ranges.next() {
+                if is_point(&range) {
+                    self.metrics.scan_counter.inc_point();
+                    if let Some(row) = self.get_row_from_point(range)? {
+                        self.count += 1;
+                        return Ok(Some(row));
+                    }
+                    continue;
+                }
+                self.scanner = match self.scanner.take() {
+                    Some(mut scanner) => {
+                        box_try!(scanner.reset_range(range, &self.store));
+                        Some(scanner)
+                    }
+                    None => Some(self.new_scanner(range)?),
+                };
                 continue;
             }
-            return Ok(data);
+            return Ok(None);
         }
-        Ok(None)
+    }
+
+    fn take_last_key(&mut self) -> Option<Vec<u8>> {
+        self.last_key.take()
+    }
+
+    fn collect_output_counts(&mut self, counts: &mut Vec<i64>) {
+        counts.push(self.count);
+        self.count = 0;
+    }
+
+    fn collect_metrics_into(&mut self, metrics: &mut ExecutorMetrics) {
+        metrics.merge(&mut self.metrics);
+        if let Some(scanner) = self.scanner.as_mut() {
+            scanner.collect_statistics_into(&mut metrics.cf_stats);
+        }
+        if self.first_collect {
+            metrics.executor_count.table_scan += 1;
+            self.first_collect = false;
+        }
     }
 }
 
@@ -125,7 +166,7 @@ mod test {
     use protobuf::RepeatedField;
     use tipb::schema::ColumnInfo;
 
-    use storage::{SnapshotStore, Statistics};
+    use storage::SnapshotStore;
 
     use super::*;
     use super::super::scanner::test::{get_point_range, get_range, prepare_table_data, Data,
@@ -172,7 +213,6 @@ mod test {
 
     #[test]
     fn test_point_get() {
-        let mut statistics = Statistics::default();
         let mut wrapper = TableScanTestWrapper::default();
         // point get returns none
         let r1 = wrapper.get_point_range(i64::MIN);
@@ -184,7 +224,7 @@ mod test {
         let (snapshot, start_ts) = wrapper.store.get_snapshot();
         let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
         let mut table_scanner =
-            TableScanExecutor::new(&wrapper.table_scan, wrapper.ranges, store, &mut statistics);
+            TableScanExecutor::new(&wrapper.table_scan, wrapper.ranges, store).unwrap();
 
         let row = table_scanner.next().unwrap().unwrap();
         assert_eq!(row.handle, handle as i64);
@@ -197,11 +237,14 @@ mod test {
             assert_eq!(expect_row[&cid], v.to_vec());
         }
         assert!(table_scanner.next().unwrap().is_none());
+        let expected_counts = vec![1];
+        let mut counts = Vec::with_capacity(1);
+        table_scanner.collect_output_counts(&mut counts);
+        assert_eq!(expected_counts, counts);
     }
 
     #[test]
     fn test_multiple_ranges() {
-        let mut statistics = Statistics::default();
         let mut wrapper = TableScanTestWrapper::default();
         // prepare range
         let r1 = get_range(TABLE_ID, i64::MIN, 0);
@@ -217,7 +260,7 @@ mod test {
         let (snapshot, start_ts) = wrapper.store.get_snapshot();
         let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
         let mut table_scanner =
-            TableScanExecutor::new(&wrapper.table_scan, wrapper.ranges, store, &mut statistics);
+            TableScanExecutor::new(&wrapper.table_scan, wrapper.ranges, store).unwrap();
 
         for handle in 0..KEY_NUMBER {
             let row = table_scanner.next().unwrap().unwrap();
@@ -235,7 +278,6 @@ mod test {
 
     #[test]
     fn test_reverse_scan() {
-        let mut statistics = Statistics::default();
         let mut wrapper = TableScanTestWrapper::default();
         wrapper.table_scan.set_desc(true);
 
@@ -253,7 +295,7 @@ mod test {
         let (snapshot, start_ts) = wrapper.store.get_snapshot();
         let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
         let mut table_scanner =
-            TableScanExecutor::new(&wrapper.table_scan, wrapper.ranges, store, &mut statistics);
+            TableScanExecutor::new(&wrapper.table_scan, wrapper.ranges, store).unwrap();
 
         for tid in 0..KEY_NUMBER {
             let handle = KEY_NUMBER - tid - 1;

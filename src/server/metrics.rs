@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use prometheus::{Counter, CounterVec, Histogram, HistogramVec};
+use prometheus::*;
 
 lazy_static! {
     pub static ref SEND_SNAP_HISTOGRAM: Histogram =
@@ -31,7 +31,8 @@ lazy_static! {
         register_histogram_vec!(
             "tikv_grpc_msg_duration_seconds",
             "Bucketed histogram of grpc server messages",
-            &["type"]
+            &["type"],
+            exponential_buckets(0.0005, 2.0, 20).unwrap()
         ).unwrap();
 
     pub static ref GRPC_MSG_FAIL_COUNTER: CounterVec =
@@ -59,5 +60,11 @@ lazy_static! {
             "tikv_server_report_failure_msg_total",
             "Total number of reporting failure messages",
             &["type", "store_id"]
+        ).unwrap();
+
+    pub static ref RAFT_MESSAGE_FLUSH_COUNTER: Counter =
+        register_counter!(
+            "tikv_server_raft_message_flush_total",
+            "Total number of raft messages flushed"
         ).unwrap();
 }

@@ -11,21 +11,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ascii::AsciiExt;
-
 use sys_info;
 
 use util::collections::HashMap;
-use util::config::{self, ReadableSize};
-
+use util::config::{self, ReadableDuration, ReadableSize};
+use coprocessor::DEFAULT_REQUEST_MAX_HANDLE_SECS;
+use util::io_limiter::DEFAULT_SNAP_MAX_BYTES_PER_SEC;
 use super::Result;
 
 pub use raftstore::store::Config as RaftStoreConfig;
 pub use storage::Config as StorageConfig;
 
 pub const DEFAULT_CLUSTER_ID: u64 = 0;
-pub const DEFAULT_LISTENING_ADDR: &'static str = "127.0.0.1:20160";
-const DEFAULT_ADVERTISE_LISTENING_ADDR: &'static str = "";
+pub const DEFAULT_LISTENING_ADDR: &str = "127.0.0.1:20160";
+const DEFAULT_ADVERTISE_LISTENING_ADDR: &str = "";
 const DEFAULT_NOTIFY_CAPACITY: usize = 40960;
 const DEFAULT_GRPC_CONCURRENCY: usize = 4;
 const DEFAULT_GRPC_CONCURRENT_STREAM: usize = 1024;
@@ -42,12 +41,17 @@ const DEFAULT_ENDPOINT_STACK_SIZE_MB: u64 = 10;
 // larger latency.
 pub const DEFAULT_MAX_RUNNING_TASK_COUNT: usize = 2 as usize * 1000;
 
+// Number of rows in each chunk.
+pub const DEFAULT_ENDPOINT_BATCH_ROW_LIMIT: usize = 64;
+
+// Number of rows in each chunk for streaming coprocessor.
+pub const DEFAULT_ENDPOINT_STREAM_BATCH_ROW_LIMIT: usize = 128;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
-    #[serde(skip)]
-    pub cluster_id: u64,
+    #[serde(skip)] pub cluster_id: u64,
 
     // Server listening address.
     pub addr: String,
@@ -64,16 +68,23 @@ pub struct Config {
     pub end_point_concurrency: usize,
     pub end_point_max_tasks: usize,
     pub end_point_stack_size: ReadableSize,
+    pub end_point_recursion_limit: u32,
+    pub end_point_stream_channel_size: usize,
+    pub end_point_batch_row_limit: usize,
+    pub end_point_stream_batch_row_limit: usize,
+    pub end_point_request_max_handle_duration: ReadableDuration,
+    pub snap_max_write_bytes_per_sec: ReadableSize,
+    pub snap_max_total_size: ReadableSize,
+
     // Server labels to specify some attributes about this server.
-    #[serde(with = "config::order_map_serde")]
-    pub labels: HashMap<String, String>,
+    #[serde(with = "config::order_map_serde")] pub labels: HashMap<String, String>,
 }
 
 impl Default for Config {
     fn default() -> Config {
         let cpu_num = sys_info::cpu_num().unwrap();
         let concurrency = if cpu_num > 8 {
-            (cpu_num as f64 * 0.8) as usize
+            (f64::from(cpu_num) * 0.8) as usize
         } else {
             4
         };
@@ -91,6 +102,15 @@ impl Default for Config {
             end_point_concurrency: concurrency,
             end_point_max_tasks: DEFAULT_MAX_RUNNING_TASK_COUNT,
             end_point_stack_size: ReadableSize::mb(DEFAULT_ENDPOINT_STACK_SIZE_MB),
+            end_point_recursion_limit: 1000,
+            end_point_stream_channel_size: 8,
+            end_point_batch_row_limit: DEFAULT_ENDPOINT_BATCH_ROW_LIMIT,
+            end_point_stream_batch_row_limit: DEFAULT_ENDPOINT_STREAM_BATCH_ROW_LIMIT,
+            end_point_request_max_handle_duration: ReadableDuration::secs(
+                DEFAULT_REQUEST_MAX_HANDLE_SECS,
+            ),
+            snap_max_write_bytes_per_sec: ReadableSize(DEFAULT_SNAP_MAX_BYTES_PER_SEC),
+            snap_max_total_size: ReadableSize(0),
         }
     }
 }
@@ -125,6 +145,16 @@ impl Config {
         // See more: https://doc.rust-lang.org/std/thread/struct.Builder.html#method.stack_size
         if self.end_point_stack_size.0 < ReadableSize::mb(2).0 {
             return Err(box_err!("server.end-point-stack-size is too small."));
+        }
+
+        if self.end_point_recursion_limit < 100 {
+            return Err(box_err!("server.end-point-recursion-limit is too small"));
+        }
+
+        if self.end_point_request_max_handle_duration.as_secs() < DEFAULT_REQUEST_MAX_HANDLE_SECS {
+            return Err(box_err!(
+                "server.end-point-request-max-handle-secs is too small."
+            ));
         }
 
         for (k, v) in &self.labels {
@@ -170,6 +200,7 @@ fn validate_label(s: &str, tp: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use util::config::ReadableDuration;
 
     #[test]
     fn test_config_validate() {
@@ -188,6 +219,14 @@ mod tests {
 
         let mut invalid_cfg = cfg.clone();
         invalid_cfg.end_point_max_tasks = 0;
+        assert!(invalid_cfg.validate().is_err());
+
+        let mut invalid_cfg = cfg.clone();
+        invalid_cfg.end_point_recursion_limit = 0;
+        assert!(invalid_cfg.validate().is_err());
+
+        let mut invalid_cfg = cfg.clone();
+        invalid_cfg.end_point_request_max_handle_duration = ReadableDuration::secs(0);
         assert!(invalid_cfg.validate().is_err());
 
         invalid_cfg = Config::default();
@@ -211,14 +250,7 @@ mod tests {
         }
 
         let valid_cases = vec![
-            "a",
-            "0",
-            "a.1-2",
-            "Cab",
-            "abC",
-            "b_1.2",
-            "cab-012",
-            "3ac.8b2",
+            "a", "0", "a.1-2", "Cab", "abC", "b_1.2", "cab-012", "3ac.8b2"
         ];
 
         for case in valid_cases {

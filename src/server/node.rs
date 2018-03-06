@@ -18,7 +18,6 @@ use std::time::Duration;
 use std::process;
 
 use mio::EventLoop;
-use rocksdb::DB;
 
 use pd::{Error as PdError, PdClient, PdTask, INVALID_ID};
 use kvproto::raft_serverpb::StoreIdent;
@@ -26,6 +25,7 @@ use kvproto::metapb;
 use protobuf::RepeatedField;
 use util::transport::SendCh;
 use util::worker::FutureWorker;
+use raftstore::coprocessor::dispatcher::CoprocessorHost;
 use raftstore::store::{self, keys, Config as StoreConfig, Engines, Msg, Peekable, SignificantMsg,
                        SnapManager, Store, StoreChannel, Transport};
 use super::Result;
@@ -36,11 +36,11 @@ use super::transport::RaftStoreRouter;
 const MAX_CHECK_CLUSTER_BOOTSTRAPPED_RETRY_COUNT: u64 = 60;
 const CHECK_CLUSTER_BOOTSTRAPPED_RETRY_SECONDS: u64 = 3;
 
-pub fn create_raft_storage<S>(router: S, db: Arc<DB>, cfg: &StorageConfig) -> Result<Storage>
+pub fn create_raft_storage<S>(router: S, cfg: &StorageConfig) -> Result<Storage>
 where
     S: RaftStoreRouter + 'static,
 {
-    let engine = box RaftKv::new(db, router);
+    let engine = Box::new(RaftKv::new(router));
     let store = Storage::from_engine(engine, cfg)?;
     Ok(store)
 }
@@ -118,6 +118,7 @@ where
         }
     }
 
+    #[allow(too_many_arguments)]
     pub fn start<T>(
         &mut self,
         event_loop: EventLoop<Store<T, C>>,
@@ -126,6 +127,7 @@ where
         snap_mgr: SnapManager,
         significant_msg_receiver: Receiver<SignificantMsg>,
         pd_worker: FutureWorker<PdTask>,
+        coprocessor_host: CoprocessorHost,
     ) -> Result<()>
     where
         T: Transport + 'static,
@@ -164,6 +166,7 @@ where
             snap_mgr,
             significant_msg_receiver,
             pd_worker,
+            coprocessor_host,
         )?;
         Ok(())
     }
@@ -181,7 +184,7 @@ where
     fn check_store(&self, engines: &Engines) -> Result<u64> {
         let res = engines
             .kv_engine
-            .get_msg::<StoreIdent>(&keys::store_ident_key())?;
+            .get_msg::<StoreIdent>(keys::STORE_IDENT_KEY)?;
         if res.is_none() {
             return Ok(INVALID_ID);
         }
@@ -227,15 +230,12 @@ where
         let region_id = self.alloc_id()?;
         info!(
             "alloc first region id {} for cluster {}, store {}",
-            region_id,
-            self.cluster_id,
-            store_id
+            region_id, self.cluster_id, store_id
         );
         let peer_id = self.alloc_id()?;
         info!(
             "alloc first peer id {} for first region {}",
-            peer_id,
-            region_id
+            peer_id, region_id
         );
 
         let region = store::prepare_bootstrap(engines, store_id, region_id, peer_id)?;
@@ -245,7 +245,7 @@ where
     fn check_prepare_bootstrap_cluster(&self, engines: &Engines) -> Result<()> {
         let res = engines
             .kv_engine
-            .get_msg::<metapb::Region>(&keys::prepare_bootstrap_key())?;
+            .get_msg::<metapb::Region>(keys::PREPARE_BOOTSTRAP_KEY)?;
         if res.is_none() {
             return Ok(());
         }
@@ -317,6 +317,7 @@ where
         snap_mgr: SnapManager,
         significant_msg_receiver: Receiver<SignificantMsg>,
         pd_worker: FutureWorker<PdTask>,
+        coprocessor_host: CoprocessorHost,
     ) -> Result<()>
     where
         T: Transport + 'static,
@@ -328,7 +329,7 @@ where
         }
 
         let cfg = self.store_cfg.clone();
-        let pd_client = self.pd_client.clone();
+        let pd_client = Arc::clone(&self.pd_client);
         let store = self.store.clone();
         let sender = event_loop.channel();
 
@@ -348,6 +349,7 @@ where
                 pd_client,
                 snap_mgr,
                 pd_worker,
+                coprocessor_host,
             ) {
                 Err(e) => panic!("construct store {} err {:?}", store_id, e),
                 Ok(s) => s,

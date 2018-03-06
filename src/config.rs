@@ -11,29 +11,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+extern crate toml;
+
 use std::error::Error;
-use std::path::Path;
 use std::usize;
+use std::fs;
+use std::io::{Read, Write};
+use std::io::Error as IoError;
+use std::path::Path;
+use std::fmt;
 
 use log::LogLevelFilter;
 use rocksdb::{BlockBasedOptions, ColumnFamilyOptions, CompactionPriority, DBCompressionType,
               DBOptions, DBRecoveryMode};
 use sys_info;
 
+use import::Config as ImportConfig;
 use server::Config as ServerConfig;
+use server::readpool::Config as ReadPoolConfig;
+use pd::Config as PdConfig;
+use raftstore::coprocessor::Config as CopConfig;
 use raftstore::store::Config as RaftstoreConfig;
 use raftstore::store::keys::region_raft_prefix_len;
-use storage::{Config as StorageConfig, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, DEFAULT_DATA_DIR,
+use storage::{Config as StorageConfig, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
               DEFAULT_ROCKSDB_SUB_DIR};
 use util::config::{self, compression_type_level_serde, ReadableDuration, ReadableSize, GB, KB, MB};
 use util::properties::{MvccPropertiesCollectorFactory, SizePropertiesCollectorFactory};
 use util::rocksdb::{db_exist, CFOptions, EventListener, FixedPrefixSliceTransform,
                     FixedSuffixSliceTransform, NoopSliceTransform};
+use util::security::SecurityConfig;
 
 const LOCKCF_MIN_MEM: usize = 256 * MB as usize;
 const LOCKCF_MAX_MEM: usize = GB as usize;
 const RAFT_MIN_MEM: usize = 256 * MB as usize;
 const RAFT_MAX_MEM: usize = 2 * GB as usize;
+pub const LAST_CONFIG_FILE: &str = "last_tikv.toml";
 
 fn memory_mb_for_cf(is_raft_db: bool, cf: &str) -> usize {
     let total_mem = sys_info::mem_info().unwrap().total * KB;
@@ -61,6 +73,7 @@ macro_rules! cf_config {
         pub struct $name {
             pub block_size: ReadableSize,
             pub block_cache_size: ReadableSize,
+            pub disable_block_cache: bool,
             pub cache_index_and_filter_blocks: bool,
             pub pin_l0_filter_and_index_blocks: bool,
             pub use_bloom_filter: bool,
@@ -81,6 +94,9 @@ macro_rules! cf_config {
             pub max_compaction_bytes: ReadableSize,
             #[serde(with = "config::compaction_pri_serde")]
             pub compaction_pri: CompactionPriority,
+            pub dynamic_level_bytes: bool,
+            pub num_levels: i32,
+            pub max_bytes_for_level_multiplier: i32,
         }
     }
 }
@@ -89,7 +105,8 @@ macro_rules! build_cf_opt {
     ($opt:ident) => {{
         let mut block_base_opts = BlockBasedOptions::new();
         block_base_opts.set_block_size($opt.block_size.0 as usize);
-        block_base_opts.set_lru_cache($opt.block_cache_size.0 as usize);
+        block_base_opts.set_no_block_cache($opt.disable_block_cache);
+        block_base_opts.set_lru_cache($opt.block_cache_size.0 as usize, -1, 0, 0.0);
         block_base_opts.set_cache_index_and_filter_blocks($opt.cache_index_and_filter_blocks);
         block_base_opts.set_pin_l0_filter_and_index_blocks_in_cache(
             $opt.pin_l0_filter_and_index_blocks);
@@ -101,7 +118,10 @@ macro_rules! build_cf_opt {
         block_base_opts.set_read_amp_bytes_per_bit($opt.read_amp_bytes_per_bit);
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_block_based_table_factory(&block_base_opts);
-        cf_opts.compression_per_level(&$opt.compression_per_level);
+        cf_opts.set_num_levels($opt.num_levels);
+        assert!($opt.compression_per_level.len() >= $opt.num_levels as usize);
+        let compression_per_level = $opt.compression_per_level[..$opt.num_levels as usize].to_vec();
+        cf_opts.compression_per_level(compression_per_level.as_slice());
         cf_opts.set_write_buffer_size($opt.write_buffer_size.0);
         cf_opts.set_max_write_buffer_number($opt.max_write_buffer_number);
         cf_opts.set_min_write_buffer_number_to_merge($opt.min_write_buffer_number_to_merge);
@@ -112,6 +132,9 @@ macro_rules! build_cf_opt {
         cf_opts.set_level_zero_stop_writes_trigger($opt.level0_stop_writes_trigger);
         cf_opts.set_max_compaction_bytes($opt.max_compaction_bytes.0);
         cf_opts.compaction_priority($opt.compaction_pri);
+        cf_opts.set_level_compaction_dynamic_level_bytes($opt.dynamic_level_bytes);
+        cf_opts.set_max_bytes_for_level_multiplier($opt.max_bytes_for_level_multiplier);
+
         cf_opts
     }};
 }
@@ -123,6 +146,7 @@ impl Default for DefaultCfConfig {
         DefaultCfConfig {
             block_size: ReadableSize::kb(64),
             block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_DEFAULT) as u64),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: true,
@@ -149,6 +173,9 @@ impl Default for DefaultCfConfig {
             level0_stop_writes_trigger: 36,
             max_compaction_bytes: ReadableSize::gb(2),
             compaction_pri: CompactionPriority::MinOverlappingRatio,
+            dynamic_level_bytes: false,
+            num_levels: 7,
+            max_bytes_for_level_multiplier: 10,
         }
     }
 }
@@ -169,6 +196,7 @@ impl Default for WriteCfConfig {
         WriteCfConfig {
             block_size: ReadableSize::kb(64),
             block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_WRITE) as u64),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: true,
@@ -195,6 +223,9 @@ impl Default for WriteCfConfig {
             level0_stop_writes_trigger: 36,
             max_compaction_bytes: ReadableSize::gb(2),
             compaction_pri: CompactionPriority::MinOverlappingRatio,
+            dynamic_level_bytes: false,
+            num_levels: 7,
+            max_bytes_for_level_multiplier: 10,
         }
     }
 }
@@ -225,6 +256,7 @@ impl Default for LockCfConfig {
         LockCfConfig {
             block_size: ReadableSize::kb(16),
             block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_LOCK) as u64),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: true,
@@ -243,6 +275,9 @@ impl Default for LockCfConfig {
             level0_stop_writes_trigger: 36,
             max_compaction_bytes: ReadableSize::gb(2),
             compaction_pri: CompactionPriority::ByCompensatedSize,
+            dynamic_level_bytes: false,
+            num_levels: 7,
+            max_bytes_for_level_multiplier: 10,
         }
     }
 }
@@ -266,6 +301,7 @@ impl Default for RaftCfConfig {
         RaftCfConfig {
             block_size: ReadableSize::kb(16),
             block_cache_size: ReadableSize::mb(128),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: true,
@@ -284,6 +320,9 @@ impl Default for RaftCfConfig {
             level0_stop_writes_trigger: 36,
             max_compaction_bytes: ReadableSize::gb(2),
             compaction_pri: CompactionPriority::ByCompensatedSize,
+            dynamic_level_bytes: false,
+            num_levels: 7,
+            max_bytes_for_level_multiplier: 10,
         }
     }
 }
@@ -304,8 +343,7 @@ impl RaftCfConfig {
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct DbConfig {
-    #[serde(with = "config::recovery_mode_serde")]
-    pub wal_recovery_mode: DBRecoveryMode,
+    #[serde(with = "config::recovery_mode_serde")] pub wal_recovery_mode: DBRecoveryMode,
     pub wal_dir: String,
     pub wal_ttl_seconds: u64,
     pub wal_size_limit: ReadableSize,
@@ -321,12 +359,12 @@ pub struct DbConfig {
     pub info_log_roll_time: ReadableDuration,
     pub info_log_dir: String,
     pub rate_bytes_per_sec: ReadableSize,
+    pub bytes_per_sync: ReadableSize,
     pub wal_bytes_per_sync: ReadableSize,
     pub max_sub_compactions: u32,
     pub writable_file_max_buffer_size: ReadableSize,
     pub use_direct_io_for_flush_and_compaction: bool,
     pub enable_pipelined_write: bool,
-    pub backup_dir: String,
     pub defaultcf: DefaultCfConfig,
     pub writecf: WriteCfConfig,
     pub lockcf: LockCfConfig,
@@ -352,12 +390,12 @@ impl Default for DbConfig {
             info_log_roll_time: ReadableDuration::secs(0),
             info_log_dir: "".to_owned(),
             rate_bytes_per_sec: ReadableSize::kb(0),
+            bytes_per_sync: ReadableSize::mb(0),
             wal_bytes_per_sync: ReadableSize::kb(0),
             max_sub_compactions: 1,
             writable_file_max_buffer_size: ReadableSize::mb(1),
             use_direct_io_for_flush_and_compaction: false,
             enable_pipelined_write: true,
-            backup_dir: "".to_owned(),
             defaultcf: DefaultCfConfig::default(),
             writecf: WriteCfConfig::default(),
             lockcf: LockCfConfig::default(),
@@ -380,27 +418,24 @@ impl DbConfig {
         opts.set_max_manifest_file_size(self.max_manifest_file_size.0);
         opts.create_if_missing(self.create_if_missing);
         opts.set_max_open_files(self.max_open_files);
-        if self.enable_statistics {
-            opts.enable_statistics();
-            opts.set_stats_dump_period_sec(self.stats_dump_period.as_secs() as usize);
-        }
+        opts.enable_statistics(self.enable_statistics);
+        opts.set_stats_dump_period_sec(self.stats_dump_period.as_secs() as usize);
         opts.set_compaction_readahead_size(self.compaction_readahead_size.0);
         opts.set_max_log_file_size(self.info_log_max_size.0);
         opts.set_log_file_time_to_roll(self.info_log_roll_time.as_secs());
         if !self.info_log_dir.is_empty() {
-            opts.create_info_log(&self.info_log_dir).unwrap_or_else(
-                |e| {
+            opts.create_info_log(&self.info_log_dir)
+                .unwrap_or_else(|e| {
                     panic!(
                         "create RocksDB info log {} error: {:?}",
-                        self.info_log_dir,
-                        e
+                        self.info_log_dir, e
                     );
-                },
-            )
+                })
         }
         if self.rate_bytes_per_sec.0 > 0 {
             opts.set_ratelimiter(self.rate_bytes_per_sec.0 as i64);
         }
+        opts.set_bytes_per_sync(self.bytes_per_sync.0 as u64);
         opts.set_wal_bytes_per_sync(self.wal_bytes_per_sync.0 as u64);
         opts.set_max_subcompactions(self.max_sub_compactions);
         opts.set_writable_file_max_buffer_size(self.writable_file_max_buffer_size.0 as i32);
@@ -422,9 +457,6 @@ impl DbConfig {
     }
 
     fn validate(&mut self) -> Result<(), Box<Error>> {
-        if !self.backup_dir.is_empty() {
-            self.backup_dir = config::canonicalize_path(&self.backup_dir)?;
-        }
         Ok(())
     }
 }
@@ -436,6 +468,7 @@ impl Default for RaftDefaultCfConfig {
         RaftDefaultCfConfig {
             block_size: ReadableSize::kb(64),
             block_cache_size: ReadableSize::mb(memory_mb_for_cf(true, CF_DEFAULT) as u64),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: false,
@@ -462,6 +495,9 @@ impl Default for RaftDefaultCfConfig {
             level0_stop_writes_trigger: 36,
             max_compaction_bytes: ReadableSize::gb(2),
             compaction_pri: CompactionPriority::ByCompensatedSize,
+            dynamic_level_bytes: false,
+            num_levels: 7,
+            max_bytes_for_level_multiplier: 10,
         }
     }
 }
@@ -485,8 +521,7 @@ impl RaftDefaultCfConfig {
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RaftDbConfig {
-    #[serde(with = "config::recovery_mode_serde")]
-    pub wal_recovery_mode: DBRecoveryMode,
+    #[serde(with = "config::recovery_mode_serde")] pub wal_recovery_mode: DBRecoveryMode,
     pub wal_dir: String,
     pub wal_ttl_seconds: u64,
     pub wal_size_limit: ReadableSize,
@@ -505,6 +540,7 @@ pub struct RaftDbConfig {
     pub use_direct_io_for_flush_and_compaction: bool,
     pub enable_pipelined_write: bool,
     pub allow_concurrent_memtable_write: bool,
+    pub bytes_per_sync: ReadableSize,
     pub wal_bytes_per_sync: ReadableSize,
     pub defaultcf: RaftDefaultCfConfig,
 }
@@ -531,6 +567,7 @@ impl Default for RaftDbConfig {
             use_direct_io_for_flush_and_compaction: false,
             enable_pipelined_write: true,
             allow_concurrent_memtable_write: false,
+            bytes_per_sync: ReadableSize::mb(0),
             wal_bytes_per_sync: ReadableSize::kb(0),
             defaultcf: RaftDefaultCfConfig::default(),
         }
@@ -550,23 +587,19 @@ impl RaftDbConfig {
         opts.set_max_manifest_file_size(self.max_manifest_file_size.0);
         opts.create_if_missing(self.create_if_missing);
         opts.set_max_open_files(self.max_open_files);
-        if self.enable_statistics {
-            opts.enable_statistics();
-            opts.set_stats_dump_period_sec(self.stats_dump_period.as_secs() as usize);
-        }
+        opts.enable_statistics(self.enable_statistics);
+        opts.set_stats_dump_period_sec(self.stats_dump_period.as_secs() as usize);
         opts.set_compaction_readahead_size(self.compaction_readahead_size.0);
         opts.set_max_log_file_size(self.info_log_max_size.0);
         opts.set_log_file_time_to_roll(self.info_log_roll_time.as_secs());
         if !self.info_log_dir.is_empty() {
-            opts.create_info_log(&self.info_log_dir).unwrap_or_else(
-                |e| {
+            opts.create_info_log(&self.info_log_dir)
+                .unwrap_or_else(|e| {
                     panic!(
                         "create RocksDB info log {} error: {:?}",
-                        self.info_log_dir,
-                        e
+                        self.info_log_dir, e
                     );
-                },
-            )
+                })
         }
         opts.set_max_subcompactions(self.max_sub_compactions);
         opts.set_writable_file_max_buffer_size(self.writable_file_max_buffer_size.0 as i32);
@@ -576,6 +609,7 @@ impl RaftDbConfig {
         opts.enable_pipelined_write(self.enable_pipelined_write);
         opts.allow_concurrent_memtable_write(self.allow_concurrent_memtable_write);
         opts.add_event_listener(EventListener::new("raft"));
+        opts.set_bytes_per_sync(self.bytes_per_sync.0 as u64);
         opts.set_wal_bytes_per_sync(self.wal_bytes_per_sync.0 as u64);
 
         opts
@@ -583,25 +617,6 @@ impl RaftDbConfig {
 
     pub fn build_cf_opts(&self) -> Vec<CFOptions> {
         vec![CFOptions::new(CF_DEFAULT, self.defaultcf.build_opt())]
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
-#[serde(default)]
-#[serde(rename_all = "kebab-case")]
-pub struct PdConfig {
-    pub endpoints: Vec<String>,
-}
-
-impl PdConfig {
-    fn validate(&self) -> Result<(), Box<Error>> {
-        if self.endpoints.is_empty() {
-            return Err("please specify pd.endpoints.".into());
-        }
-        for addr in &self.endpoints {
-            config::check_addr(addr)?;
-        }
-        Ok(())
     }
 }
 
@@ -640,17 +655,19 @@ pub enum LogLevel {
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct TiKvConfig {
-    #[serde(with = "LogLevel")]
-    pub log_level: LogLevelFilter,
+    #[serde(with = "LogLevel")] pub log_level: LogLevelFilter,
     pub log_file: String,
+    pub readpool: ReadPoolConfig,
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub pd: PdConfig,
     pub metric: MetricConfig,
-    #[serde(rename = "raftstore")]
-    pub raft_store: RaftstoreConfig,
+    #[serde(rename = "raftstore")] pub raft_store: RaftstoreConfig,
+    pub coprocessor: CopConfig,
     pub rocksdb: DbConfig,
     pub raftdb: RaftDbConfig,
+    pub security: SecurityConfig,
+    pub import: ImportConfig,
 }
 
 impl Default for TiKvConfig {
@@ -658,13 +675,17 @@ impl Default for TiKvConfig {
         TiKvConfig {
             log_level: LogLevelFilter::Info,
             log_file: "".to_owned(),
+            readpool: ReadPoolConfig::default(),
             server: ServerConfig::default(),
             metric: MetricConfig::default(),
             raft_store: RaftstoreConfig::default(),
+            coprocessor: CopConfig::default(),
             pd: PdConfig::default(),
             rocksdb: DbConfig::default(),
             raftdb: RaftDbConfig::default(),
             storage: StorageConfig::default(),
+            security: SecurityConfig::default(),
+            import: ImportConfig::default(),
         }
     }
 }
@@ -672,13 +693,8 @@ impl Default for TiKvConfig {
 impl TiKvConfig {
     pub fn validate(&mut self) -> Result<(), Box<Error>> {
         self.storage.validate()?;
-        if self.rocksdb.backup_dir.is_empty() && self.storage.data_dir != DEFAULT_DATA_DIR {
-            self.rocksdb.backup_dir = format!(
-                "{}",
-                Path::new(&self.storage.data_dir).join("backup").display()
-            );
-        }
 
+        self.raft_store.region_split_check_diff = self.coprocessor.region_split_size / 16;
         self.raft_store.raftdb_path = if self.raft_store.raftdb_path.is_empty() {
             config::canonicalize_sub_path(&self.storage.data_dir, "raft")?
         } else {
@@ -689,9 +705,7 @@ impl TiKvConfig {
             config::canonicalize_sub_path(&self.storage.data_dir, DEFAULT_ROCKSDB_SUB_DIR)?;
 
         if kv_db_path == self.raft_store.raftdb_path {
-            return Err(
-                "raft_store.raftdb_path can not same with storage.data_dir/db".into(),
-            );
+            return Err("raft_store.raftdb_path can not same with storage.data_dir/db".into());
         }
         if db_exist(&kv_db_path) && !db_exist(&self.raft_store.raftdb_path) {
             return Err("default rocksdb exist, buf raftdb not exist".into());
@@ -704,6 +718,172 @@ impl TiKvConfig {
         self.server.validate()?;
         self.raft_store.validate()?;
         self.pd.validate()?;
+        self.coprocessor.validate()?;
+        self.security.validate()?;
+        self.import.validate()?;
         Ok(())
+    }
+
+    pub fn compatible_adjust(&mut self) {
+        let default_raft_store = RaftstoreConfig::default();
+        let default_coprocessor = CopConfig::default();
+        if self.raft_store.region_max_size != default_raft_store.region_max_size {
+            warn!(
+                "deprecated configuration, \
+                 raftstore.region-max-size has been moved to coprocessor"
+            );
+            if self.coprocessor.region_max_size == default_coprocessor.region_max_size {
+                warn!(
+                    "override coprocessor.region-max-size with raftstore.region-max-size, {:?}",
+                    self.raft_store.region_max_size
+                );
+                self.coprocessor.region_max_size = self.raft_store.region_max_size;
+            }
+            self.raft_store.region_max_size = default_raft_store.region_max_size;
+        }
+        if self.raft_store.region_split_size != default_raft_store.region_split_size {
+            warn!(
+                "deprecated configuration, \
+                 raftstore.region-split-size has been moved to coprocessor",
+            );
+            if self.coprocessor.region_split_size == default_coprocessor.region_split_size {
+                warn!(
+                    "override coprocessor.region-split-size with raftstore.region-split-size, {:?}",
+                    self.raft_store.region_split_size
+                );
+                self.coprocessor.region_split_size = self.raft_store.region_split_size;
+            }
+            self.raft_store.region_split_size = default_raft_store.region_split_size;
+        }
+    }
+
+    pub fn check_critical_cfg_with(&self, last_cfg: &Self) -> Result<(), Box<Error>> {
+        if last_cfg.rocksdb.wal_dir != self.rocksdb.wal_dir {
+            return Err(format!(
+                "db wal_dir have been changed, former db wal_dir is {}, \
+                 current db wal_dir is {}, please guarantee all data wal log \
+                 have been moved to destination directory.",
+                last_cfg.rocksdb.wal_dir, self.rocksdb.wal_dir
+            ).into());
+        }
+
+        if last_cfg.raftdb.wal_dir != self.raftdb.wal_dir {
+            return Err(format!(
+                "raftdb wal_dir have been changed, former raftdb wal_dir is {}, \
+                 current raftdb wal_dir is {}, please guarantee all raft wal log \
+                 have been moved to destination directory.",
+                last_cfg.raftdb.wal_dir, self.rocksdb.wal_dir
+            ).into());
+        }
+
+        if last_cfg.storage.data_dir != self.storage.data_dir {
+            return Err(format!(
+                "storage data dir have been changed, former data dir is {}, \
+                 current data dir is {}, please check if it is expected.",
+                last_cfg.storage.data_dir, self.storage.data_dir
+            ).into());
+        }
+
+        if last_cfg.raft_store.raftdb_path != self.raft_store.raftdb_path {
+            return Err(format!(
+                "raft dir have been changed, former raft dir is {}, \
+                 current raft dir is {}, please check if it is expected.",
+                last_cfg.raft_store.raftdb_path, self.raft_store.raftdb_path
+            ).into());
+        }
+
+        Ok(())
+    }
+
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Self
+    where
+        P: fmt::Debug,
+    {
+        fs::File::open(&path)
+            .map_err::<Box<Error>, _>(|e| Box::new(e))
+            .and_then(|mut f| {
+                let mut s = String::new();
+                f.read_to_string(&mut s)?;
+                let c = toml::from_str(&s)?;
+                Ok(c)
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "invalid auto generated configuration file {:?}, err {}",
+                    path, e
+                );
+            })
+    }
+
+    pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), IoError> {
+        let content = toml::to_string(&self).unwrap();
+        let mut f = fs::File::create(&path)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tempdir::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn test_check_critical_cfg_with() {
+        let mut tikv_cfg = TiKvConfig::default();
+        let mut last_cfg = TiKvConfig::default();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_ok());
+
+        tikv_cfg.rocksdb.wal_dir = "/data/wal_dir".to_owned();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_err());
+
+        last_cfg.rocksdb.wal_dir = "/data/wal_dir".to_owned();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_ok());
+
+        tikv_cfg.raftdb.wal_dir = "/raft/wal_dir".to_owned();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_err());
+
+        last_cfg.raftdb.wal_dir = "/raft/wal_dir".to_owned();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_ok());
+
+        tikv_cfg.storage.data_dir = "/data1".to_owned();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_err());
+
+        last_cfg.storage.data_dir = "/data1".to_owned();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_ok());
+
+        tikv_cfg.raft_store.raftdb_path = "/raft_path".to_owned();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_err());
+
+        last_cfg.raft_store.raftdb_path = "/raft_path".to_owned();
+        assert!(tikv_cfg.check_critical_cfg_with(&last_cfg).is_ok());
+    }
+
+    #[test]
+    fn test_persist_cfg() {
+        let dir = TempDir::new("test_persist_cfg").unwrap();
+        let path_buf = dir.path().join(LAST_CONFIG_FILE);
+        let file = path_buf.as_path().to_str().unwrap();
+        let (s1, s2) = ("/xxx/wal_dir".to_owned(), "/yyy/wal_dir".to_owned());
+
+        let mut tikv_cfg = TiKvConfig::default();
+
+        tikv_cfg.rocksdb.wal_dir = s1.clone();
+        tikv_cfg.raftdb.wal_dir = s2.clone();
+        tikv_cfg.write_to_file(file).unwrap();
+        let cfg_from_file = TiKvConfig::from_file(file);
+        assert_eq!(cfg_from_file.rocksdb.wal_dir, s1.clone());
+        assert_eq!(cfg_from_file.raftdb.wal_dir, s2.clone());
+
+        // write critical config when exist.
+        tikv_cfg.rocksdb.wal_dir = s2.clone();
+        tikv_cfg.raftdb.wal_dir = s1.clone();
+        tikv_cfg.write_to_file(file).unwrap();
+        let cfg_from_file = TiKvConfig::from_file(file);
+        assert_eq!(cfg_from_file.rocksdb.wal_dir, s2.clone());
+        assert_eq!(cfg_from_file.raftdb.wal_dir, s1.clone());
     }
 }

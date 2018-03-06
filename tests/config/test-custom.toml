@@ -1,6 +1,15 @@
 log-level = "debug"
 log-file = "foo"
 
+[readpool]
+high-concurrency = 1
+normal-concurrency = 3
+low-concurrency = 7
+max-tasks-high = 10000
+max-tasks-normal = 20000
+max-tasks-low = 30000
+stack-size = "20MB"
+
 [server]
 addr = "example.com:443"
 advertise-addr = "example.com:443"
@@ -13,6 +22,13 @@ grpc-stream-initial-window-size = 12345
 end-point-concurrency = 12
 end-point-max-tasks = 12
 end-point-stack-size = "12MB"
+end-point-recursion-limit = 100
+end-point-stream-channel-size = 16
+end-point-batch-row-limit = 64
+end-point-stream-batch-row-limit = 4096
+end-point-request-max-handle-duration = "12s"
+snap-max-write-bytes-per-sec = "10MB"
+snap-max-total-size = "10GB"
 
 [server.labels]
 a = "b"
@@ -20,6 +36,7 @@ a = "b"
 [storage]
 data-dir = "/var"
 gc-ratio-threshold = 1.2
+max-key-size = 8192
 scheduler-notify-capacity = 123
 scheduler-messages-per-tick = 123
 scheduler-concurrency = 123
@@ -51,8 +68,6 @@ raft-log-gc-threshold = 12
 raft-log-gc-count-limit = 12
 raft-log-gc-size-limit = "1KB"
 split-region-check-tick-interval = "12s"
-region-max-size = "12MB"
-region-split-size = "12MB"
 region-split-check-diff = "6MB"
 region-compact-check-interval = "12s"
 region-compact-delete-keys-count = 1234
@@ -66,12 +81,19 @@ notify-capacity = 12345
 messages-per-tick = 12345
 max-peer-down-duration = "12m"
 max-leader-missing-duration = "12h"
+abnormal-leader-missing-duration = "6h"
 snap-apply-batch-size = "12MB"
 consistency-check-interval = "12s"
 report-region-flow-interval = "12m"
 raft-store-max-leader-lease = "12s"
 right-derive-when-split = false
 allow-remove-leader = true
+use-delete-range = true
+
+[coprocessor]
+split-region-on-table = true
+region-max-size = "12MB"
+region-split-size = "12MB"
 
 [rocksdb]
 wal-recovery-mode = 1
@@ -90,16 +112,17 @@ info-log-max-size = "1KB"
 info-log-roll-time = "12s"
 info-log-dir = "/var"
 rate-bytes-per-sec = "1KB"
-wal-bytes-per-sync = "1MB"
+bytes-per-sync = "1MB"
+wal-bytes-per-sync = "32KB"
 max-sub-compactions = 12
 writable-file-max-buffer-size = "12MB"
 use-direct-io-for-flush-and-compaction = true
 enable-pipelined-write = false
-backup-dir = "/var"
 
 [rocksdb.defaultcf]
 block-size = "12KB"
 block-cache-size = "12GB"
+disable-block-cache = false
 cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
@@ -126,10 +149,14 @@ level0-slowdown-writes-trigger = 123
 level0-stop-writes-trigger = 123
 max-compaction-bytes = "1GB"
 compaction-pri = 3
+dynamic-level-bytes = true
+num-levels = 4
+max-bytes-for-level-multiplier = 8
 
 [rocksdb.writecf]
 block-size = "12KB"
 block-cache-size = "12GB"
+disable-block-cache = false
 cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
@@ -156,10 +183,14 @@ level0-slowdown-writes-trigger = 123
 level0-stop-writes-trigger = 123
 max-compaction-bytes = "1GB"
 compaction-pri = 3
+dynamic-level-bytes = true
+num-levels = 4
+max-bytes-for-level-multiplier = 8
 
 [rocksdb.lockcf]
 block-size = "12KB"
 block-cache-size = "12GB"
+disable-block-cache = false
 cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
@@ -186,10 +217,14 @@ level0-slowdown-writes-trigger = 123
 level0-stop-writes-trigger = 123
 max-compaction-bytes = "1GB"
 compaction-pri = 3
+dynamic-level-bytes = true
+num-levels = 4
+max-bytes-for-level-multiplier = 8
 
 [rocksdb.raftcf]
 block-size = "12KB"
 block-cache-size = "12GB"
+disable-block-cache = false
 cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
@@ -216,6 +251,9 @@ level0-slowdown-writes-trigger = 123
 level0-stop-writes-trigger = 123
 max-compaction-bytes = "1GB"
 compaction-pri = 3
+dynamic-level-bytes = true
+num-levels = 4
+max-bytes-for-level-multiplier = 8
 
 [raftdb]
 wal-recovery-mode = 3
@@ -237,11 +275,13 @@ writable-file-max-buffer-size = "12MB"
 use-direct-io-for-flush-and-compaction = true
 enable-pipelined-write = false
 allow-concurrent-memtable-write = true
-wal-bytes-per-sync = "1MB"
+bytes-per-sync = "1MB"
+wal-bytes-per-sync = "32KB"
 
 [raftdb.defaultcf]
 block-size = "12KB"
 block-cache-size = "12GB"
+disable-block-cache = false
 cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
@@ -268,3 +308,15 @@ level0-slowdown-writes-trigger = 123
 level0-stop-writes-trigger = 123
 max-compaction-bytes = "1GB"
 compaction-pri = 3
+dynamic-level-bytes = true
+num-levels = 4
+max-bytes-for-level-multiplier = 8
+
+[security]
+ca-path = "invalid path"
+cert-path = "invalid path"
+key-path = "invalid path"
+
+[import]
+num-threads = 123
+stream-channel-window = 123

@@ -11,55 +11,56 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use tipb::executor::Selection;
 use tipb::schema::ColumnInfo;
 
-use coprocessor::metrics::*;
-use coprocessor::select::xeval::EvalContext;
-use coprocessor::dag::expr::Expression;
+use coprocessor::dag::expr::{EvalContext, Expression};
 use coprocessor::Result;
 
-use super::{inflate_with_col_for_dag, Executor, ExprColumnRefVisitor, Row};
+use super::{inflate_with_col_for_dag, Executor, ExecutorMetrics, ExprColumnRefVisitor, Row};
 
-pub struct SelectionExecutor<'a> {
+pub struct SelectionExecutor {
     conditions: Vec<Expression>,
-    cols: Rc<Vec<ColumnInfo>>,
+    cols: Arc<Vec<ColumnInfo>>,
     related_cols_offset: Vec<usize>, // offset of related columns
-    ctx: Rc<EvalContext>,
-    src: Box<Executor + 'a>,
+    ctx: Arc<EvalContext>,
+    src: Box<Executor + Send>,
+    count: i64,
+    first_collect: bool,
 }
 
-impl<'a> SelectionExecutor<'a> {
+impl SelectionExecutor {
     pub fn new(
         mut meta: Selection,
-        ctx: Rc<EvalContext>,
-        columns_info: Rc<Vec<ColumnInfo>>,
-        src: Box<Executor + 'a>,
-    ) -> Result<SelectionExecutor<'a>> {
+        ctx: Arc<EvalContext>,
+        columns_info: Arc<Vec<ColumnInfo>>,
+        src: Box<Executor + Send>,
+    ) -> Result<SelectionExecutor> {
         let conditions = meta.take_conditions().into_vec();
         let mut visitor = ExprColumnRefVisitor::new(columns_info.len());
         visitor.batch_visit(&conditions)?;
-        COPR_EXECUTOR_COUNT.with_label_values(&["selection"]).inc();
         Ok(SelectionExecutor {
             conditions: box_try!(Expression::batch_build(ctx.as_ref(), conditions)),
             cols: columns_info,
             related_cols_offset: visitor.column_offsets(),
             ctx: ctx,
             src: src,
+            count: 0,
+            first_collect: true,
         })
     }
 }
 
 #[allow(never_loop)]
-impl<'a> Executor for SelectionExecutor<'a> {
+impl Executor for SelectionExecutor {
     fn next(&mut self) -> Result<Option<Row>> {
         'next: while let Some(row) = self.src.next()? {
             let cols = inflate_with_col_for_dag(
                 &self.ctx,
                 &row.data,
-                self.cols.clone(),
+                self.cols.as_ref(),
                 &self.related_cols_offset,
                 row.handle,
             )?;
@@ -69,15 +70,31 @@ impl<'a> Executor for SelectionExecutor<'a> {
                     continue 'next;
                 }
             }
+            self.count += 1;
             return Ok(Some(row));
         }
         Ok(None)
+    }
+
+    fn collect_output_counts(&mut self, counts: &mut Vec<i64>) {
+        self.src.collect_output_counts(counts);
+        counts.push(self.count);
+        self.count = 0;
+    }
+
+    fn collect_metrics_into(&mut self, metrics: &mut ExecutorMetrics) {
+        self.src.collect_metrics_into(metrics);
+        if self.first_collect {
+            metrics.executor_count.selection += 1;
+            self.first_collect = false;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::i64;
+    use std::sync::Arc;
 
     use kvproto::kvrpcpb::IsolationLevel;
     use protobuf::RepeatedField;
@@ -86,7 +103,7 @@ mod tests {
 
     use coprocessor::codec::mysql::types;
     use coprocessor::codec::datum::Datum;
-    use storage::{SnapshotStore, Statistics};
+    use storage::SnapshotStore;
     use util::codec::number::NumberEncoder;
 
     use super::*;
@@ -188,10 +205,7 @@ mod tests {
         let (snapshot, start_ts) = test_store.get_snapshot();
         let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
 
-        let mut statistics = Statistics::default();
-
-        let inner_table_scan =
-            TableScanExecutor::new(&table_scan, key_ranges, store, &mut statistics);
+        let inner_table_scan = TableScanExecutor::new(&table_scan, key_ranges, store).unwrap();
 
         // selection executor
         let mut selection = Selection::new();
@@ -200,8 +214,8 @@ mod tests {
 
         let mut selection_executor = SelectionExecutor::new(
             selection,
-            Rc::new(EvalContext::default()),
-            Rc::new(cis),
+            Arc::new(EvalContext::default()),
+            Arc::new(cis),
             Box::new(inner_table_scan),
         ).unwrap();
 
@@ -245,10 +259,7 @@ mod tests {
 
         let (snapshot, start_ts) = test_store.get_snapshot();
         let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
-        let mut statistics = Statistics::default();
-
-        let inner_table_scan =
-            TableScanExecutor::new(&table_scan, key_ranges, store, &mut statistics);
+        let inner_table_scan = TableScanExecutor::new(&table_scan, key_ranges, store).unwrap();
 
         // selection executor
         let mut selection = Selection::new();
@@ -257,8 +268,8 @@ mod tests {
 
         let mut selection_executor = SelectionExecutor::new(
             selection,
-            Rc::new(EvalContext::default()),
-            Rc::new(cis),
+            Arc::new(EvalContext::default()),
+            Arc::new(cis),
             Box::new(inner_table_scan),
         ).unwrap();
 
@@ -276,5 +287,9 @@ mod tests {
         assert_eq!(selection_rows.len(), expect_row_handles.len());
         let result_row = selection_rows.iter().map(|r| r.handle).collect::<Vec<_>>();
         assert_eq!(result_row, expect_row_handles);
+        let expected_counts = vec![raw_data.len() as i64, expect_row_handles.len() as i64];
+        let mut counts = Vec::with_capacity(2);
+        selection_executor.collect_output_counts(&mut counts);
+        assert_eq!(expected_counts, counts);
     }
 }

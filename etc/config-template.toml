@@ -10,6 +10,22 @@
 # file to store log, write to stderr if it's empty.
 # log-file = ""
 
+[readpool]
+# size of thread pool for high-priority read operations
+# high-concurrency = 8
+# size of thread pool for normal-priority read operations
+# normal-concurrency = 8
+# size of thread pool for low-priority read operations
+# low-concurrency = 8
+# max running high-priority read operations, reject if exceed
+# max-tasks-high = 16000
+# max running normal-priority read operations, reject if exceed
+# max-tasks-normal = 16000
+# max running low-priority read operations, reject if exceed
+# max-tasks-low = 16000
+# size of stack size for each thread pool
+# stack-size = "10MB"
+
 [server]
 # set listening address.
 # addr = "127.0.0.1:20160"
@@ -37,6 +53,15 @@
 
 # stack size of endpoint, complicated tasks may involve very deep recursion.
 # end-point-stack-size = "10MB"
+# max recursion level allowed when decoding dag expression
+# end-point-recursion-limit = 1000
+
+# max time to handle coprocessor request before timeout
+# end-point-request-max-handle-duration = "60s"
+
+# the max bytes that snapshot can be written to disk in one second,
+# should be set based on your disk performance
+# snap-max-write-bytes-per-sec = "30MB"
 
 # set attributes about this server, e.g. { zone = "us-west-1", disk = "ssd" }.
 # labels = {}
@@ -95,11 +120,6 @@
 # Store heartbeat tick interval for reporting to pd.
 # pd-store-heartbeat-tick-interval = "10s"
 
-# When the region's size exceeds region-max-size, we will split the region
-# into two which the left region's size will be region-split-size or a little
-# bit smaller.
-# region-max-size = "144MB"
-# region-split-size = "96MB"
 # When region size changes exceeds region-split-check-diff, we should check
 # whether the region should be split or not.
 # region-split-check-diff = "6MB"
@@ -137,6 +157,20 @@
 
 # Interval (s) to check region whether the data are consistent.
 # consistency-check-interval = 0
+
+# Use delete range to drop a large number of continuous keys.
+# use-delete-range = false
+
+[coprocessor]
+# When it is true, it will try to split a region with table prefix if
+# that region crosses tables. It is recommended to turn off this option
+# if there will be a large number of tables created.
+# split-region-on-table = true
+# When the region's size exceeds region-max-size, we will split the region
+# into two which the left region's size will be region-split-size or a little
+# bit smaller.
+# region-max-size = "144MB"
+# region-split-size = "96MB"
 
 [rocksdb]
 # Maximum number of concurrent background jobs (compactions and flushes)
@@ -231,11 +265,12 @@
 # Enable or disable the pipelined write
 # enable-pipelined-write = true
 
-# set backup path, if not set, use "backup" under store path.
-# backup-dir = "/tmp/tikv/store/backup"
+# Allows OS to incrementally sync files to disk while they are being
+# written, asynchronously, in the background.
+# bytes-per-sync = "0MB"
 
 # Allows OS to incrementally sync WAL to disk while it is being written.
-# wal-bytes-per-sync = 0
+# wal-bytes-per-sync = "0KB"
 
 # Column Family default used to store actual data of the database.
 [rocksdb.defaultcf]
@@ -320,6 +355,9 @@
 # 16     =>  00.78 %
 # read-amp-bytes-per-bit = 0
 
+# Pick target size of each level dynamically.
+# dynamic-level-bytes = false
+
 # Options for Column Family write
 # Column Family write used to store commit informations in MVCC model
 [rocksdb.writecf]
@@ -340,6 +378,7 @@
 # pin-l0-filter-and-index-blocks = true
 # compaction-pri = 3
 # read-amp-bytes-per-bit = 0
+# dynamic-level-bytes = false
 
 [rocksdb.lockcf]
 # compression-per-level = ["no", "no", "no", "no", "no", "no", "no"]
@@ -357,6 +396,7 @@
 # pin-l0-filter-and-index-blocks = true
 # compaction-pri = 0
 # read-amp-bytes-per-bit = 0
+# dynamic-level-bytes = false
 
 [raftdb]
 # max-sub-compactions = 1
@@ -393,3 +433,16 @@
 # compaction-pri = 0
 # read-amp-bytes-per-bit = 0
 # wal-bytes-per-sync = 0
+# dynamic-level-bytes = false
+
+[security]
+# set the path for certificates. Empty string means disabling secure connectoins.
+# ca-path = ""
+# cert-path = ""
+# key-path = ""
+
+[import]
+# number of threads to handle RPC requests.
+# num-threads = 8
+# stream channel window size, stream will be blocked on channel full.
+# stream-channel-window = 128

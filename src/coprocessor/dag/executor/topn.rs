@@ -12,7 +12,7 @@
 // limitations under the License.
 
 use std::usize;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::vec::IntoIter;
 
 use tipb::executor::TopN;
@@ -21,15 +21,13 @@ use tipb::expression::ByItem;
 
 use coprocessor::codec::datum::Datum;
 use coprocessor::Result;
-use coprocessor::select::xeval::EvalContext;
-use coprocessor::dag::expr::Expression;
-use coprocessor::select::topn_heap::{SortRow, TopNHeap};
-use coprocessor::metrics::*;
+use coprocessor::dag::expr::{EvalContext, Expression};
 
-use super::{inflate_with_col_for_dag, Executor, ExprColumnRefVisitor, Row};
+use super::topn_heap::{SortRow, TopNHeap};
+use super::{inflate_with_col_for_dag, Executor, ExecutorMetrics, ExprColumnRefVisitor, Row};
 
 struct OrderBy {
-    items: Rc<Vec<ByItem>>,
+    items: Arc<Vec<ByItem>>,
     exprs: Vec<Expression>,
 }
 
@@ -42,7 +40,7 @@ impl OrderBy {
                 .collect()
         );
         Ok(OrderBy {
-            items: Rc::new(order_by),
+            items: Arc::new(order_by),
             exprs: exprs,
         })
     }
@@ -53,85 +51,109 @@ impl OrderBy {
     }
 }
 
-pub struct TopNExecutor<'a> {
+pub struct TopNExecutor {
     order_by: OrderBy,
-    cols: Rc<Vec<ColumnInfo>>,
+    cols: Arc<Vec<ColumnInfo>>,
     related_cols_offset: Vec<usize>, // offset of related columns
-    heap: Option<TopNHeap>,
     iter: Option<IntoIter<SortRow>>,
-    ctx: Rc<EvalContext>,
-    src: Box<Executor + 'a>,
+    ctx: Arc<EvalContext>,
+    src: Box<Executor + Send>,
+    limit: usize,
+    count: i64,
+    first_collect: bool,
 }
 
-impl<'a> TopNExecutor<'a> {
+impl TopNExecutor {
     pub fn new(
         mut meta: TopN,
-        ctx: Rc<EvalContext>,
-        columns_info: Rc<Vec<ColumnInfo>>,
-        src: Box<Executor + 'a>,
-    ) -> Result<TopNExecutor<'a>> {
+        ctx: Arc<EvalContext>,
+        columns_info: Arc<Vec<ColumnInfo>>,
+        src: Box<Executor + Send>,
+    ) -> Result<TopNExecutor> {
         let order_by = meta.take_order_by().into_vec();
 
         let mut visitor = ExprColumnRefVisitor::new(columns_info.len());
         for by_item in &order_by {
             visitor.visit(by_item.get_expr())?;
         }
-
-        COPR_EXECUTOR_COUNT.with_label_values(&["topn"]).inc();
         Ok(TopNExecutor {
             order_by: OrderBy::new(&ctx, order_by)?,
-            heap: Some(TopNHeap::new(meta.get_limit() as usize)?),
             cols: columns_info,
             related_cols_offset: visitor.column_offsets(),
             iter: None,
             ctx: ctx,
             src: src,
+            limit: meta.get_limit() as usize,
+            count: 0,
+            first_collect: true,
         })
     }
 
     fn fetch_all(&mut self) -> Result<()> {
+        if self.limit == 0 {
+            self.iter = Some(Vec::default().into_iter());
+            return Ok(());
+        }
+
+        let mut heap = TopNHeap::new(self.limit)?;
         while let Some(row) = self.src.next()? {
             let cols = inflate_with_col_for_dag(
                 &self.ctx,
                 &row.data,
-                self.cols.clone(),
+                self.cols.as_ref(),
                 &self.related_cols_offset,
                 row.handle,
             )?;
             let ob_values = self.order_by.eval(&self.ctx, &cols)?;
-            self.heap.as_mut().unwrap().try_add_row(
+            heap.try_add_row(
                 row.handle,
                 row.data,
                 ob_values,
-                self.order_by.items.clone(),
-                self.ctx.clone(),
+                Arc::clone(&self.order_by.items),
+                Arc::clone(&self.ctx),
             )?;
         }
+        self.iter = Some(heap.into_sorted_vec()?.into_iter());
         Ok(())
     }
 }
 
-impl<'a> Executor for TopNExecutor<'a> {
+impl Executor for TopNExecutor {
     fn next(&mut self) -> Result<Option<Row>> {
         if self.iter.is_none() {
             self.fetch_all()?;
-            self.iter = Some(self.heap.take().unwrap().into_sorted_vec()?.into_iter());
         }
         let iter = self.iter.as_mut().unwrap();
         match iter.next() {
-            Some(sort_row) => Ok(Some(Row {
-                handle: sort_row.handle,
-                data: sort_row.data,
-            })),
+            Some(sort_row) => {
+                self.count += 1;
+                Ok(Some(Row {
+                    handle: sort_row.handle,
+                    data: sort_row.data,
+                }))
+            }
             None => Ok(None),
+        }
+    }
+
+    fn collect_output_counts(&mut self, counts: &mut Vec<i64>) {
+        self.src.collect_output_counts(counts);
+        counts.push(self.count);
+        self.count = 0;
+    }
+
+    fn collect_metrics_into(&mut self, metrics: &mut ExecutorMetrics) {
+        self.src.collect_metrics_into(metrics);
+        if self.first_collect {
+            metrics.executor_count.topn += 1;
+            self.first_collect = false;
         }
     }
 }
 
-
 #[cfg(test)]
 pub mod test {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use kvproto::kvrpcpb::IsolationLevel;
     use protobuf::RepeatedField;
@@ -144,7 +166,7 @@ pub mod test {
     use util::collections::HashMap;
     use util::codec::number::NumberEncoder;
 
-    use storage::{SnapshotStore, Statistics};
+    use storage::SnapshotStore;
 
     use super::*;
     use super::super::table_scan::TableScanExecutor;
@@ -165,8 +187,8 @@ pub mod test {
         let mut order_cols = Vec::new();
         order_cols.push(new_order_by(0, true));
         order_cols.push(new_order_by(1, false));
-        let order_cols = Rc::new(order_cols);
-        let ctx = Rc::new(EvalContext::default());
+        let order_cols = Arc::new(order_cols);
+        let ctx = Arc::new(EvalContext::default());
 
         let mut topn_heap = TopNHeap::new(5).unwrap();
 
@@ -260,11 +282,11 @@ pub mod test {
             let row_data = RowColsDict::new(HashMap::default(), data.into_bytes());
             topn_heap
                 .try_add_row(
-                    handle as i64,
+                    i64::from(handle),
                     row_data,
                     ob_values,
-                    order_cols.clone(),
-                    ctx.clone(),
+                    Arc::clone(&order_cols),
+                    Arc::clone(&ctx),
                 )
                 .unwrap();
         }
@@ -282,8 +304,8 @@ pub mod test {
         let mut order_cols = Vec::new();
         order_cols.push(new_order_by(0, false));
         order_cols.push(new_order_by(1, true));
-        let order_cols = Rc::new(order_cols);
-        let ctx = Rc::new(EvalContext::default());
+        let order_cols = Arc::new(order_cols);
+        let ctx = Arc::new(EvalContext::default());
         let mut topn_heap = TopNHeap::new(5).unwrap();
 
         let ob_values1: Vec<Datum> = vec![Datum::Bytes(b"aaa".to_vec()), Datum::I64(2)];
@@ -293,8 +315,8 @@ pub mod test {
                 0 as i64,
                 row_data,
                 ob_values1,
-                order_cols.clone(),
-                ctx.clone(),
+                Arc::clone(&order_cols),
+                Arc::clone(&ctx),
             )
             .unwrap();
 
@@ -305,8 +327,8 @@ pub mod test {
                 0 as i64,
                 row_data2,
                 ob_values2,
-                order_cols.clone(),
-                ctx.clone(),
+                Arc::clone(&order_cols),
+                Arc::clone(&ctx),
             )
             .unwrap();
 
@@ -319,8 +341,8 @@ pub mod test {
                     0 as i64,
                     row_data3,
                     bad_key1,
-                    order_cols.clone(),
-                    ctx.clone()
+                    Arc::clone(&order_cols),
+                    Arc::clone(&ctx)
                 )
                 .is_err()
         );
@@ -405,8 +427,7 @@ pub mod test {
         // init TableScan
         let (snapshot, start_ts) = test_store.get_snapshot();
         let snap = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
-        let mut statistics = Statistics::default();
-        let ts_ect = TableScanExecutor::new(&table_scan, key_ranges, snap, &mut statistics);
+        let ts_ect = TableScanExecutor::new(&table_scan, key_ranges, snap).unwrap();
 
         // init TopN meta
         let mut ob_vec = Vec::with_capacity(2);
@@ -419,8 +440,8 @@ pub mod test {
         // init topn executor
         let mut topn_ect = TopNExecutor::new(
             topn,
-            Rc::new(EvalContext::default()),
-            Rc::new(cis),
+            Arc::new(EvalContext::default()),
+            Arc::new(cis),
             Box::new(ts_ect),
         ).unwrap();
         let mut topn_rows = Vec::with_capacity(limit as usize);
@@ -432,5 +453,56 @@ pub mod test {
         for (row, handle) in topn_rows.iter().zip(expect_row_handles) {
             assert_eq!(row.handle, handle);
         }
+        let expected_counts = vec![6, limit as i64];
+        let mut counts = Vec::with_capacity(2);
+        topn_ect.collect_output_counts(&mut counts);
+        assert_eq!(expected_counts, counts);
+    }
+
+    #[test]
+    fn test_limit() {
+        // prepare data and store
+        let tid = 1;
+        let cis = vec![
+            new_col_info(1, types::LONG_LONG),
+            new_col_info(2, types::VARCHAR),
+            new_col_info(3, types::NEW_DECIMAL),
+        ];
+        let raw_data = vec![
+            vec![
+                Datum::I64(1),
+                Datum::Bytes(b"a".to_vec()),
+                Datum::Dec(7.into()),
+            ],
+        ];
+        let table_data = gen_table_data(tid, &cis, &raw_data);
+        let mut test_store = TestStore::new(&table_data);
+        // init table scan meta
+        let mut table_scan = TableScan::new();
+        table_scan.set_table_id(tid);
+        table_scan.set_columns(RepeatedField::from_vec(cis.clone()));
+        // prepare range
+        let range1 = get_range(tid, 0, 4);
+        let range2 = get_range(tid, 5, 10);
+        let key_ranges = vec![range1, range2];
+        // init TableScan
+        let (snapshot, start_ts) = test_store.get_snapshot();
+        let snap = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
+
+        // init TopN meta
+        let mut ob_vec = Vec::with_capacity(2);
+        ob_vec.push(new_order_by(1, false));
+        ob_vec.push(new_order_by(2, true));
+        let mut topn = TopN::default();
+        topn.set_order_by(RepeatedField::from_vec(ob_vec));
+        // test with limit=0
+        topn.set_limit(0);
+        let mut topn_ect = TopNExecutor::new(
+            topn,
+            Arc::new(EvalContext::default()),
+            Arc::new(cis),
+            Box::new(TableScanExecutor::new(&table_scan, key_ranges, snap).unwrap()),
+        ).unwrap();
+        assert!(topn_ect.next().unwrap().is_none());
     }
 }

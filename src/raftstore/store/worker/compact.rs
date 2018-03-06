@@ -96,21 +96,21 @@ mod test {
     use std::thread::sleep;
     use util::rocksdb::new_engine;
     use tempdir::TempDir;
-    use storage::CF_WRITE;
     use rocksdb::{Writable, WriteBatch};
+    use storage::CF_DEFAULT;
     use super::*;
 
-    const ROCKSDB_TOTAL_SST_FILES_SIZE: &'static str = "rocksdb.total-sst-files-size";
+    const ROCKSDB_TOTAL_SST_FILES_SIZE: &str = "rocksdb.total-sst-files-size";
 
     #[test]
     fn test_compact_range() {
         let path = TempDir::new("compact-range-test").unwrap();
-        let db = new_engine(path.path().to_str().unwrap(), &[CF_WRITE]).unwrap();
+        let db = new_engine(path.path().to_str().unwrap(), &[CF_DEFAULT], None).unwrap();
         let db = Arc::new(db);
 
-        let mut runner = Runner::new(db.clone());
+        let mut runner = Runner::new(Arc::clone(&db));
 
-        let handle = rocksdb::get_cf_handle(&db, CF_WRITE).unwrap();
+        let handle = rocksdb::get_cf_handle(&db, CF_DEFAULT).unwrap();
 
         // generate first sst file.
         let wb = WriteBatch::new();
@@ -138,7 +138,7 @@ mod test {
 
         // schedule compact range task
         runner.run(Task {
-            cf_name: String::from(CF_WRITE),
+            cf_name: String::from(CF_DEFAULT),
             start_key: None,
             end_key: None,
         });

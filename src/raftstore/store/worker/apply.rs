@@ -11,11 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::fmt::{self, Debug, Display, Formatter};
+use std::rc::Rc;
 use std::collections::VecDeque;
+use std::mem;
 
 use rocksdb::{Writable, WriteBatch, DB};
 use rocksdb::rocksdb_options::WriteOptions;
@@ -28,8 +29,8 @@ use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, AdminResponse, ChangePeerR
                           RaftCmdRequest, RaftCmdResponse, Request, Response};
 
 use util::worker::Runnable;
-use util::{escape, rocksdb};
-use util::time::{duration_to_sec, SlowTimer};
+use util::{escape, rocksdb, MustConsumeVec};
+use util::time::{duration_to_sec, Instant, SlowTimer};
 use util::collections::{HashMap, HashMapEntry as MapEntry};
 use storage::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT};
 use raftstore::{Error, Result};
@@ -68,8 +69,7 @@ impl Drop for PendingCmd {
         if self.cb.is_some() {
             panic!(
                 "callback of pending command at [index: {}, term: {}] is leak.",
-                self.index,
-                self.term
+                self.index, self.term
             );
         }
     }
@@ -114,7 +114,7 @@ impl PendingCmdQueue {
         self.conf_change.take()
     }
 
-    // TODO: seems we don't need to seperate conf change from normal entries.
+    // TODO: seems we don't need to separate conf change from normal entries.
     fn set_conf_change(&mut self, cmd: PendingCmd) {
         self.conf_change = Some(cmd);
     }
@@ -161,58 +161,82 @@ pub enum ExecResult {
         index: u64,
         snap: Snapshot,
     },
-    VerifyHash { index: u64, hash: Vec<u8> },
-    DeleteRange { ranges: Vec<Range> },
+    VerifyHash {
+        index: u64,
+        hash: Vec<u8>,
+    },
+    DeleteRange {
+        ranges: Vec<Range>,
+    },
+}
+
+struct ApplyCallback {
+    region: Region,
+    cbs: Vec<(Option<Callback>, RaftCmdResponse)>,
+}
+
+impl ApplyCallback {
+    fn new(region: Region) -> ApplyCallback {
+        let cbs = vec![];
+        ApplyCallback { region, cbs }
+    }
+
+    fn invoke_all(self, host: &CoprocessorHost) {
+        for (cb, mut resp) in self.cbs {
+            host.post_apply(&self.region, &mut resp);
+            cb.map(|cb| cb.invoke_with_response(resp));
+        }
+    }
+
+    fn push(&mut self, cb: Option<Callback>, resp: RaftCmdResponse) {
+        self.cbs.push((cb, resp));
+    }
 }
 
 struct ApplyContext<'a> {
-    pub host: &'a CoprocessorHost,
-    pub wb: Option<WriteBatch>,
-    pub cbs: Vec<(Callback, RaftCmdResponse)>,
-    pub wb_last_bytes: u64,
-    pub wb_last_keys: u64,
-    pub sync_log: bool,
+    host: &'a CoprocessorHost,
+    wb: WriteBatch,
+    cbs: MustConsumeVec<ApplyCallback>,
+    wb_last_bytes: u64,
+    wb_last_keys: u64,
+    sync_log: bool,
+    exec_ctx: Option<ExecContext>,
+    use_delete_range: bool,
 }
 
 impl<'a> ApplyContext<'a> {
-    fn new(host: &CoprocessorHost) -> ApplyContext {
+    fn new(host: &CoprocessorHost, use_delete_range: bool) -> ApplyContext {
         ApplyContext {
             host: host,
-            wb: Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE)),
-            cbs: vec![],
+            wb: WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE),
+            cbs: MustConsumeVec::new("callback of apply context"),
             wb_last_bytes: 0,
             wb_last_keys: 0,
             sync_log: false,
+            exec_ctx: None,
+            use_delete_range: use_delete_range,
         }
     }
 
-    pub fn wb_mut(&mut self) -> &mut WriteBatch {
-        self.wb.as_mut().unwrap()
-    }
-
-    pub fn wb_ref(&self) -> &WriteBatch {
-        self.wb.as_ref().unwrap()
+    fn prepare_for(&mut self, delegate: &ApplyDelegate) {
+        self.cbs.push(ApplyCallback::new(delegate.region.clone()));
     }
 
     pub fn mark_last_bytes_and_keys(&mut self) {
-        self.wb_last_bytes = self.wb_ref().data_size() as u64;
-        self.wb_last_keys = self.wb_ref().count() as u64;
+        self.wb_last_bytes = self.wb.data_size() as u64;
+        self.wb_last_keys = self.wb.count() as u64;
     }
 
     pub fn delta_bytes(&self) -> u64 {
-        self.wb_ref().data_size() as u64 - self.wb_last_bytes
+        self.wb.data_size() as u64 - self.wb_last_bytes
     }
 
     pub fn delta_keys(&self) -> u64 {
-        self.wb_ref().count() as u64 - self.wb_last_keys
+        self.wb.count() as u64 - self.wb_last_keys
     }
-}
 
-impl<'a> Drop for ApplyContext<'a> {
-    fn drop(&mut self) {
-        if !self.cbs.is_empty() {
-            panic!("callback of apply context is leak");
-        }
+    pub fn use_delete_range(&self) -> bool {
+        self.use_delete_range
     }
 }
 
@@ -220,10 +244,7 @@ impl<'a> Drop for ApplyContext<'a> {
 fn notify_region_removed(region_id: u64, peer_id: u64, mut cmd: PendingCmd) {
     debug!(
         "[region {}] {} is removed, notify cmd at [index: {}, term: {}].",
-        region_id,
-        peer_id,
-        cmd.index,
-        cmd.term
+        region_id, peer_id, cmd.index, cmd.term
     );
     notify_req_region_removed(region_id, cmd.cb.take().unwrap());
 }
@@ -231,29 +252,27 @@ fn notify_region_removed(region_id: u64, peer_id: u64, mut cmd: PendingCmd) {
 pub fn notify_req_region_removed(region_id: u64, cb: Callback) {
     let region_not_found = Error::RegionNotFound(region_id);
     let resp = cmd_resp::new_error(region_not_found);
-    cb(resp);
+    cb.invoke_with_response(resp);
 }
 
 /// Call the callback of `cmd` when it can not be processed further.
 fn notify_stale_command(tag: &str, term: u64, mut cmd: PendingCmd) {
     info!(
         "{} command at [index: {}, term: {}] is stale, skip",
-        tag,
-        cmd.index,
-        cmd.term
+        tag, cmd.index, cmd.term
     );
     notify_stale_req(term, cmd.cb.take().unwrap());
 }
 
 pub fn notify_stale_req(term: u64, cb: Callback) {
     let resp = cmd_resp::err_resp(Error::StaleCommand, term);
-    cb(resp);
+    cb.invoke_with_response(resp);
 }
 
 fn should_flush_to_engine(cmd: &RaftCmdRequest, wb_keys: usize) -> bool {
     // When encounter ComputeHash cmd, we must flush the write batch to engine immediately.
-    if cmd.has_admin_request() &&
-        cmd.get_admin_request().get_cmd_type() == AdminCmdType::ComputeHash
+    if cmd.has_admin_request()
+        && cmd.get_admin_request().get_cmd_type() == AdminCmdType::ComputeHash
     {
         return true;
     }
@@ -333,6 +352,7 @@ impl ApplyDelegate {
         if committed_entries.is_empty() {
             return vec![];
         }
+        apply_ctx.prepare_for(self);
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // others will be saved as a normal entry with no data, so we must re-propose these
         // commands again.
@@ -364,7 +384,7 @@ impl ApplyDelegate {
         }
 
         if !self.pending_remove {
-            self.write_apply_state(apply_ctx.wb_mut());
+            self.write_apply_state(&apply_ctx.wb);
         }
 
         self.update_metrics(apply_ctx);
@@ -391,8 +411,7 @@ impl ApplyDelegate {
             .unwrap_or_else(|e| {
                 panic!(
                     "{} failed to save apply state to write batch, error: {:?}",
-                    self.tag,
-                    e
+                    self.tag, e
                 );
             });
     }
@@ -409,23 +428,23 @@ impl ApplyDelegate {
         if !data.is_empty() {
             let cmd = parse_data_at(data, index, &self.tag);
 
-            if should_flush_to_engine(&cmd, apply_ctx.wb_ref().count()) {
-                self.write_apply_state(apply_ctx.wb_mut());
+            if should_flush_to_engine(&cmd, apply_ctx.wb.count()) {
+                self.write_apply_state(&apply_ctx.wb);
 
                 self.update_metrics(apply_ctx);
-
+                let wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
                 // flush to engine
                 self.engine
-                    .write(apply_ctx.wb.take().unwrap())
+                    .write(mem::replace(&mut apply_ctx.wb, wb))
                     .unwrap_or_else(|e| {
                         panic!("{} failed to write to engine, error: {:?}", self.tag, e)
                     });
 
                 // call callback
-                for (cb, resp) in apply_ctx.cbs.drain(..) {
-                    cb(resp);
+                for cbs in apply_ctx.cbs.drain(..) {
+                    cbs.invoke_all(apply_ctx.host);
                 }
-                apply_ctx.wb = Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE));
+                apply_ctx.prepare_for(self);
                 apply_ctx.mark_last_bytes_and_keys();
             }
 
@@ -440,10 +459,11 @@ impl ApplyDelegate {
         assert!(term > 0);
         while let Some(mut cmd) = self.pending_cmds.pop_normal(term - 1) {
             // apprently, all the callbacks whose term is less than entry's term are stale.
-            apply_ctx.cbs.push((
-                cmd.cb.take().unwrap(),
-                cmd_resp::err_resp(Error::StaleCommand, term),
-            ));
+            apply_ctx
+                .cbs
+                .last_mut()
+                .unwrap()
+                .push(cmd.cb.take(), cmd_resp::err_resp(Error::StaleCommand, term));
         }
         None
     }
@@ -470,10 +490,7 @@ impl ApplyDelegate {
                         } else {
                             panic!(
                                 "{} unexpected result {:?} for conf change {:?} at {}",
-                                self.tag,
-                                res,
-                                conf_change,
-                                index
+                                self.tag, res, conf_change, index
                             );
                         }
                         res
@@ -509,7 +526,7 @@ impl ApplyDelegate {
         apply_ctx: &mut ApplyContext,
         index: u64,
         term: u64,
-        mut cmd: RaftCmdRequest,
+        cmd: RaftCmdRequest,
     ) -> Option<ExecResult> {
         if index == 0 {
             panic!(
@@ -523,21 +540,15 @@ impl ApplyDelegate {
         }
 
         let cmd_cb = self.find_cb(index, term, &cmd);
-        apply_ctx.host.pre_apply(&self.region, &mut cmd);
-        let (mut resp, exec_result) = self.apply_raft_cmd(apply_ctx.wb_mut(), index, term, &cmd);
+        apply_ctx.host.pre_apply(&self.region, &cmd);
+        let (mut resp, exec_result) = self.apply_raft_cmd(apply_ctx, index, term, cmd);
 
         debug!("{} applied command at log index {}", self.tag, index);
 
-        let cb = match cmd_cb {
-            None => return exec_result,
-            Some(cb) => cb,
-        };
-
-        // TODO: Involve post apply hook.
         // TODO: if we have exec_result, maybe we should return this callback too. Outer
         // store will call it after handing exec result.
         cmd_resp::bind_term(&mut resp, self.term);
-        apply_ctx.cbs.push((cb, resp));
+        apply_ctx.cbs.last_mut().unwrap().push(cmd_cb, resp);
 
         exec_result
     }
@@ -550,17 +561,17 @@ impl ApplyDelegate {
     // usually due to disk operation fail, which is rare, so just panic is ok.
     fn apply_raft_cmd(
         &mut self,
-        wb: &mut WriteBatch,
+        ctx: &mut ApplyContext,
         index: u64,
         term: u64,
-        req: &RaftCmdRequest,
+        req: RaftCmdRequest,
     ) -> (RaftCmdResponse, Option<ExecResult>) {
         // if pending remove, apply should be aborted already.
         assert!(!self.pending_remove);
 
-        let mut ctx = self.new_ctx(wb, index, term, req);
+        ctx.exec_ctx = Some(self.new_ctx(index, term, req));
         ctx.wb.set_save_point();
-        let (resp, exec_result) = self.exec_raft_cmd(&mut ctx).unwrap_or_else(|e| {
+        let (resp, exec_result) = self.exec_raft_cmd(ctx).unwrap_or_else(|e| {
             // clear dirty values.
             ctx.wb.rollback_to_save_point().unwrap();
             match e {
@@ -570,9 +581,10 @@ impl ApplyDelegate {
             (cmd_resp::new_error(e), None)
         });
 
-        ctx.apply_state.set_applied_index(index);
+        let mut exec_ctx = ctx.exec_ctx.take().unwrap();
+        exec_ctx.apply_state.set_applied_index(index);
 
-        self.apply_state = ctx.apply_state;
+        self.apply_state = exec_ctx.apply_state;
         self.applied_index_term = term;
 
         if let Some(ref exec_result) = exec_result {
@@ -580,10 +592,10 @@ impl ApplyDelegate {
                 ExecResult::ChangePeer(ref cp) => {
                     self.region = cp.region.clone();
                 }
-                ExecResult::ComputeHash { .. } |
-                ExecResult::VerifyHash { .. } |
-                ExecResult::CompactLog { .. } |
-                ExecResult::DeleteRange { .. } => {}
+                ExecResult::ComputeHash { .. }
+                | ExecResult::VerifyHash { .. }
+                | ExecResult::CompactLog { .. }
+                | ExecResult::DeleteRange { .. } => {}
                 ExecResult::SplitRegion {
                     ref left,
                     ref right,
@@ -642,27 +654,22 @@ impl ApplyDelegate {
         }
     }
 
-    fn new_ctx<'a>(
-        &self,
-        wb: &'a mut WriteBatch,
-        index: u64,
-        term: u64,
-        req: &'a RaftCmdRequest,
-    ) -> ExecContext<'a> {
+    fn new_ctx(&self, index: u64, term: u64, req: RaftCmdRequest) -> ExecContext {
         ExecContext {
             apply_state: self.apply_state.clone(),
-            wb: wb,
-            req: req,
+            req: Rc::new(req),
             index: index,
             term: term,
         }
     }
 }
 
-struct ExecContext<'a> {
+struct ExecContext {
     apply_state: RaftApplyState,
-    wb: &'a mut WriteBatch,
-    req: &'a RaftCmdRequest,
+    // Note: use reference here to help get around the borrow check
+    // at compile time, so we can borrow the content of req and modify
+    // context at the same time.
+    req: Rc<RaftCmdRequest>,
     index: u64,
     term: u64,
 }
@@ -672,28 +679,29 @@ impl ApplyDelegate {
     // Only errors that will also occur on all other stores should be returned.
     fn exec_raft_cmd(
         &mut self,
-        ctx: &mut ExecContext,
+        ctx: &mut ApplyContext,
     ) -> Result<(RaftCmdResponse, Option<ExecResult>)> {
-        check_epoch(&self.region, ctx.req)?;
-        if ctx.req.has_admin_request() {
-            self.exec_admin_cmd(ctx)
+        let req = Rc::clone(&ctx.exec_ctx.as_ref().unwrap().req);
+        check_epoch(&self.region, &req)?;
+        if req.has_admin_request() {
+            self.exec_admin_cmd(ctx, req.get_admin_request())
         } else {
-            self.exec_write_cmd(ctx)
+            self.exec_write_cmd(ctx, req.get_requests())
         }
     }
 
     fn exec_admin_cmd(
         &mut self,
-        ctx: &mut ExecContext,
+        ctx: &mut ApplyContext,
+        request: &AdminRequest,
     ) -> Result<(RaftCmdResponse, Option<ExecResult>)> {
-        let request = ctx.req.get_admin_request();
         let cmd_type = request.get_cmd_type();
         info!(
             "{} execute admin command {:?} at [term: {}, index: {}]",
             self.tag,
             request,
-            ctx.term,
-            ctx.index
+            ctx.exec_ctx.as_ref().unwrap().term,
+            ctx.exec_ctx.as_ref().unwrap().index
         );
 
         let (mut response, exec_result) = match cmd_type {
@@ -708,13 +716,21 @@ impl ApplyDelegate {
         response.set_cmd_type(cmd_type);
 
         let mut resp = RaftCmdResponse::new();
+        let uuid = ctx.exec_ctx
+            .as_ref()
+            .unwrap()
+            .req
+            .get_header()
+            .get_uuid()
+            .to_vec();
+        resp.mut_header().set_uuid(uuid);
         resp.set_admin_response(response);
         Ok((resp, exec_result))
     }
 
     fn exec_change_peer(
         &mut self,
-        ctx: &ExecContext,
+        ctx: &mut ApplyContext,
         request: &AdminRequest,
     ) -> Result<(AdminResponse, Option<ExecResult>)> {
         let request = request.get_change_peer();
@@ -745,9 +761,7 @@ impl ApplyDelegate {
                 if exists {
                     error!(
                         "{} can't add duplicated peer {:?} to region {:?}",
-                        self.tag,
-                        peer,
-                        self.region
+                        self.tag, peer, self.region
                     );
                     return Err(box_err!(
                         "can't add duplicated peer {:?} to region {:?}",
@@ -766,9 +780,7 @@ impl ApplyDelegate {
 
                 info!(
                     "{} add peer {:?} to region {:?}",
-                    self.tag,
-                    peer,
-                    self.region
+                    self.tag, peer, self.region
                 );
             }
             ConfChangeType::RemoveNode => {
@@ -779,9 +791,7 @@ impl ApplyDelegate {
                 if !exists {
                     error!(
                         "{} remove missing peer {:?} from region {:?}",
-                        self.tag,
-                        peer,
-                        self.region
+                        self.tag, peer, self.region
                     );
                     return Err(box_err!(
                         "remove missing peer {:?} from region {:?}",
@@ -809,6 +819,7 @@ impl ApplyDelegate {
                     self.region
                 );
             }
+            ConfChangeType::AddLearnerNode => unimplemented!(),
         }
 
         let state = if self.pending_remove {
@@ -816,7 +827,7 @@ impl ApplyDelegate {
         } else {
             PeerState::Normal
         };
-        if let Err(e) = write_peer_state(&self.engine, ctx.wb, &region, state) {
+        if let Err(e) = write_peer_state(&self.engine, &ctx.wb, &region, state) {
             panic!("{} failed to update region state: {:?}", self.tag, e);
         }
 
@@ -835,7 +846,7 @@ impl ApplyDelegate {
 
     fn exec_split(
         &mut self,
-        ctx: &ExecContext,
+        ctx: &mut ApplyContext,
         req: &AdminRequest,
     ) -> Result<(AdminResponse, Option<ExecResult>)> {
         PEER_ADMIN_CMD_COUNTER_VEC
@@ -844,7 +855,7 @@ impl ApplyDelegate {
 
         let split_req = req.get_split();
         let right_derive = split_req.get_right_derive();
-        if !split_req.has_split_key() {
+        if split_req.get_split_key().is_empty() {
             return Err(box_err!("missing split key"));
         }
 
@@ -896,19 +907,13 @@ impl ApplyDelegate {
         let region_ver = region.get_region_epoch().get_version() + 1;
         region.mut_region_epoch().set_version(region_ver);
         new_region.mut_region_epoch().set_version(region_ver);
-        write_peer_state(&self.engine, ctx.wb, &region, PeerState::Normal)
-            .and_then(|_| {
-                write_peer_state(&self.engine, ctx.wb, &new_region, PeerState::Normal)
-            })
-            .and_then(|_| {
-                write_initial_apply_state(&self.engine, ctx.wb, new_region.get_id())
-            })
+        write_peer_state(&self.engine, &ctx.wb, &region, PeerState::Normal)
+            .and_then(|_| write_peer_state(&self.engine, &ctx.wb, &new_region, PeerState::Normal))
+            .and_then(|_| write_initial_apply_state(&self.engine, &ctx.wb, new_region.get_id()))
             .unwrap_or_else(|e| {
                 panic!(
                     "{} failed to save split region {:?}: {:?}",
-                    self.tag,
-                    new_region,
-                    e
+                    self.tag, new_region, e
                 )
             });
 
@@ -948,7 +953,7 @@ impl ApplyDelegate {
 
     fn exec_compact_log(
         &mut self,
-        ctx: &mut ExecContext,
+        ctx: &mut ApplyContext,
         req: &AdminRequest,
     ) -> Result<(AdminResponse, Option<ExecResult>)> {
         PEER_ADMIN_CMD_COUNTER_VEC
@@ -957,14 +962,12 @@ impl ApplyDelegate {
 
         let compact_index = req.get_compact_log().get_compact_index();
         let resp = AdminResponse::new();
-
-        let first_index = peer_storage::first_index(&ctx.apply_state);
+        let apply_state = &mut ctx.exec_ctx.as_mut().unwrap().apply_state;
+        let first_index = peer_storage::first_index(apply_state);
         if compact_index <= first_index {
             debug!(
                 "{} compact index {} <= first index {}, no need to compact",
-                self.tag,
-                compact_index,
-                first_index
+                self.tag, compact_index, first_index
             );
             return Ok((resp, None));
         }
@@ -984,7 +987,7 @@ impl ApplyDelegate {
         }
 
         // compact failure is safe to be omitted, no need to assert.
-        compact_raft_log(&self.tag, &mut ctx.apply_state, compact_index, compact_term)?;
+        compact_raft_log(&self.tag, apply_state, compact_index, compact_term)?;
 
         PEER_ADMIN_CMD_COUNTER_VEC
             .with_label_values(&["compact", "success"])
@@ -993,7 +996,7 @@ impl ApplyDelegate {
         Ok((
             resp,
             Some(ExecResult::CompactLog {
-                state: ctx.apply_state.get_truncated_state().clone(),
+                state: apply_state.get_truncated_state().clone(),
                 first_index: first_index,
             }),
         ))
@@ -1001,9 +1004,9 @@ impl ApplyDelegate {
 
     fn exec_write_cmd(
         &mut self,
-        ctx: &ExecContext,
+        ctx: &ApplyContext,
+        requests: &[Request],
     ) -> Result<(RaftCmdResponse, Option<ExecResult>)> {
-        let requests = ctx.req.get_requests();
         let mut responses = Vec::with_capacity(requests.len());
 
         let mut ranges = vec![];
@@ -1012,7 +1015,9 @@ impl ApplyDelegate {
             let mut resp = match cmd_type {
                 CmdType::Put => self.handle_put(ctx, req),
                 CmdType::Delete => self.handle_delete(ctx, req),
-                CmdType::DeleteRange => self.handle_delete_range(req, &mut ranges),
+                CmdType::DeleteRange => {
+                    self.handle_delete_range(req, &mut ranges, ctx.use_delete_range())
+                }
                 // Readonly commands are handled in raftstore directly.
                 // Don't panic here in case there are old entries need to be applied.
                 // It's also safe to skip them here, because a restart must have happened,
@@ -1032,6 +1037,14 @@ impl ApplyDelegate {
         }
 
         let mut resp = RaftCmdResponse::new();
+        let uuid = ctx.exec_ctx
+            .as_ref()
+            .unwrap()
+            .req
+            .get_header()
+            .get_uuid()
+            .to_vec();
+        resp.mut_header().set_uuid(uuid);
         resp.set_responses(RepeatedField::from_vec(responses));
 
         let exec_res = if ranges.is_empty() {
@@ -1043,7 +1056,7 @@ impl ApplyDelegate {
         Ok((resp, exec_res))
     }
 
-    fn handle_put(&mut self, ctx: &ExecContext, req: &Request) -> Result<Response> {
+    fn handle_put(&mut self, ctx: &ApplyContext, req: &Request) -> Result<Response> {
         let (key, value) = (req.get_put().get_key(), req.get_put().get_value());
         check_data_key(key, &self.region)?;
 
@@ -1051,7 +1064,7 @@ impl ApplyDelegate {
         let key = keys::data_key(key);
         self.metrics.size_diff_hint += key.len() as i64;
         self.metrics.size_diff_hint += value.len() as i64;
-        if req.get_put().has_cf() {
+        if !req.get_put().get_cf().is_empty() {
             let cf = req.get_put().get_cf();
             // TODO: don't allow write preseved cfs.
             if cf == CF_LOCK {
@@ -1085,7 +1098,7 @@ impl ApplyDelegate {
         Ok(resp)
     }
 
-    fn handle_delete(&mut self, ctx: &ExecContext, req: &Request) -> Result<Response> {
+    fn handle_delete(&mut self, ctx: &ApplyContext, req: &Request) -> Result<Response> {
         let key = req.get_delete().get_key();
         check_data_key(key, &self.region)?;
 
@@ -1093,7 +1106,7 @@ impl ApplyDelegate {
         // since size_diff_hint is not accurate, so we just skip calculate the value size.
         self.metrics.size_diff_hint -= key.len() as i64;
         let resp = Response::new();
-        if req.get_delete().has_cf() {
+        if !req.get_delete().get_cf().is_empty() {
             let cf = req.get_delete().get_cf();
             // TODO: check whether cf exists or not.
             rocksdb::get_cf_handle(&self.engine, cf)
@@ -1118,7 +1131,12 @@ impl ApplyDelegate {
         Ok(resp)
     }
 
-    fn handle_delete_range(&mut self, req: &Request, ranges: &mut Vec<Range>) -> Result<Response> {
+    fn handle_delete_range(
+        &mut self,
+        req: &Request,
+        ranges: &mut Vec<Range>,
+        use_delete_range: bool,
+    ) -> Result<Response> {
         let s_key = req.get_delete_range().get_start_key();
         let e_key = req.get_delete_range().get_end_key();
         if !e_key.is_empty() && s_key >= e_key {
@@ -1146,10 +1164,10 @@ impl ApplyDelegate {
         let handle = rocksdb::get_cf_handle(&self.engine, cf).unwrap();
 
         let start_key = keys::data_key(s_key);
-        // Use delete_file_in_range to drop as many sst files as possible, this is
-        // a way to reclaim disk space quickly after drop a table/index.
+        // Use delete_files_in_range to drop as many sst files as possible, this
+        // is a way to reclaim disk space quickly after drop a table/index.
         self.engine
-            .delete_file_in_range_cf(handle, &start_key, &end_key)
+            .delete_files_in_range_cf(handle, &start_key, &end_key, /* include_end */ false)
             .unwrap_or_else(|e| {
                 panic!(
                     "{} failed to delete files in range [{}, {}): {:?}",
@@ -1161,16 +1179,17 @@ impl ApplyDelegate {
             });
 
         // Delete all remaining keys.
-        util::delete_all_in_range_cf(&self.engine, cf, &start_key, &end_key).unwrap_or_else(|e| {
-            panic!(
-                "{} failed to delete all in range [{}, {}), cf: {}, err: {:?}",
-                self.tag,
-                escape(&start_key),
-                escape(&end_key),
-                cf,
-                e
-            );
-        });
+        util::delete_all_in_range_cf(&self.engine, cf, &start_key, &end_key, use_delete_range)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} failed to delete all in range [{}, {}), cf: {}, err: {:?}",
+                    self.tag,
+                    escape(&start_key),
+                    escape(&end_key),
+                    cf,
+                    e
+                );
+            });
 
         ranges.push(Range::new(cf.to_owned(), start_key, end_key));
 
@@ -1203,11 +1222,11 @@ pub fn do_get(tag: &str, region: &Region, snap: &Snapshot, req: &Request) -> Res
     check_data_key(key, region)?;
 
     let mut resp = Response::new();
-    let res = if req.get_get().has_cf() {
+    let res = if !req.get_get().get_cf().is_empty() {
         let cf = req.get_get().get_cf();
         // TODO: check whether cf exists or not.
-        snap.get_value_cf(cf, &keys::data_key(key)).unwrap_or_else(
-            |e| {
+        snap.get_value_cf(cf, &keys::data_key(key))
+            .unwrap_or_else(|e| {
                 panic!(
                     "{} failed to get {} with cf {}: {:?}",
                     tag,
@@ -1215,8 +1234,7 @@ pub fn do_get(tag: &str, region: &Region, snap: &Snapshot, req: &Request) -> Res
                     cf,
                     e
                 )
-            },
-        )
+            })
     } else {
         snap.get_value(&keys::data_key(key))
             .unwrap_or_else(|e| panic!("{} failed to get {}: {:?}", tag, escape(key), e))
@@ -1228,17 +1246,11 @@ pub fn do_get(tag: &str, region: &Region, snap: &Snapshot, req: &Request) -> Res
     Ok(resp)
 }
 
-pub fn do_snap(region: Region) -> Result<Response> {
-    let mut resp = Response::new();
-    resp.mut_snap().set_region(region);
-    Ok(resp)
-}
-
 // Consistency Check
 impl ApplyDelegate {
     fn exec_compute_hash(
         &self,
-        ctx: &ExecContext,
+        ctx: &ApplyContext,
         _: &AdminRequest,
     ) -> Result<(AdminResponse, Option<ExecResult>)> {
         let resp = AdminResponse::new();
@@ -1246,19 +1258,19 @@ impl ApplyDelegate {
             resp,
             Some(ExecResult::ComputeHash {
                 region: self.region.clone(),
-                index: ctx.index,
+                index: ctx.exec_ctx.as_ref().unwrap().index,
                 // This snapshot may be held for a long time, which may cause too many
                 // open files in rocksdb.
                 // TODO: figure out another way to do consistency check without snapshot
                 // or short life snapshot.
-                snap: Snapshot::new(self.engine.clone()),
+                snap: Snapshot::new(Arc::clone(&self.engine)),
             }),
         ))
     }
 
     fn exec_verify_hash(
         &self,
-        _: &ExecContext,
+        _: &ApplyContext,
         req: &AdminRequest,
     ) -> Result<(AdminResponse, Option<ExecResult>)> {
         let verify_req = req.get_verify_hash();
@@ -1346,13 +1358,18 @@ impl RegionProposal {
     }
 }
 
+pub struct ApplyBatch {
+    vec: Vec<Apply>,
+    start: Instant,
+}
+
 pub struct Destroy {
     region_id: u64,
 }
 
 /// region related task.
 pub enum Task {
-    Applies(Vec<Apply>),
+    Applies(ApplyBatch),
     Registration(Registration),
     Proposals(Vec<RegionProposal>),
     Destroy(Destroy),
@@ -1360,7 +1377,10 @@ pub enum Task {
 
 impl Task {
     pub fn applies(applies: Vec<Apply>) -> Task {
-        Task::Applies(applies)
+        Task::Applies(ApplyBatch {
+            vec: applies,
+            start: Instant::now_coarse(),
+        })
     }
 
     pub fn register(peer: &Peer) -> Task {
@@ -1377,7 +1397,7 @@ impl Task {
 impl Display for Task {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match *self {
-            Task::Applies(ref a) => write!(f, "async applys count {}", a.len()),
+            Task::Applies(ref a) => write!(f, "async applys count {}", a.vec.len()),
             Task::Proposals(ref p) => write!(f, "region proposal count {}", p.len()),
             Task::Registration(ref r) => {
                 write!(f, "[region {}] Reg {:?}", r.region.get_id(), r.apply_state)
@@ -1421,11 +1441,17 @@ pub struct Runner {
     delegates: HashMap<u64, ApplyDelegate>,
     notifier: Sender<TaskRes>,
     sync_log: bool,
+    use_delete_range: bool,
     tag: String,
 }
 
 impl Runner {
-    pub fn new<T, C>(store: &Store<T, C>, notifier: Sender<TaskRes>, sync_log: bool) -> Runner {
+    pub fn new<T, C>(
+        store: &Store<T, C>,
+        notifier: Sender<TaskRes>,
+        sync_log: bool,
+        use_delete_range: bool,
+    ) -> Runner {
         let mut delegates =
             HashMap::with_capacity_and_hasher(store.get_peers().len(), Default::default());
         for (&region_id, p) in store.get_peers() {
@@ -1433,10 +1459,11 @@ impl Runner {
         }
         Runner {
             db: store.kv_engine(),
-            host: store.coprocessor_host.clone(),
+            host: Arc::clone(&store.coprocessor_host),
             delegates: delegates,
             notifier: notifier,
             sync_log: sync_log,
+            use_delete_range: use_delete_range,
             tag: format!("[store {}]", store.store_id()),
         }
     }
@@ -1445,7 +1472,7 @@ impl Runner {
         let t = SlowTimer::new();
 
         let mut applys_res = Vec::with_capacity(applys.len());
-        let mut apply_ctx = ApplyContext::new(self.host.as_ref());
+        let mut apply_ctx = ApplyContext::new(self.host.as_ref(), self.use_delete_range);
         let mut committed_count = 0;
         for apply in applys {
             if apply.entries.is_empty() {
@@ -1489,13 +1516,15 @@ impl Runner {
         // so we use sync-log flag here.
         let mut write_opts = WriteOptions::new();
         write_opts.set_sync(self.sync_log && apply_ctx.sync_log);
-        self.db
-            .write_opt(apply_ctx.wb.take().unwrap(), &write_opts)
-            .unwrap_or_else(|e| panic!("failed to write to engine, error: {:?}", e));
+        if !apply_ctx.wb.is_empty() {
+            self.db
+                .write_opt(apply_ctx.wb, &write_opts)
+                .unwrap_or_else(|e| panic!("failed to write to engine, error: {:?}", e));
+        }
 
         // Call callbacks
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&self.host);
         }
 
         if !applys_res.is_empty() {
@@ -1550,11 +1579,10 @@ impl Runner {
         let peer_id = s.id;
         let region_id = s.region.get_id();
         let term = s.term;
-        let delegate = ApplyDelegate::from_registration(self.db.clone(), s);
+        let delegate = ApplyDelegate::from_registration(Arc::clone(&self.db), s);
         info!(
             "{} register to apply delegates at term {}",
-            delegate.tag,
-            delegate.term
+            delegate.tag, delegate.term
         );
         if let Some(mut old_delegate) = self.delegates.insert(region_id, delegate) {
             assert_eq!(old_delegate.id, peer_id);
@@ -1583,7 +1611,11 @@ impl Runner {
 impl Runnable<Task> for Runner {
     fn run(&mut self, task: Task) {
         match task {
-            Task::Applies(a) => self.handle_applies(a),
+            Task::Applies(a) => {
+                let elapsed = duration_to_sec(a.start.elapsed());
+                APPLY_TASK_WAIT_TIME_HISTOGRAM.observe(elapsed);
+                self.handle_applies(a.vec);
+            }
             Task::Proposals(props) => self.handle_proposals(props),
             Task::Registration(s) => self.handle_registration(s),
             Task::Destroy(d) => self.handle_destroy(d),
@@ -1598,6 +1630,7 @@ impl Runnable<Task> for Runner {
 #[cfg(test)]
 mod tests {
     use std::sync::*;
+    use std::sync::atomic::*;
 
     use tempdir::TempDir;
     use rocksdb::{Writable, WriteBatch, DB};
@@ -1605,15 +1638,17 @@ mod tests {
     use kvproto::metapb::RegionEpoch;
     use kvproto::raft_cmdpb::CmdType;
 
-    use super::*;
+    use raftstore::coprocessor::*;
+    use raftstore::store::msg::WriteResponse;
     use storage::{ALL_CFS, CF_WRITE};
     use util::collections::HashMap;
 
+    use super::*;
+
     pub fn create_tmp_engine(path: &str) -> (TempDir, Arc<DB>) {
         let path = TempDir::new(path).unwrap();
-        let db = Arc::new(
-            rocksdb::new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap(),
-        );
+        let db =
+            Arc::new(rocksdb::new_engine(path.path().to_str().unwrap(), ALL_CFS, None).unwrap());
         (path, db)
     }
 
@@ -1625,6 +1660,7 @@ mod tests {
             notifier: tx,
             sync_log: false,
             tag: "".to_owned(),
+            use_delete_range: true,
         }
     }
 
@@ -1668,8 +1704,8 @@ mod tests {
     fn test_basic_flow() {
         let (tx, rx) = mpsc::channel();
         let (_tmp, db) = create_tmp_engine("apply-basic");
-        let host = Arc::new(CoprocessorHost::new());
-        let mut runner = new_runner(db.clone(), host, tx);
+        let host = Arc::new(CoprocessorHost::default());
+        let mut runner = new_runner(Arc::clone(&db), host, tx);
 
         let mut reg = Registration::default();
         reg.id = 1;
@@ -1695,7 +1731,9 @@ mod tests {
             false,
             1,
             0,
-            box move |resp| { resp_tx.send(resp).unwrap(); },
+            Callback::Write(box move |resp: WriteResponse| {
+                resp_tx.send(resp.response).unwrap();
+            }),
         );
         let region_proposal = RegionProposal::new(1, 1, vec![p]);
         runner.run(Task::Proposals(vec![region_proposal]));
@@ -1706,8 +1744,15 @@ mod tests {
 
         let (cc_tx, cc_rx) = mpsc::channel();
         let pops = vec![
-            Proposal::new(false, 2, 0, box |_| {}),
-            Proposal::new(true, 3, 0, box move |resp| { cc_tx.send(resp).unwrap(); }),
+            Proposal::new(false, 2, 0, Callback::None),
+            Proposal::new(
+                true,
+                3,
+                0,
+                Callback::Write(box move |write: WriteResponse| {
+                    cc_tx.send(write.response).unwrap();
+                }),
+            ),
         ];
         let region_proposal = RegionProposal::new(1, 2, pops);
         runner.run(Task::Proposals(vec![region_proposal]));
@@ -1722,7 +1767,7 @@ mod tests {
             assert_eq!(cc.as_ref().map(|c| c.index), Some(3));
         }
 
-        let p = Proposal::new(true, 4, 0, box move |_| {});
+        let p = Proposal::new(true, 4, 0, Callback::None);
         let region_proposal = RegionProposal::new(1, 2, vec![p]);
         runner.run(Task::Proposals(vec![region_proposal]));
         assert!(rx.try_recv().is_err());
@@ -1734,9 +1779,9 @@ mod tests {
         let cc_resp = cc_rx.try_recv().unwrap();
         assert!(cc_resp.get_header().get_error().has_stale_command());
 
-        runner.run(Task::applies(
-            vec![Apply::new(1, 1, vec![new_entry(2, 3, None)])],
-        ));
+        runner.run(Task::applies(vec![
+            Apply::new(1, 1, vec![new_entry(2, 3, None)]),
+        ]));
         // non registered region should be ignored.
         assert!(rx.try_recv().is_err());
 
@@ -1747,9 +1792,9 @@ mod tests {
 
         let apply_state_key = keys::apply_state_key(2);
         assert!(db.get(&apply_state_key).unwrap().is_none());
-        runner.run(Task::applies(
-            vec![Apply::new(2, 11, vec![new_entry(5, 4, None)])],
-        ));
+        runner.run(Task::applies(vec![
+            Apply::new(2, 11, vec![new_entry(5, 4, None)]),
+        ]));
         let res = match rx.try_recv() {
             Ok(TaskRes::Applys(res)) => res,
             e => panic!("unexpected apply result: {:?}", e),
@@ -1808,7 +1853,9 @@ mod tests {
             let cmd = PendingCmd::new(
                 self.entry.get_index(),
                 self.entry.get_term(),
-                box move |r| tx.send(r).unwrap(),
+                Callback::Write(box move |resp: WriteResponse| {
+                    tx.send(resp.response).unwrap();
+                }),
             );
             delegate.pending_cmds.append_normal(cmd);
             self
@@ -1892,13 +1939,33 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct ApplyObserver {
+        pre_admin_count: Arc<AtomicUsize>,
+        pre_query_count: Arc<AtomicUsize>,
+        post_admin_count: Arc<AtomicUsize>,
+        post_query_count: Arc<AtomicUsize>,
+    }
+
+    impl Coprocessor for ApplyObserver {}
+
+    impl QueryObserver for ApplyObserver {
+        fn pre_apply_query(&self, _: &mut ObserverContext, _: &[Request]) {
+            self.pre_query_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn post_apply_query(&self, _: &mut ObserverContext, _: &mut RepeatedField<Response>) {
+            self.post_query_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn test_handle_raft_committed_entries() {
         let (_path, db) = create_tmp_engine("test-delegate");
         let mut reg = Registration::default();
         reg.region.set_end_key(b"k5".to_vec());
         reg.region.mut_region_epoch().set_version(3);
-        let mut delegate = ApplyDelegate::from_registration(db.clone(), reg);
+        let mut delegate = ApplyDelegate::from_registration(Arc::clone(&db), reg);
         let (tx, rx) = mpsc::channel();
 
         let put_entry = EntryBuilder::new(1, 1)
@@ -1908,12 +1975,15 @@ mod tests {
             .epoch(1, 3)
             .capture_resp(&mut delegate, tx.clone())
             .build();
-        let host = CoprocessorHost::new();
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut host = CoprocessorHost::default();
+        let obs = ApplyObserver::default();
+        host.registry
+            .register_query_observer(1, Box::new(obs.clone()));
+        let mut apply_ctx = ApplyContext::new(&host, true);
         let res = delegate.handle_raft_committed_entries(&mut apply_ctx, vec![put_entry]);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         assert!(res.is_empty());
         let resp = rx.try_recv().unwrap();
@@ -1936,11 +2006,11 @@ mod tests {
             .put_cf(CF_LOCK, b"k1", b"v1")
             .epoch(1, 3)
             .build();
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut apply_ctx = ApplyContext::new(&host, true);
         delegate.handle_raft_committed_entries(&mut apply_ctx, vec![put_entry]);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         let lock_handle = db.cf_handle(CF_LOCK).unwrap();
         assert_eq!(db.get_cf(lock_handle, &dk_k1).unwrap().unwrap(), b"v1");
@@ -1959,11 +2029,11 @@ mod tests {
             .epoch(1, 1)
             .capture_resp(&mut delegate, tx.clone())
             .build();
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut apply_ctx = ApplyContext::new(&host, true);
         delegate.handle_raft_committed_entries(&mut apply_ctx, vec![put_entry]);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         let resp = rx.try_recv().unwrap();
         assert!(resp.get_header().get_error().has_stale_epoch());
@@ -1976,11 +2046,11 @@ mod tests {
             .epoch(1, 3)
             .capture_resp(&mut delegate, tx.clone())
             .build();
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut apply_ctx = ApplyContext::new(&host, true);
         delegate.handle_raft_committed_entries(&mut apply_ctx, vec![put_entry]);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         let resp = rx.try_recv().unwrap();
         assert!(resp.get_header().get_error().has_key_not_in_region());
@@ -2002,11 +2072,11 @@ mod tests {
         let lock_written_bytes = delegate.metrics.lock_cf_written_bytes;
         let delete_keys_hint = delegate.metrics.delete_keys_hint;
         let size_diff_hint = delegate.metrics.size_diff_hint;
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut apply_ctx = ApplyContext::new(&host, true);
         delegate.handle_raft_committed_entries(&mut apply_ctx, vec![put_entry]);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         let resp = rx.try_recv().unwrap();
         // stale command should be cleared.
@@ -2026,11 +2096,11 @@ mod tests {
             .epoch(1, 3)
             .capture_resp(&mut delegate, tx.clone())
             .build();
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut apply_ctx = ApplyContext::new(&host, true);
         delegate.handle_raft_committed_entries(&mut apply_ctx, vec![delete_entry]);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         let resp = rx.try_recv().unwrap();
         assert!(resp.get_header().get_error().has_key_not_in_region());
@@ -2040,11 +2110,11 @@ mod tests {
             .epoch(1, 3)
             .capture_resp(&mut delegate, tx.clone())
             .build();
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut apply_ctx = ApplyContext::new(&host, true);
         delegate.handle_raft_committed_entries(&mut apply_ctx, vec![delete_range_entry]);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         let resp = rx.try_recv().unwrap();
         assert!(resp.get_header().get_error().has_key_not_in_region());
@@ -2057,11 +2127,11 @@ mod tests {
             .epoch(1, 3)
             .capture_resp(&mut delegate, tx.clone())
             .build();
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut apply_ctx = ApplyContext::new(&host, true);
         delegate.handle_raft_committed_entries(&mut apply_ctx, vec![delete_range_entry]);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         let resp = rx.try_recv().unwrap();
         assert!(!resp.get_header().has_error(), "{:?}", resp);
@@ -2078,11 +2148,11 @@ mod tests {
                 .build();
             entries.push(put_entry);
         }
-        let mut apply_ctx = ApplyContext::new(&host);
+        let mut apply_ctx = ApplyContext::new(&host, true);
         delegate.handle_raft_committed_entries(&mut apply_ctx, entries);
-        db.write(apply_ctx.wb.take().unwrap()).unwrap();
-        for (cb, resp) in apply_ctx.cbs.drain(..) {
-            cb(resp);
+        db.write(apply_ctx.wb).unwrap();
+        for cbs in apply_ctx.cbs.drain(..) {
+            cbs.invoke_all(&host);
         }
         for _ in 0..WRITE_BATCH_MAX_KEYS {
             rx.try_recv().unwrap();
@@ -2090,6 +2160,15 @@ mod tests {
         assert_eq!(
             delegate.apply_state.get_applied_index(),
             WRITE_BATCH_MAX_KEYS as u64 + 8
+        );
+
+        assert_eq!(
+            obs.pre_query_count.load(Ordering::SeqCst),
+            8 + WRITE_BATCH_MAX_KEYS
+        );
+        assert_eq!(
+            obs.post_query_count.load(Ordering::SeqCst),
+            8 + WRITE_BATCH_MAX_KEYS
         );
     }
 }

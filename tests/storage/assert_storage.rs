@@ -23,7 +23,6 @@ use super::util::new_raft_storage_with_store_count;
 use tikv::storage::config::Config;
 use tikv::storage::engine;
 
-
 #[derive(Clone)]
 pub struct AssertionStorage {
     pub store: SyncStorage,
@@ -99,11 +98,11 @@ impl AssertionStorage {
 
     fn expect_not_leader_or_stale_command(&self, err: storage::Error) {
         match err {
-            storage::Error::Txn(
-                txn::Error::Mvcc(mvcc::Error::Engine(engine::Error::Request(ref e))),
-            ) |
-            storage::Error::Txn(txn::Error::Engine(engine::Error::Request(ref e))) |
-            storage::Error::Engine(engine::Error::Request(ref e)) => {
+            storage::Error::Txn(txn::Error::Mvcc(mvcc::Error::Engine(
+                engine::Error::Request(ref e),
+            )))
+            | storage::Error::Txn(txn::Error::Engine(engine::Error::Request(ref e)))
+            | storage::Error::Engine(engine::Error::Request(ref e)) => {
                 assert!(
                     e.has_not_leader() | e.has_stale_command(),
                     "invalid error {:?}",
@@ -300,6 +299,12 @@ impl AssertionStorage {
             .unwrap();
     }
 
+    pub fn prewrite_err(&self, mutations: Vec<Mutation>, primary: &[u8], start_ts: u64) {
+        self.store
+            .prewrite(self.ctx.clone(), mutations, primary.to_vec(), start_ts)
+            .unwrap_err();
+    }
+
     pub fn prewrite_locked(
         &self,
         mutations: Vec<Mutation>,
@@ -312,16 +317,12 @@ impl AssertionStorage {
             .unwrap();
         let locks: Vec<(&[u8], &[u8], u64)> = res.iter()
             .filter_map(|x| {
-                if let Err(
-                    storage::Error::Txn(
-                        txn::Error::Mvcc(mvcc::Error::KeyIsLocked {
-                            ref key,
-                            ref primary,
-                            ts,
-                            ..
-                        }),
-                    ),
-                ) = *x
+                if let Err(storage::Error::Txn(txn::Error::Mvcc(mvcc::Error::KeyIsLocked {
+                    ref key,
+                    ref primary,
+                    ts,
+                    ..
+                }))) = *x
                 {
                     Some((key.as_ref(), primary.as_ref(), ts))
                 } else {
@@ -376,9 +377,17 @@ impl AssertionStorage {
         );
     }
 
-    pub fn scan_lock_ok(&self, max_ts: u64, expect: Vec<LockInfo>) {
+    pub fn scan_lock_ok(
+        &self,
+        max_ts: u64,
+        start_key: Vec<u8>,
+        limit: usize,
+        expect: Vec<LockInfo>,
+    ) {
         assert_eq!(
-            self.store.scan_lock(self.ctx.clone(), max_ts).unwrap(),
+            self.store
+                .scan_lock(self.ctx.clone(), max_ts, start_key, limit)
+                .unwrap(),
             expect
         );
     }
@@ -389,12 +398,26 @@ impl AssertionStorage {
             .unwrap();
     }
 
+    pub fn resolve_lock_batch_ok(
+        &self,
+        start_ts_1: u64,
+        commit_ts_1: u64,
+        start_ts_2: u64,
+        commit_ts_2: u64,
+    ) {
+        self.store
+            .resolve_lock_batch(
+                self.ctx.clone(),
+                vec![(start_ts_1, commit_ts_1), (start_ts_2, commit_ts_2)],
+            )
+            .unwrap();
+    }
+
     pub fn resolve_lock_with_illegal_tso(&self, start_ts: u64, commit_ts: Option<u64>) {
         let resp = self.store
             .resolve_lock(self.ctx.clone(), start_ts, commit_ts);
         self.expect_invalid_tso_err(resp, start_ts, commit_ts.unwrap())
     }
-
 
     pub fn gc_ok(&self, safe_point: u64) {
         self.store.gc(self.ctx.clone(), safe_point).unwrap();
@@ -425,8 +448,18 @@ impl AssertionStorage {
         self.store.raw_put(self.ctx.clone(), key, value).unwrap();
     }
 
+    pub fn raw_put_err(&self, key: Vec<u8>, value: Vec<u8>) {
+        self.store
+            .raw_put(self.ctx.clone(), key, value)
+            .unwrap_err();
+    }
+
     pub fn raw_delete_ok(&self, key: Vec<u8>) {
         self.store.raw_delete(self.ctx.clone(), key).unwrap()
+    }
+
+    pub fn raw_delete_err(&self, key: Vec<u8>) {
+        self.store.raw_delete(self.ctx.clone(), key).unwrap_err();
     }
 
     pub fn raw_scan_ok(&self, start_key: Vec<u8>, limit: usize, expect: Vec<(&[u8], &[u8])>) {
@@ -454,7 +487,7 @@ impl AssertionStorage {
 
     pub fn test_txn_store_gc3(&self, key_prefix: u8) {
         let key_len = 10_000;
-        let key = vec![key_prefix; 10_000];
+        let key = vec![key_prefix; 1024];
         for k in 1u64..(MAX_TXN_WRITE_SIZE / key_len * 2) as u64 {
             self.put_ok(&key, b"", k * 10, k * 10 + 5);
         }
@@ -470,7 +503,7 @@ impl AssertionStorage {
         key_prefix: u8,
     ) {
         let key_len = 10_000;
-        let key = vec![key_prefix; 10_000];
+        let key = vec![key_prefix; 1024];
         for k in 1u64..(MAX_TXN_WRITE_SIZE / key_len * 2) as u64 {
             self.put_ok_for_cluster(cluster, &key, b"", k * 10, k * 10 + 5);
         }

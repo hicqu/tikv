@@ -41,8 +41,11 @@ quick_error!{
             description(err.description())
             display("unknown error {:?}", err)
         }
+        RegionNotFound(key: Vec<u8>) {
+            description("region is not found")
+            display("region is not found for key {:?}", key)
+        }
     }
 }
-
 
 pub type Result<T> = result::Result<T, Error>;

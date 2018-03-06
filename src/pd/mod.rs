@@ -11,17 +11,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 mod metrics;
 mod client;
 mod util;
 
 pub mod errors;
 pub mod pd;
+mod config;
 pub use self::errors::{Error, Result};
 pub use self::client::RpcClient;
 pub use self::util::validate_endpoints;
 pub use self::pd::{Runner as PdRunner, Task as PdTask};
+pub use self::util::RECONNECT_INTERVAL_SEC;
+pub use self::config::Config;
+
+use std::ops::Deref;
 
 use kvproto::metapb;
 use kvproto::pdpb;
@@ -30,7 +34,7 @@ use futures::Future;
 pub type Key = Vec<u8>;
 pub type PdFuture<T> = Box<Future<Item = T, Error = Error> + Send>;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RegionStat {
     pub down_peers: Vec<pdpb::PeerStats>,
     pub pending_peers: Vec<metapb::Peer>,
@@ -60,6 +64,29 @@ impl RegionStat {
             read_keys: read_keys,
             approximate_size: approximate_size,
         }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct RegionInfo {
+    pub region: metapb::Region,
+    pub leader: Option<metapb::Peer>,
+}
+
+impl RegionInfo {
+    pub fn new(region: metapb::Region, leader: Option<metapb::Peer>) -> RegionInfo {
+        RegionInfo {
+            region: region,
+            leader: leader,
+        }
+    }
+}
+
+impl Deref for RegionInfo {
+    type Target = metapb::Region;
+
+    fn deref(&self) -> &Self::Target {
+        &self.region
     }
 }
 
@@ -111,12 +138,23 @@ pub trait PdClient: Send + Sync {
     // Get store information.
     fn get_store(&self, store_id: u64) -> Result<metapb::Store>;
 
+    // Get all stores information.
+    fn get_all_stores(&self) -> Result<Vec<metapb::Store>> {
+        unimplemented!();
+    }
+
     // Get cluster meta information.
     fn get_cluster_config(&self) -> Result<metapb::Cluster>;
 
     // For route.
     // Get region which the key belong to.
     fn get_region(&self, key: &[u8]) -> Result<metapb::Region>;
+
+    // Get region info which the key belong to.
+    fn get_region_info(&self, key: &[u8]) -> Result<RegionInfo> {
+        self.get_region(key)
+            .map(|region| RegionInfo::new(region, None))
+    }
 
     // Get region by region id.
     fn get_region_by_id(&self, region_id: u64) -> PdFuture<Option<metapb::Region>>;
@@ -144,6 +182,16 @@ pub trait PdClient: Send + Sync {
 
     // Report pd the split region.
     fn report_split(&self, left: metapb::Region, right: metapb::Region) -> PdFuture<()>;
+
+    // Scatter the region across the cluster.
+    fn scatter_region(&self, _: RegionInfo) -> Result<()> {
+        unimplemented!();
+    }
+
+    // Register a handler to the client, it will be invoked after reconnecting to PD.
+    //
+    // Please note that this method should only be called once.
+    fn handle_reconnect<F: Fn() + Sync + Send + 'static>(&self, _: F) {}
 }
 
 const REQUEST_TIMEOUT: u64 = 2; // 2s

@@ -22,55 +22,56 @@
 
 #[macro_use]
 extern crate clap;
+extern crate fs2;
 #[cfg(feature = "mem-profiling")]
 extern crate jemallocator;
-extern crate tikv;
+extern crate libc;
 #[macro_use]
 extern crate log;
-extern crate rocksdb;
-extern crate toml;
-extern crate libc;
-extern crate fs2;
-#[cfg(unix)]
-extern crate signal;
 #[cfg(unix)]
 extern crate nix;
 extern crate prometheus;
+extern crate rocksdb;
 extern crate serde_json;
+#[cfg(unix)]
+extern crate signal;
+extern crate tikv;
+extern crate toml;
 
 mod signal_handler;
 #[cfg(unix)]
 mod profiling;
 
-use std::error::Error;
 use std::process;
 use std::fs::File;
 use std::usize;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
-use std::io::Read;
 use std::env;
 use std::time::Duration;
 
 use clap::{App, Arg, ArgMatches};
 use fs2::FileExt;
 
-use tikv::config::{MetricConfig, TiKvConfig};
+use tikv::config::{MetricConfig, TiKvConfig, LAST_CONFIG_FILE};
 use tikv::util::{self, panic_hook, rocksdb as rocksdb_util};
 use tikv::util::collections::HashMap;
 use tikv::util::logger::{self, StderrLogger};
 use tikv::util::file_log::RotatingFileLogger;
+use tikv::util::security::SecurityManager;
 use tikv::util::transport::SendCh;
 use tikv::util::worker::FutureWorker;
 use tikv::storage::DEFAULT_ROCKSDB_SUB_DIR;
 use tikv::server::{create_raft_storage, Node, Server, DEFAULT_CLUSTER_ID};
 use tikv::server::transport::ServerRaftStoreRouter;
 use tikv::server::resolve;
-use tikv::raftstore::store::{self, Engines, SnapManager};
+use tikv::raftstore::store::{self, new_compaction_listener, Engines, SnapManagerBuilder};
+use tikv::raftstore::coprocessor::CoprocessorHost;
 use tikv::pd::{PdClient, RpcClient};
 use tikv::util::time::Monitor;
-use tikv::util::rocksdb::metrics_flusher::{MetricsFlusher, DEFAULT_FLUSER_INTERVAL};
+use tikv::util::rocksdb::metrics_flusher::{MetricsFlusher, DEFAULT_FLUSHER_INTERVAL};
+use tikv::import::{ImportSSTService, SSTImporter};
 
 const RESERVED_OPEN_FDS: u64 = 1000;
 
@@ -143,16 +144,16 @@ fn check_system_config(config: &TiKvConfig) {
     }
 }
 
-fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
+fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig, security_mgr: Arc<SecurityManager>) {
     let store_path = Path::new(&cfg.storage.data_dir);
     let lock_path = store_path.join(Path::new("LOCK"));
     let db_path = store_path.join(Path::new(DEFAULT_ROCKSDB_SUB_DIR));
     let snap_path = store_path.join(Path::new("snap"));
     let raft_db_path = Path::new(&cfg.raft_store.raftdb_path);
+    let import_path = store_path.join("import");
 
-    let f = File::create(lock_path.as_path()).unwrap_or_else(|e| {
-        fatal!("failed to create lock at {}: {:?}", lock_path.display(), e)
-    });
+    let f = File::create(lock_path.as_path())
+        .unwrap_or_else(|e| fatal!("failed to create lock at {}: {:?}", lock_path.display(), e));
     if f.try_lock_exclusive().is_err() {
         fatal!(
             "lock {:?} failed, maybe another instance is using this directory.",
@@ -166,15 +167,17 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
     let store_sendch = SendCh::new(event_loop.channel(), "raftstore");
     let (significant_msg_sender, significant_msg_receiver) = mpsc::channel();
     let raft_router = ServerRaftStoreRouter::new(store_sendch.clone(), significant_msg_sender);
+    let compaction_listener = new_compaction_listener(store_sendch.clone());
 
     // Create kv engine, storage.
-    let kv_db_opts = cfg.rocksdb.build_opt();
+    let mut kv_db_opts = cfg.rocksdb.build_opt();
+    kv_db_opts.add_event_listener(compaction_listener);
     let kv_cfs_opts = cfg.rocksdb.build_cf_opts();
     let kv_engine = Arc::new(
         rocksdb_util::new_engine_opt(db_path.to_str().unwrap(), kv_db_opts, kv_cfs_opts)
             .unwrap_or_else(|s| fatal!("failed to create kv engine: {:?}", s)),
     );
-    let mut storage = create_raft_storage(raft_router.clone(), kv_engine.clone(), &cfg.storage)
+    let mut storage = create_raft_storage(raft_router.clone(), &cfg.storage)
         .unwrap_or_else(|e| fatal!("failed to create raft stroage: {:?}", e));
 
     // Create raft engine.
@@ -187,33 +190,47 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
             raft_db_cf_opts,
         ).unwrap_or_else(|s| fatal!("failed to create raft engine: {:?}", s)),
     );
-    let engines = Engines::new(kv_engine.clone(), raft_engine.clone());
+    let engines = Engines::new(Arc::clone(&kv_engine), Arc::clone(&raft_engine));
 
     // Create pd client and pd work, snapshot manager, server.
     let pd_client = Arc::new(pd_client);
     let pd_worker = FutureWorker::new("pd worker");
-    let (mut worker, resolver) = resolve::new_resolver(pd_client.clone())
+    let (mut worker, resolver) = resolve::new_resolver(Arc::clone(&pd_client))
         .unwrap_or_else(|e| fatal!("failed to start address resolver: {:?}", e));
-    let snap_mgr = SnapManager::new(
-        snap_path.as_path().to_str().unwrap().to_owned(),
-        Some(store_sendch),
-    );
 
+    let snap_mgr = SnapManagerBuilder::default()
+        .max_write_bytes_per_sec(cfg.server.snap_max_write_bytes_per_sec.0)
+        .max_total_size(cfg.server.snap_max_total_size.0)
+        .build(
+            snap_path.as_path().to_str().unwrap().to_owned(),
+            Some(store_sendch),
+        );
+
+    let importer = Arc::new(SSTImporter::new(import_path).unwrap());
+    let import_service = ImportSSTService::new(cfg.import.clone(), storage.clone(), importer);
+
+    let server_cfg = Arc::new(cfg.server.clone());
     // Create server
     let mut server = Server::new(
-        &cfg.server,
-        cfg.raft_store.region_split_size.0 as usize,
+        &server_cfg,
+        &security_mgr,
+        cfg.coprocessor.region_split_size.0 as usize,
         storage.clone(),
         raft_router,
         resolver,
         snap_mgr.clone(),
         pd_worker.scheduler(),
         Some(engines.clone()),
+        Some(import_service),
     ).unwrap_or_else(|e| fatal!("failed to create server: {:?}", e));
     let trans = server.transport();
 
     // Create node.
-    let mut node = Node::new(&mut event_loop, &cfg.server, &cfg.raft_store, pd_client);
+    let mut node = Node::new(&mut event_loop, &server_cfg, &cfg.raft_store, pd_client);
+
+    // Create CoprocessorHost.
+    let coprocessor_host = CoprocessorHost::new(cfg.coprocessor.clone(), node.get_sendch());
+
     node.start(
         event_loop,
         engines.clone(),
@@ -221,6 +238,7 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
         snap_mgr,
         significant_msg_receiver,
         pd_worker,
+        coprocessor_host,
     ).unwrap_or_else(|e| fatal!("failed to start node: {:?}", e));
     initial_metric(&cfg.metric, Some(node.id()));
 
@@ -232,7 +250,7 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
 
     let mut metrics_flusher = MetricsFlusher::new(
         engines.clone(),
-        Duration::from_millis(DEFAULT_FLUSER_INTERVAL),
+        Duration::from_millis(DEFAULT_FLUSHER_INTERVAL),
     );
 
     // Start metrics flusher
@@ -242,9 +260,9 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
 
     // Run server.
     server
-        .start(&cfg.server)
+        .start(server_cfg, security_mgr)
         .unwrap_or_else(|e| fatal!("failed to start server: {:?}", e));
-    signal_handler::handle_signal(engines, &cfg.rocksdb.backup_dir);
+    signal_handler::handle_signal(engines);
 
     // Stop.
     server
@@ -312,6 +330,40 @@ fn overwrite_config_with_cmd_args(config: &mut TiKvConfig, matches: &ArgMatches)
     }
 }
 
+// Set gRPC event engine to epollsig.
+// See more: https://github.com/grpc/grpc/blob/486761d04e03a9183d8013eddd86c3134d52d459\
+//           /src/core/lib/iomgr/ev_posix.cc#L149
+fn configure_grpc_poll_strategy() {
+    const GRPC_POLL_STRATEGY: &str = "GRPC_POLL_STRATEGY";
+    const DEFAULT_ENGINE: &str = "epollsig";
+    if cfg!(target_os = "linux") && env::var(GRPC_POLL_STRATEGY).is_err() {
+        // Set to epollsig if it is not specified.
+        env::set_var(GRPC_POLL_STRATEGY, DEFAULT_ENGINE);
+    }
+}
+
+fn check_and_persist_critical_config(config: &TiKvConfig, matches: &ArgMatches) {
+    if let Some(path) = matches.value_of("config") {
+        let cfg_file = Path::new(path);
+        if let Some(cfg_dir) = cfg_file.parent() {
+            // Check current critical configurations with last time, if there are some
+            // changes, user must guarantee relevant works have been done.
+            let path_buf = cfg_dir.join(LAST_CONFIG_FILE);
+            if path_buf.exists() {
+                let last_cfg = TiKvConfig::from_file(&path_buf);
+                if let Err(e) = config.check_critical_cfg_with(&last_cfg) {
+                    fatal!("check critical config failed, err {:?}", e);
+                }
+            }
+
+            // Persist current critical configurations to file.
+            if let Err(e) = config.write_to_file(&path_buf) {
+                fatal!("persist critical config failed, err {:?}", e);
+            }
+        }
+    }
+}
+
 fn main() {
     let long_version: String = {
         let (hash, branch, time, rust_ver) = util::build_info();
@@ -331,9 +383,7 @@ fn main() {
     let matches = App::new("TiKV")
         .long_version(long_version.as_ref())
         .author("PingCAP Inc. <info@pingcap.com>")
-        .about(
-            "A Distributed transactional key-value database powered by Rust and Raft",
-        )
+        .about("A Distributed transactional key-value database powered by Rust and Raft")
         .arg(
             Arg::with_name("config")
                 .short("C")
@@ -435,29 +485,17 @@ fn main() {
         process::exit(0);
     }
 
-    let mut config = matches.value_of("config").map_or_else(
-        TiKvConfig::default,
-        |path| {
-            File::open(&path)
-                .map_err::<Box<Error>, _>(|e| Box::new(e))
-                .and_then(|mut f| {
-                    let mut s = String::new();
-                    f.read_to_string(&mut s)?;
-                    let c = toml::from_str(&s)?;
-                    Ok(c)
-                })
-                .unwrap_or_else(|e| {
-                    fatal!("invalid configuration file {:?}: {}", path, e);
-                })
-        },
-    );
+    let mut config = matches
+        .value_of("config")
+        .map_or_else(TiKvConfig::default, |path| TiKvConfig::from_file(&path));
 
     overwrite_config_with_cmd_args(&mut config, &matches);
 
-    if let Err(e) = config.validate() {
-        fatal!("invalid configuration: {:?}", e);
-    }
+    check_and_persist_critical_config(&config, &matches);
 
+    // Sets the global logger ASAP.
+    // It is okay to use the config w/o `validata()`,
+    // because `init_log()` handles various conditions.
     init_log(&config);
 
     // Print version information.
@@ -465,6 +503,10 @@ fn main() {
 
     panic_hook::set_exit_hook();
 
+    config.compatible_adjust();
+    if let Err(e) = config.validate() {
+        fatal!("invalid configuration: {:?}", e);
+    }
     info!(
         "using config: {}",
         serde_json::to_string_pretty(&config).unwrap()
@@ -473,7 +515,13 @@ fn main() {
     // Before any startup, check system configuration.
     check_system_config(&config);
 
-    let pd_client = RpcClient::new(&config.pd.endpoints)
+    configure_grpc_poll_strategy();
+
+    let security_mgr = Arc::new(
+        SecurityManager::new(&config.security)
+            .unwrap_or_else(|e| fatal!("failed to create security manager: {:?}", e)),
+    );
+    let pd_client = RpcClient::new(&config.pd, Arc::clone(&security_mgr))
         .unwrap_or_else(|e| fatal!("failed to create rpc client: {:?}", e));
     let cluster_id = pd_client
         .get_cluster_id()
@@ -485,5 +533,5 @@ fn main() {
     info!("connect to PD cluster {}", cluster_id);
 
     let _m = Monitor::default();
-    run_raft_server(pd_client, &config);
+    run_raft_server(pd_client, &config, security_mgr);
 }

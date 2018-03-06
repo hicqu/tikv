@@ -14,6 +14,10 @@
 #![feature(plugin)]
 #![cfg_attr(feature = "dev", plugin(clippy))]
 
+extern crate clap;
+extern crate grpcio as grpc;
+extern crate kvproto;
+extern crate protobuf;
 /// Inject failures to `TikV`.
 ///
 /// TODO: Integrate into tikv-ctl.
@@ -22,15 +26,10 @@
 ///
 /// ```sh
 /// ./tikv-fail -a 127.0.0.1:9090 inject\
-//      tikv::raftstore::store::store::raft_between_save=panic
+//      raft_between_save=panic("boom")
 /// ```
 ///
-
 extern crate tikv;
-extern crate clap;
-extern crate grpcio as grpc;
-extern crate protobuf;
-extern crate kvproto;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -49,6 +48,7 @@ fn main() {
         .about("A tool for injecting failures to TiKV and recovery")
         .arg(
             Arg::with_name("addr")
+                .required(true)
                 .short("a")
                 .takes_value(true)
                 .help("set tikv ip:port"),
@@ -119,7 +119,7 @@ fn main() {
             inject_req.set_actions(actions);
 
             let option = CallOption::default().timeout(Duration::from_secs(10));
-            client.inject_fail_point_opt(inject_req, option).unwrap();
+            client.inject_fail_point_opt(&inject_req, option).unwrap();
         }
     } else if let Some(matches) = matches.subcommand_matches("recover") {
         let mut list = matches.value_of("file").map_or_else(Vec::new, read_file);
@@ -134,12 +134,12 @@ fn main() {
             recover_req.set_name(name);
 
             let option = CallOption::default().timeout(Duration::from_secs(10));
-            client.recover_fail_point_opt(recover_req, option).unwrap();
+            client.recover_fail_point_opt(&recover_req, option).unwrap();
         }
     } else if matches.is_present("list") {
         let list_req = debugpb::ListFailPointsRequest::new();
         let option = CallOption::default().timeout(Duration::from_secs(10));
-        let resp = client.list_fail_points_opt(list_req, option).unwrap();
+        let resp = client.list_fail_points_opt(&list_req, option).unwrap();
         println!("{:?}", resp.get_entries());
     }
 }

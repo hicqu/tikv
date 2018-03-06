@@ -23,34 +23,35 @@ use util::properties::MvccProperties;
 
 const GC_MAX_ROW_VERSIONS_THRESHOLD: u64 = 100;
 
-pub struct MvccReader<'a> {
-    snapshot: &'a Snapshot,
-    statistics: &'a mut Statistics,
+pub struct MvccReader {
+    snapshot: Box<Snapshot>,
+    statistics: Statistics,
     // cursors are used for speeding up scans.
-    data_cursor: Option<Cursor<'a>>,
-    lock_cursor: Option<Cursor<'a>>,
-    write_cursor: Option<Cursor<'a>>,
+    data_cursor: Option<Cursor>,
+    lock_cursor: Option<Cursor>,
+    write_cursor: Option<Cursor>,
 
     scan_mode: Option<ScanMode>,
     key_only: bool,
 
     fill_cache: bool,
+    lower_bound: Option<Vec<u8>>,
     upper_bound: Option<Vec<u8>>,
     isolation_level: IsolationLevel,
 }
 
-impl<'a> MvccReader<'a> {
+impl MvccReader {
     pub fn new(
-        snapshot: &'a Snapshot,
-        statistics: &'a mut Statistics,
+        snapshot: Box<Snapshot>,
         scan_mode: Option<ScanMode>,
         fill_cache: bool,
+        lower_bound: Option<Vec<u8>>,
         upper_bound: Option<Vec<u8>>,
         isolation_level: IsolationLevel,
-    ) -> MvccReader<'a> {
+    ) -> MvccReader {
         MvccReader {
             snapshot: snapshot,
-            statistics: statistics,
+            statistics: Statistics::default(),
             data_cursor: None,
             lock_cursor: None,
             write_cursor: None,
@@ -58,12 +59,18 @@ impl<'a> MvccReader<'a> {
             isolation_level: isolation_level,
             key_only: false,
             fill_cache: fill_cache,
+            lower_bound: lower_bound,
             upper_bound: upper_bound,
         }
     }
 
-    pub fn close(self) -> &'a mut Statistics {
-        self.statistics
+    pub fn get_statistics(&self) -> &Statistics {
+        &self.statistics
+    }
+
+    pub fn collect_statistics_into(&mut self, stats: &mut Statistics) {
+        stats.add(&self.statistics);
+        self.statistics = Statistics::default();
     }
 
     pub fn set_key_only(&mut self, key_only: bool) {
@@ -75,7 +82,7 @@ impl<'a> MvccReader<'a> {
             return Ok(vec![]);
         }
         if self.scan_mode.is_some() && self.data_cursor.is_none() {
-            let iter_opt = IterOption::new(None, self.fill_cache);
+            let iter_opt = IterOption::new(None, None, self.fill_cache);
             self.data_cursor = Some(self.snapshot.iter(iter_opt, self.get_scan_mode(true))?);
         }
 
@@ -94,14 +101,14 @@ impl<'a> MvccReader<'a> {
         };
 
         self.statistics.data.processed += 1;
-        self.statistics.data.flow_stats.read_bytes += res.len();
+        self.statistics.data.flow_stats.read_bytes += k.raw().unwrap_or_default().len() + res.len();
         self.statistics.data.flow_stats.read_keys += 1;
         Ok(res)
     }
 
     pub fn load_lock(&mut self, key: &Key) -> Result<Option<Lock>> {
         if self.scan_mode.is_some() && self.lock_cursor.is_none() {
-            let iter_opt = IterOption::new(None, true);
+            let iter_opt = IterOption::new(None, None, true);
             let iter = self.snapshot
                 .iter_cf(CF_LOCK, iter_opt, self.get_scan_mode(true))?;
             self.lock_cursor = Some(iter);
@@ -151,7 +158,7 @@ impl<'a> MvccReader<'a> {
     ) -> Result<Option<(u64, Write)>> {
         if self.scan_mode.is_some() {
             if self.write_cursor.is_none() {
-                let iter_opt = IterOption::new(None, self.fill_cache);
+                let iter_opt = IterOption::new(None, None, self.fill_cache);
                 let iter = self.snapshot
                     .iter_cf(CF_WRITE, iter_opt, self.get_scan_mode(false))?;
                 self.write_cursor = Some(iter);
@@ -167,11 +174,9 @@ impl<'a> MvccReader<'a> {
 
         let cursor = self.write_cursor.as_mut().unwrap();
         let ok = if reverse {
-            cursor
-                .near_seek_for_prev(&key.append_ts(ts), &mut self.statistics.write)?
+            cursor.near_seek_for_prev(&key.append_ts(ts), &mut self.statistics.write)?
         } else {
-            cursor
-                .near_seek(&key.append_ts(ts), &mut self.statistics.write)?
+            cursor.near_seek(&key.append_ts(ts), &mut self.statistics.write)?
         };
         if !ok {
             return Ok(None);
@@ -184,7 +189,7 @@ impl<'a> MvccReader<'a> {
         }
         let write = Write::parse(cursor.value())?;
         self.statistics.write.processed += 1;
-        self.statistics.write.flow_stats.read_bytes += cursor.value().len();
+        self.statistics.write.flow_stats.read_bytes += cursor.key().len() + cursor.value().len();
         self.statistics.write.flow_stats.read_keys += 1;
         Ok(Some((commit_ts, write)))
     }
@@ -259,7 +264,7 @@ impl<'a> MvccReader<'a> {
     fn create_data_cursor(&mut self) -> Result<()> {
         self.scan_mode = Some(ScanMode::Forward);
         if self.data_cursor.is_none() {
-            let iter_opt = IterOption::new(None, self.fill_cache);
+            let iter_opt = IterOption::new(None, None, self.fill_cache);
             let iter = self.snapshot.iter(iter_opt, self.get_scan_mode(true))?;
             self.data_cursor = Some(iter);
         }
@@ -268,7 +273,11 @@ impl<'a> MvccReader<'a> {
 
     fn create_write_cursor(&mut self) -> Result<()> {
         if self.write_cursor.is_none() {
-            let iter_opt = IterOption::new(self.upper_bound.as_ref().cloned(), self.fill_cache);
+            let iter_opt = IterOption::new(
+                self.lower_bound.as_ref().cloned(),
+                self.upper_bound.as_ref().cloned(),
+                self.fill_cache,
+            );
             let iter = self.snapshot
                 .iter_cf(CF_WRITE, iter_opt, self.get_scan_mode(false))?;
             self.write_cursor = Some(iter);
@@ -278,7 +287,11 @@ impl<'a> MvccReader<'a> {
 
     fn create_lock_cursor(&mut self) -> Result<()> {
         if self.lock_cursor.is_none() {
-            let iter_opt = IterOption::new(self.upper_bound.as_ref().cloned(), true);
+            let iter_opt = IterOption::new(
+                self.lower_bound.as_ref().cloned(),
+                self.upper_bound.as_ref().cloned(),
+                true,
+            );
             let iter = self.snapshot
                 .iter_cf(CF_LOCK, iter_opt, self.get_scan_mode(true))?;
             self.lock_cursor = Some(iter);
@@ -296,9 +309,8 @@ impl<'a> MvccReader<'a> {
 
         while ok {
             if Write::parse(cursor.value())?.start_ts == ts {
-                return Ok(Some(
-                    Key::from_encoded(cursor.key().to_vec()).truncate_ts()?,
-                ));
+                return Ok(Some(Key::from_encoded(cursor.key().to_vec())
+                    .truncate_ts()?));
             }
             ok = cursor.next(&mut self.statistics.write);
         }
@@ -401,7 +413,7 @@ impl<'a> MvccReader<'a> {
         &mut self,
         start: Option<Key>,
         filter: F,
-        limit: Option<usize>,
+        limit: usize,
     ) -> Result<(Vec<(Key, Lock)>, Option<Key>)>
     where
         F: Fn(&Lock) -> bool,
@@ -421,10 +433,8 @@ impl<'a> MvccReader<'a> {
             let lock = Lock::parse(cursor.value())?;
             if filter(&lock) {
                 locks.push((key.clone(), lock));
-                if let Some(limit) = limit {
-                    if locks.len() >= limit {
-                        return Ok((locks, Some(key)));
-                    }
+                if limit > 0 && locks.len() >= limit {
+                    return Ok((locks, Some(key)));
                 }
             }
             cursor.next(&mut self.statistics.lock);
@@ -438,7 +448,7 @@ impl<'a> MvccReader<'a> {
         mut start: Option<Key>,
         limit: usize,
     ) -> Result<(Vec<Key>, Option<Key>)> {
-        let iter_opt = IterOption::new(None, self.fill_cache);
+        let iter_opt = IterOption::new(None, None, self.fill_cache);
         let scan_mode = self.get_scan_mode(false);
         let mut cursor = self.snapshot.iter_cf(CF_WRITE, iter_opt, scan_mode)?;
         let mut keys = vec![];
@@ -549,12 +559,11 @@ mod tests {
     use kvproto::kvrpcpb::IsolationLevel;
     use rocksdb::{self, Writable, WriteBatch, DB};
     use std::sync::Arc;
-    use storage::{make_key, Mutation, Options, Statistics, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT,
-                  CF_WRITE};
+    use storage::{make_key, Mutation, Options, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
     use storage::engine::Modify;
     use storage::mvcc::{MvccReader, MvccTxn};
     use tempdir::TempDir;
-    use raftstore::coprocessor::RegionSnapshot;
+    use raftstore::store::RegionSnapshot;
     use raftstore::store::keys;
     use util::rocksdb::{self as rocksdb_util, CFOptions};
     use util::properties::{MvccProperties, MvccPropertiesCollectorFactory};
@@ -567,7 +576,7 @@ mod tests {
     impl RegionEngine {
         pub fn new(db: Arc<DB>, region: Region) -> RegionEngine {
             RegionEngine {
-                db: db.clone(),
+                db: Arc::clone(&db),
                 region: region,
             }
         }
@@ -591,30 +600,26 @@ mod tests {
         }
 
         fn prewrite(&mut self, m: Mutation, pk: &[u8], start_ts: u64) {
-            let mut stat = Statistics::default();
-            let snap = RegionSnapshot::from_raw(self.db.clone(), self.region.clone());
-            let mut txn = MvccTxn::new(&snap, &mut stat, start_ts, None, IsolationLevel::SI, true);
+            let snap = RegionSnapshot::from_raw(Arc::clone(&self.db), self.region.clone());
+            let mut txn = MvccTxn::new(Box::new(snap), start_ts, None, IsolationLevel::SI, true);
             txn.prewrite(m, pk, &Options::default()).unwrap();
-            self.write(txn.modifies());
+            self.write(txn.into_modifies());
         }
 
         fn commit(&mut self, pk: &[u8], start_ts: u64, commit_ts: u64) {
             let k = make_key(pk);
-            let mut stat = Statistics::default();
-            let snap = RegionSnapshot::from_raw(self.db.clone(), self.region.clone());
-            let mut txn = MvccTxn::new(&snap, &mut stat, start_ts, None, IsolationLevel::SI, true);
+            let snap = RegionSnapshot::from_raw(Arc::clone(&self.db), self.region.clone());
+            let mut txn = MvccTxn::new(Box::new(snap), start_ts, None, IsolationLevel::SI, true);
             txn.commit(&k, commit_ts).unwrap();
-            self.write(txn.modifies());
+            self.write(txn.into_modifies());
         }
 
         fn gc(&mut self, pk: &[u8], safe_point: u64) {
             let k = make_key(pk);
-            let mut stat = Statistics::default();
-            let snap = RegionSnapshot::from_raw(self.db.clone(), self.region.clone());
-            let mut txn =
-                MvccTxn::new(&snap, &mut stat, safe_point, None, IsolationLevel::SI, true);
+            let snap = RegionSnapshot::from_raw(Arc::clone(&self.db), self.region.clone());
+            let mut txn = MvccTxn::new(Box::new(snap), safe_point, None, IsolationLevel::SI, true);
             txn.gc(&k, safe_point).unwrap();
-            self.write(txn.modifies());
+            self.write(txn.into_modifies());
         }
 
         fn write(&mut self, modifies: Vec<Modify>) {
@@ -671,9 +676,7 @@ mod tests {
             CFOptions::new(CF_LOCK, rocksdb::ColumnFamilyOptions::new()),
             CFOptions::new(CF_WRITE, cf_opts),
         ];
-        Arc::new(
-            rocksdb_util::new_engine_opt(path, db_opts, cfs_opts).unwrap(),
-        )
+        Arc::new(rocksdb_util::new_engine_opt(path, db_opts, cfs_opts).unwrap())
     }
 
     fn make_region(id: u64, start_key: Vec<u8>, end_key: Vec<u8>) -> Region {
@@ -694,9 +697,8 @@ mod tests {
         safe_point: u64,
         need_gc: bool,
     ) -> Option<MvccProperties> {
-        let snap = RegionSnapshot::from_raw(db.clone(), region.clone());
-        let mut stat = Statistics::default();
-        let reader = MvccReader::new(&snap, &mut stat, None, false, None, IsolationLevel::SI);
+        let snap = RegionSnapshot::from_raw(Arc::clone(&db), region.clone());
+        let reader = MvccReader::new(Box::new(snap), None, false, None, None, IsolationLevel::SI);
         assert_eq!(reader.need_gc(safe_point, 1.0), need_gc);
         reader.get_mvcc_properties(safe_point)
     }
@@ -712,22 +714,22 @@ mod tests {
 
     fn test_without_properties(path: &str, region: &Region) {
         let db = open_db(path, false);
-        let mut engine = RegionEngine::new(db.clone(), region.clone());
+        let mut engine = RegionEngine::new(Arc::clone(&db), region.clone());
 
         // Put 2 keys.
         engine.put(&[1], 1, 1);
         engine.put(&[4], 2, 2);
-        assert!(check_need_gc(db.clone(), region.clone(), 10, true).is_none());
+        assert!(check_need_gc(Arc::clone(&db), region.clone(), 10, true).is_none());
         engine.flush();
         // After this flush, we have a SST file without properties.
         // Without properties, we always need GC.
-        assert!(check_need_gc(db.clone(), region.clone(), 10, true).is_none());
+        assert!(check_need_gc(Arc::clone(&db), region.clone(), 10, true).is_none());
     }
 
     #[allow(cyclomatic_complexity)]
     fn test_with_properties(path: &str, region: &Region) {
         let db = open_db(path, true);
-        let mut engine = RegionEngine::new(db.clone(), region.clone());
+        let mut engine = RegionEngine::new(Arc::clone(&db), region.clone());
 
         // Put 2 keys.
         engine.put(&[2], 3, 3);
@@ -736,12 +738,12 @@ mod tests {
         // After this flush, we have a SST file w/ properties, plus the SST
         // file w/o properties from previous flush. We always need GC as
         // long as we can't get properties from any SST files.
-        assert!(check_need_gc(db.clone(), region.clone(), 10, true).is_none());
+        assert!(check_need_gc(Arc::clone(&db), region.clone(), 10, true).is_none());
         engine.compact();
         // After this compact, the two SST files are compacted into a new
         // SST file with properties. Now all SST files have properties and
         // all keys have only one version, so we don't need gc.
-        let props = check_need_gc(db.clone(), region.clone(), 10, false).unwrap();
+        let props = check_need_gc(Arc::clone(&db), region.clone(), 10, false).unwrap();
         assert_eq!(props.min_ts, 1);
         assert_eq!(props.max_ts, 4);
         assert_eq!(props.num_rows, 4);
@@ -757,7 +759,7 @@ mod tests {
         engine.flush();
         // After this flush, keys 5,6 in the new SST file have more than one
         // versions, so we need gc.
-        let props = check_need_gc(db.clone(), region.clone(), 10, true).unwrap();
+        let props = check_need_gc(Arc::clone(&db), region.clone(), 10, true).unwrap();
         assert_eq!(props.min_ts, 1);
         assert_eq!(props.max_ts, 8);
         assert_eq!(props.num_rows, 6);
@@ -765,7 +767,7 @@ mod tests {
         assert_eq!(props.num_versions, 8);
         assert_eq!(props.max_row_versions, 2);
         // But if the `safe_point` is older than all versions, we don't need gc too.
-        let props = check_need_gc(db.clone(), region.clone(), 0, false).unwrap();
+        let props = check_need_gc(Arc::clone(&db), region.clone(), 0, false).unwrap();
         assert_eq!(props.min_ts, u64::MAX);
         assert_eq!(props.max_ts, 0);
         assert_eq!(props.num_rows, 0);
@@ -779,7 +781,7 @@ mod tests {
         engine.compact();
         // After this compact, all versions of keys 5,6 are deleted,
         // no keys have more than one versions, so we don't need gc.
-        let props = check_need_gc(db.clone(), region.clone(), 10, false).unwrap();
+        let props = check_need_gc(Arc::clone(&db), region.clone(), 10, false).unwrap();
         assert_eq!(props.min_ts, 1);
         assert_eq!(props.max_ts, 4);
         assert_eq!(props.num_rows, 4);
@@ -790,7 +792,7 @@ mod tests {
         // A single lock version need gc.
         engine.lock(&[7], 9, 9);
         engine.flush();
-        let props = check_need_gc(db.clone(), region.clone(), 10, true).unwrap();
+        let props = check_need_gc(Arc::clone(&db), region.clone(), 10, true).unwrap();
         assert_eq!(props.min_ts, 1);
         assert_eq!(props.max_ts, 9);
         assert_eq!(props.num_rows, 5);

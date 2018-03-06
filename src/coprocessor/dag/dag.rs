@@ -11,185 +11,168 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
-use tipb::executor::{ExecType, Executor};
 use tipb::schema::ColumnInfo;
-use tipb::select::{DAGRequest, SelectResponse};
+use tipb::select::{Chunk, DAGRequest, EncodeType, SelectResponse, StreamResponse};
 use kvproto::coprocessor::{KeyRange, Response};
 use protobuf::{Message as PbMsg, RepeatedField};
 
 use coprocessor::codec::mysql;
 use coprocessor::codec::datum::{Datum, DatumEncoder};
-use coprocessor::select::xeval::EvalContext;
-use coprocessor::{Error, Result};
-use coprocessor::endpoint::{get_chunk, get_pk, to_pb_error, ReqContext};
-use storage::{Snapshot, SnapshotStore, Statistics};
+use coprocessor::dag::expr::EvalContext;
+use coprocessor::Result;
+use coprocessor::endpoint::{get_pk, prefix_next, ReqContext};
+use storage::{Snapshot, SnapshotStore};
 
-use super::executor::{AggregationExecutor, Executor as DAGExecutor, IndexScanExecutor,
-                      LimitExecutor, Row, SelectionExecutor, TableScanExecutor, TopNExecutor};
+use super::executor::{build_exec, Executor, ExecutorMetrics, Row};
 
-pub struct DAGContext<'s> {
-    columns: Rc<Vec<ColumnInfo>>,
+pub struct DAGContext {
+    columns: Arc<Vec<ColumnInfo>>,
     has_aggr: bool,
-    req: DAGRequest,
-    ranges: Vec<KeyRange>,
-    snap: &'s Snapshot,
-    eval_ctx: Rc<EvalContext>,
-    req_ctx: &'s ReqContext,
+    req_ctx: ReqContext,
+    exec: Box<Executor + Send>,
+    output_offsets: Vec<u32>,
 }
 
-impl<'s> DAGContext<'s> {
+impl DAGContext {
     pub fn new(
-        req: DAGRequest,
+        mut req: DAGRequest,
         ranges: Vec<KeyRange>,
-        snap: &'s Snapshot,
-        eval_ctx: Rc<EvalContext>,
-        req_ctx: &'s ReqContext,
-    ) -> DAGContext<'s> {
-        DAGContext {
-            req: req,
-            columns: Rc::new(vec![]),
-            ranges: ranges,
-            snap: snap,
-            has_aggr: false,
-            eval_ctx: eval_ctx,
+        snap: Box<Snapshot>,
+        req_ctx: ReqContext,
+    ) -> Result<DAGContext> {
+        let eval_ctx = Arc::new(box_try!(EvalContext::new(
+            req.get_time_zone_offset(),
+            req.get_flags()
+        )));
+        let store = SnapshotStore::new(
+            snap,
+            req.get_start_ts(),
+            req_ctx.isolation_level,
+            req_ctx.fill_cache,
+        );
+
+        let dag_executor = build_exec(req.take_executors().into_vec(), store, ranges, eval_ctx)?;
+        Ok(DAGContext {
+            columns: dag_executor.columns,
+            has_aggr: dag_executor.has_aggr,
             req_ctx: req_ctx,
-        }
+            exec: dag_executor.exec,
+            output_offsets: req.take_output_offsets(),
+        })
     }
 
-    pub fn handle_request(mut self, statistics: &'s mut Statistics) -> Result<Response> {
-        self.validate_dag()?;
-        let mut exec = self.build_dag(statistics)?;
-        let mut chunks = vec![];
+    pub fn handle_request(&mut self, batch_row_limit: usize) -> Result<Response> {
+        let mut record_cnt = 0;
+        let mut chunks = Vec::new();
         loop {
-            match exec.next() {
-                Ok(Some(row)) => {
+            match self.exec.next()? {
+                Some(row) => {
                     self.req_ctx.check_if_outdated()?;
-                    let chunk = get_chunk(&mut chunks);
+                    if chunks.is_empty() || record_cnt >= batch_row_limit {
+                        let chunk = Chunk::new();
+                        chunks.push(chunk);
+                        record_cnt = 0;
+                    }
+                    let chunk = chunks.last_mut().unwrap();
+                    record_cnt += 1;
                     if self.has_aggr {
                         chunk.mut_rows_data().extend_from_slice(&row.data.value);
                     } else {
-                        let value =
-                            inflate_cols(&row, &self.columns, self.req.get_output_offsets())?;
+                        let value = inflate_cols(&row, &self.columns, &self.output_offsets)?;
                         chunk.mut_rows_data().extend_from_slice(&value);
                     }
                 }
-                Ok(None) => {
+                None => {
                     let mut resp = Response::new();
                     let mut sel_resp = SelectResponse::new();
                     sel_resp.set_chunks(RepeatedField::from_vec(chunks));
+                    self.exec
+                        .collect_output_counts(sel_resp.mut_output_counts());
                     let data = box_try!(sel_resp.write_to_bytes());
                     resp.set_data(data);
                     return Ok(resp);
                 }
-                Err(e) => if let Error::Other(_) = e {
-                    let mut resp = Response::new();
-                    let mut sel_resp = SelectResponse::new();
-                    sel_resp.set_error(to_pb_error(&e));
-                    resp.set_data(box_try!(sel_resp.write_to_bytes()));
-                    resp.set_other_error(format!("{}", e));
-                    return Ok(resp);
-                } else {
-                    return Err(e);
-                },
             }
         }
     }
 
-    fn validate_dag(&mut self) -> Result<()> {
-        let execs = self.req.get_executors();
-        let first = execs
-            .first()
-            .ok_or_else(|| Error::Other(box_err!("has no executor")))?;
-        // check whether first exec is *scan and get the column info
-        match first.get_tp() {
-            ExecType::TypeTableScan => {
-                self.columns = Rc::new(first.get_tbl_scan().get_columns().to_vec());
-            }
-            ExecType::TypeIndexScan => {
-                self.columns = Rc::new(first.get_idx_scan().get_columns().to_vec());
-            }
-            _ => {
-                return Err(box_err!(
-                    "first exec type should be *Scan, but get {:?}",
-                    first.get_tp()
-                ))
-            }
-        }
-        // check whether dag has a aggregation action and take a flag
-        if execs
-            .iter()
-            .rev()
-            .any(|exec| exec.get_tp() == ExecType::TypeAggregation)
-        {
-            self.has_aggr = true;
-        }
-        Ok(())
-    }
-
-    // seperate first exec build action from `build_dag`
-    // since it will generte mutable conflict when putting together
-    fn build_first(
-        &'s self,
-        mut first: Executor,
-        statistics: &'s mut Statistics,
-    ) -> Box<DAGExecutor + 's> {
-        let store = SnapshotStore::new(
-            self.snap,
-            self.req.get_start_ts(),
-            self.req_ctx.isolation_level,
-            self.req_ctx.fill_cache,
-        );
-
-        match first.get_tp() {
-            ExecType::TypeTableScan => Box::new(TableScanExecutor::new(
-                first.get_tbl_scan(),
-                self.ranges.clone(),
-                store,
-                statistics,
-            )),
-            ExecType::TypeIndexScan => Box::new(IndexScanExecutor::new(
-                first.take_idx_scan(),
-                self.ranges.clone(),
-                store,
-                statistics,
-            )),
-            _ => unreachable!(),
-        }
-    }
-
-    fn build_dag(&'s self, statistics: &'s mut Statistics) -> Result<Box<DAGExecutor + 's>> {
-        let mut execs = self.req.get_executors().to_vec().into_iter();
-        let mut src = self.build_first(execs.next().unwrap(), statistics);
-        for mut exec in execs {
-            let curr: Box<DAGExecutor> = match exec.get_tp() {
-                ExecType::TypeTableScan | ExecType::TypeIndexScan => {
-                    return Err(box_err!("got too much *scan exec, should be only one"))
+    pub fn handle_streaming_request(
+        &mut self,
+        batch_row_limit: usize,
+    ) -> Result<(Option<Response>, bool)> {
+        let (mut record_cnt, mut finished) = (0, false);
+        let mut chunk = Chunk::new();
+        let mut start_key = None;
+        while record_cnt < batch_row_limit {
+            match self.exec.next()? {
+                Some(row) => {
+                    record_cnt += 1;
+                    if record_cnt == 1 {
+                        start_key = self.exec.take_last_key();
+                    }
+                    if self.has_aggr {
+                        chunk.mut_rows_data().extend_from_slice(&row.data.value);
+                    } else {
+                        let value = inflate_cols(&row, &self.columns, &self.output_offsets)?;
+                        chunk.mut_rows_data().extend_from_slice(&value);
+                    }
                 }
-                ExecType::TypeSelection => Box::new(SelectionExecutor::new(
-                    exec.take_selection(),
-                    self.eval_ctx.clone(),
-                    self.columns.clone(),
-                    src,
-                )?),
-                ExecType::TypeAggregation => Box::new(AggregationExecutor::new(
-                    exec.take_aggregation(),
-                    self.eval_ctx.clone(),
-                    self.columns.clone(),
-                    src,
-                )?),
-                ExecType::TypeTopN => Box::new(TopNExecutor::new(
-                    exec.take_topN(),
-                    self.eval_ctx.clone(),
-                    self.columns.clone(),
-                    src,
-                )?),
-                ExecType::TypeLimit => Box::new(LimitExecutor::new(exec.take_limit(), src)),
-            };
-            src = curr;
+                None => {
+                    finished = true;
+                    break;
+                }
+            }
         }
-        Ok(src)
+        if record_cnt > 0 {
+            let end_key = self.exec.take_last_key();
+            return self.make_stream_response(chunk, start_key, end_key)
+                .map(|r| (Some(r), finished));
+        }
+        Ok((None, true))
+    }
+
+    fn make_stream_response(
+        &mut self,
+        chunk: Chunk,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
+    ) -> Result<Response> {
+        let mut s_resp = StreamResponse::new();
+        s_resp.set_encode_type(EncodeType::TypeDefault);
+        s_resp.set_data(box_try!(chunk.write_to_bytes()));
+        self.exec.collect_output_counts(s_resp.mut_output_counts());
+
+        let mut resp = Response::new();
+        resp.set_data(box_try!(s_resp.write_to_bytes()));
+
+        // `start_key` and `end_key` indicates the key_range which has been scaned
+        // for generating the response. It's for TiDB can retry requests partially,
+        // but some `Executor`s (e.g. TopN and Aggr) don't support that, in which
+        // cases both `start_key` and `end_key` should be None.
+        let (start, end) = match (start_key, end_key) {
+            (Some(start_key), Some(end_key)) => if start_key > end_key {
+                (end_key, prefix_next(&start_key))
+            } else {
+                (start_key, prefix_next(&end_key))
+            },
+            (Some(start_key), None) => {
+                let end_key = prefix_next(&start_key);
+                (start_key, end_key)
+            }
+            (None, None) => return Ok(resp),
+            _ => unreachable!(),
+        };
+        let mut range = KeyRange::new();
+        range.set_start(start);
+        range.set_end(end);
+        resp.set_range(range);
+        Ok(resp)
+    }
+
+    pub fn collect_metrics_into(&mut self, metrics: &mut ExecutorMetrics) {
+        self.exec.collect_metrics_into(metrics);
     }
 }
 

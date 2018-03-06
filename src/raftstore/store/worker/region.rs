@@ -11,7 +11,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
@@ -95,13 +94,14 @@ struct SnapContext {
     raft_db: Arc<DB>,
     batch_size: usize,
     mgr: SnapManager,
+    use_delete_range: bool,
 }
 
 impl SnapContext {
     fn generate_snap(&self, region_id: u64, notifier: SyncSender<RaftSnapshot>) -> Result<()> {
         // do we need to check leader here?
-        let raft_db = self.raft_db.clone();
-        let raw_snap = Snapshot::new(self.kv_db.clone());
+        let raft_db = Arc::clone(&self.raft_db);
+        let raw_snap = Snapshot::new(Arc::clone(&self.kv_db));
 
         let snap = box_try!(store::do_snapshot(
             self.mgr.clone(),
@@ -109,12 +109,14 @@ impl SnapContext {
             &raw_snap,
             region_id
         ));
+        // Only enable the fail point when the region id is equal to 1, which is
+        // the id of bootstrapped region in tests.
+        fail_point!("region_gen_snap", region_id == 1, |_| Ok(()));
         if let Err(e) = notifier.try_send(snap) {
             info!(
                 "[region {}] failed to notify snap result, maybe leadership has changed, \
                  ignore: {:?}",
-                region_id,
-                e
+                region_id, e
             );
         }
         Ok(())
@@ -140,6 +142,7 @@ impl SnapContext {
 
     fn apply_snap(&self, region_id: u64, abort: Arc<AtomicUsize>) -> Result<()> {
         info!("[region {}] begin apply snap data", region_id);
+        fail_point!("region_apply_snap");
         check_abort(&abort)?;
         let region_key = keys::region_state_key(region_id);
         let mut region_state: RegionLocalState =
@@ -158,20 +161,25 @@ impl SnapContext {
         let start_key = keys::enc_start_key(&region);
         let end_key = keys::enc_end_key(&region);
         check_abort(&abort)?;
-        box_try!(util::delete_all_in_range(&self.kv_db, &start_key, &end_key));
+        box_try!(util::delete_all_in_range(
+            &self.kv_db,
+            &start_key,
+            &end_key,
+            self.use_delete_range
+        ));
         check_abort(&abort)?;
 
         let state_key = keys::apply_state_key(region_id);
-        let apply_state: RaftApplyState =
-            match box_try!(self.kv_db.get_msg_cf(CF_RAFT, &state_key)) {
-                Some(state) => state,
-                None => {
-                    return Err(box_err!(
-                        "failed to get raftstate from {}",
-                        escape(&state_key)
-                    ))
-                }
-            };
+        let apply_state: RaftApplyState = match box_try!(self.kv_db.get_msg_cf(CF_RAFT, &state_key))
+        {
+            Some(state) => state,
+            None => {
+                return Err(box_err!(
+                    "failed to get raftstate from {}",
+                    escape(&state_key)
+                ))
+            }
+        };
         let term = apply_state.get_truncated_state().get_term();
         let idx = apply_state.get_truncated_state().get_index();
         let snap_key = SnapKey::new(region_id, term, idx);
@@ -186,9 +194,9 @@ impl SnapContext {
         check_abort(&abort)?;
         let timer = Instant::now();
         let options = ApplyOptions {
-            db: self.kv_db.clone(),
+            db: Arc::clone(&self.kv_db),
             region: region.clone(),
-            abort: abort.clone(),
+            abort: Arc::clone(&abort),
             write_batch_size: self.batch_size,
         };
         s.apply(options)?;
@@ -197,10 +205,7 @@ impl SnapContext {
         region_state.set_state(PeerState::Normal);
         let handle = box_try!(rocksdb::get_cf_handle(&self.kv_db, CF_RAFT));
         box_try!(wb.put_msg_cf(handle, &region_key, &region_state));
-        box_try!(wb.delete_cf(
-            handle,
-            &keys::snapshot_raft_state_key(region_id)
-        ));
+        box_try!(wb.delete_cf(handle, &keys::snapshot_raft_state_key(region_id)));
         self.kv_db.write(wb).unwrap_or_else(|e| {
             panic!("{} failed to save apply_snap result: {:?}", region_id, e);
         });
@@ -218,10 +223,12 @@ impl SnapContext {
         let apply_histogram = SNAP_HISTOGRAM.with_label_values(&["apply"]);
         let timer = apply_histogram.start_coarse_timer();
 
-        match self.apply_snap(region_id, status.clone()) {
+        match self.apply_snap(region_id, Arc::clone(&status)) {
             Ok(()) => {
                 status.swap(JOB_STATUS_FINISHED, Ordering::SeqCst);
-                SNAP_COUNTER_VEC.with_label_values(&["apply", "success"]).inc();
+                SNAP_COUNTER_VEC
+                    .with_label_values(&["apply", "success"])
+                    .inc();
             }
             Err(Error::Abort) => {
                 warn!("applying snapshot for region {} is aborted.", region_id);
@@ -250,7 +257,9 @@ impl SnapContext {
             escape(&start_key),
             escape(&end_key)
         );
-        if let Err(e) = util::delete_all_in_range(&self.kv_db, &start_key, &end_key) {
+        if let Err(e) =
+            util::delete_all_in_range(&self.kv_db, &start_key, &end_key, self.use_delete_range)
+        {
             error!(
                 "failed to delete data in [{}, {}): {:?}",
                 escape(&start_key),
@@ -267,7 +276,13 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(kv_db: Arc<DB>, raft_db: Arc<DB>, mgr: SnapManager, batch_size: usize) -> Runner {
+    pub fn new(
+        kv_db: Arc<DB>,
+        raft_db: Arc<DB>,
+        mgr: SnapManager,
+        batch_size: usize,
+        use_delete_range: bool,
+    ) -> Runner {
         Runner {
             pool: ThreadPoolBuilder::with_default_factory(thd_name!("snap generator"))
                 .thread_count(GENERATE_POOL_SIZE)
@@ -277,6 +292,7 @@ impl Runner {
                 raft_db: raft_db,
                 mgr: mgr,
                 batch_size: batch_size,
+                use_delete_range: use_delete_range,
             },
         }
     }

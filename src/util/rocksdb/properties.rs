@@ -26,17 +26,17 @@ use rocksdb::{DBEntryType, TablePropertiesCollector, TablePropertiesCollectorFac
 use util::codec::{Error, Result};
 use util::codec::number::{NumberDecoder, NumberEncoder};
 
-const PROP_NUM_ERRORS: &'static str = "tikv.num_errors";
-const PROP_MIN_TS: &'static str = "tikv.min_ts";
-const PROP_MAX_TS: &'static str = "tikv.max_ts";
-const PROP_NUM_ROWS: &'static str = "tikv.num_rows";
-const PROP_NUM_PUTS: &'static str = "tikv.num_puts";
-const PROP_NUM_VERSIONS: &'static str = "tikv.num_versions";
-const PROP_MAX_ROW_VERSIONS: &'static str = "tikv.max_row_versions";
-const PROP_ROWS_INDEX: &'static str = "tikv.rows_index";
+const PROP_NUM_ERRORS: &str = "tikv.num_errors";
+const PROP_MIN_TS: &str = "tikv.min_ts";
+const PROP_MAX_TS: &str = "tikv.max_ts";
+const PROP_NUM_ROWS: &str = "tikv.num_rows";
+const PROP_NUM_PUTS: &str = "tikv.num_puts";
+const PROP_NUM_VERSIONS: &str = "tikv.num_versions";
+const PROP_MAX_ROW_VERSIONS: &str = "tikv.max_row_versions";
+const PROP_ROWS_INDEX: &str = "tikv.rows_index";
 const PROP_ROWS_INDEX_DISTANCE: u64 = 10000;
-const PROP_TOTAL_SIZE: &'static str = "tikv.total_size";
-const PROP_SIZE_INDEX: &'static str = "tikv.size_index";
+const PROP_TOTAL_SIZE: &str = "tikv.total_size";
+const PROP_SIZE_INDEX: &str = "tikv.size_index";
 const PROP_SIZE_INDEX_DISTANCE: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
@@ -150,7 +150,7 @@ impl TablePropertiesCollector for MvccPropertiesCollector {
             self.props.max_row_versions = self.row_versions;
         }
 
-        let v = match Write::parse(value) {
+        let write_type = match Write::parse_type(value) {
             Ok(v) => v,
             Err(_) => {
                 self.num_errors += 1;
@@ -158,7 +158,7 @@ impl TablePropertiesCollector for MvccPropertiesCollector {
             }
         };
 
-        if v.write_type == WriteType::Put {
+        if write_type == WriteType::Put {
             self.props.num_puts += 1;
         }
 
@@ -166,8 +166,8 @@ impl TablePropertiesCollector for MvccPropertiesCollector {
         if self.row_versions == 1 {
             self.cur_index_handle.size += 1;
             self.cur_index_handle.offset += 1;
-            if self.cur_index_handle.offset == 1 ||
-                self.cur_index_handle.size >= PROP_ROWS_INDEX_DISTANCE
+            if self.cur_index_handle.offset == 1
+                || self.cur_index_handle.size >= PROP_ROWS_INDEX_DISTANCE
             {
                 self.row_index_handles
                     .insert(self.last_row.clone(), self.cur_index_handle.clone());
@@ -204,7 +204,7 @@ pub struct IndexHandle {
     pub offset: u64, // The offset of the block in the file
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct IndexHandles(BTreeMap<Vec<u8>, IndexHandle>);
 
 impl Deref for IndexHandles {
@@ -221,8 +221,12 @@ impl DerefMut for IndexHandles {
 }
 
 impl IndexHandles {
-    fn new() -> IndexHandles {
+    pub fn new() -> IndexHandles {
         IndexHandles(BTreeMap::new())
+    }
+
+    pub fn add(&mut self, key: Vec<u8>, index_handle: IndexHandle) {
+        self.0.insert(key, index_handle);
     }
 
     // Format: | klen | k | v.size | v.offset |
@@ -252,28 +256,24 @@ impl IndexHandles {
     }
 
     fn get_approximate_distance_in_range(&self, start: &[u8], end: &[u8]) -> u64 {
-        assert!(end >= start);
-        let mut range = self.range::<[u8], _>((Included(start), Unbounded));
-        let start_offset = match range.next() {
+        assert!(start <= end);
+        if start == end {
+            return 0;
+        }
+        let range = self.range::<[u8], _>((Unbounded, Included(start)));
+        let start_offset = match range.last() {
             Some((_, v)) => v.offset,
-            None => return 0,
+            None => 0,
         };
         let mut range = self.range::<[u8], _>((Included(end), Unbounded));
         let end_offset = match range.next() {
             Some((_, v)) => v.offset,
-            None => {
-                // Last handle must exists if we have start offset.
-                let (_, v) = self.iter().last().unwrap();
-                v.offset
-            }
+            None => self.iter().last().map_or(0, |(_, v)| v.offset),
         };
         if end_offset < start_offset {
             panic!(
                 "start {:?} end {:?} start_offset {} end_offset {}",
-                start,
-                end,
-                start_offset,
-                end_offset
+                start, end, start_offset, end_offset
             );
         }
         end_offset - start_offset
@@ -300,7 +300,7 @@ impl RowsProperties {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SizeProperties {
     pub total_size: u64,
     pub index_handles: IndexHandles,
@@ -324,6 +324,22 @@ impl SizeProperties {
     pub fn get_approximate_size_in_range(&self, start: &[u8], end: &[u8]) -> u64 {
         self.index_handles
             .get_approximate_distance_in_range(start, end)
+    }
+
+    pub fn smallest_key(&self) -> Option<Vec<u8>> {
+        self.index_handles
+            .0
+            .iter()
+            .next()
+            .map(|(key, _)| key.clone())
+    }
+
+    pub fn largest_key(&self) -> Option<Vec<u8>> {
+        self.index_handles
+            .0
+            .iter()
+            .last()
+            .map(|(key, _)| key.clone())
     }
 }
 
@@ -452,6 +468,7 @@ impl DecodeProperties for UserCollectedProperties {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test::Bencher;
     use rocksdb::{DBEntryType, TablePropertiesCollector};
     use storage::Key;
     use storage::mvcc::{Write, WriteType};
@@ -486,6 +503,27 @@ mod tests {
         assert_eq!(props.num_puts, 4);
         assert_eq!(props.num_versions, 7);
         assert_eq!(props.max_row_versions, 3);
+    }
+
+    #[bench]
+    fn bench_mvcc_properties(b: &mut Bencher) {
+        let ts = 1;
+        let num_entries = 100;
+        let mut entries = Vec::new();
+        for i in 0..num_entries {
+            let s = format!("{:032}", i);
+            let k = Key::from_raw(s.as_bytes()).append_ts(ts);
+            let k = keys::data_key(k.encoded());
+            let w = Write::new(WriteType::Put, ts, Some(s.as_bytes().to_owned()));
+            entries.push((k, w.to_bytes()));
+        }
+
+        let mut collector = MvccPropertiesCollector::new();
+        b.iter(|| {
+            for &(ref k, ref v) in &entries {
+                collector.add(k, v, DBEntryType::Put, 0, 0);
+            }
+        });
     }
 
     #[test]
@@ -536,15 +574,13 @@ mod tests {
 
         let h: Vec<_> = props.index_handles.values().collect();
         let cases = [
-            ("a", "z", h[4].offset - h[0].offset),
+            ("a", "z", h[4].offset),
             ("a", "a", 0),
             ("z", "z", 0),
-            ("k-0", "k-10000", h[1].offset - h[0].offset),
-            ("k-0", "k-20000", h[2].offset - h[0].offset),
-            ("k-10000", "k-18888", h[2].offset - h[1].offset),
-            ("k-16666", "k-18888", 0),
-            ("k-16666", "k-26666", h[3].offset - h[2].offset),
-            ("k-26666", "k-26666", 0),
+            ("k-1", "k-10000", h[1].offset - h[0].offset),
+            ("k-1", "k-20000", h[2].offset - h[0].offset),
+            ("k-16666", "k-18888", h[2].offset - h[1].offset),
+            ("k-16666", "k-26666", h[3].offset - h[1].offset),
         ];
         for &(start, end, rows) in &cases {
             let start = keys::data_key(start.as_bytes());
@@ -585,6 +621,11 @@ mod tests {
         let result = UserProperties(collector.finish());
 
         let props = SizeProperties::decode(&result).unwrap();
+        assert_eq!(props.smallest_key().unwrap(), cases[0].0.as_bytes());
+        assert_eq!(
+            props.largest_key().unwrap(),
+            cases[cases.len() - 1].0.as_bytes()
+        );
         assert_eq!(props.total_size, PROP_SIZE_INDEX_DISTANCE / 8 * 29 + 11);
         let handles = &props.index_handles;
         assert_eq!(handles.len(), 4);
@@ -602,13 +643,13 @@ mod tests {
         assert_eq!(k.offset, PROP_SIZE_INDEX_DISTANCE / 8 * 29 + 11);
 
         let cases = [
-            (" ", "z", k.offset - a.offset),
+            (" ", "z", k.offset),
             (" ", " ", 0),
             ("z", "z", 0),
             ("a", "k", k.offset - a.offset),
             ("a", "i", i.offset - a.offset),
             ("e", "h", i.offset - e.offset),
-            ("g", "h", 0),
+            ("g", "h", i.offset - e.offset),
             ("g", "g", 0),
         ];
         for &(start, end, size) in &cases {

@@ -37,7 +37,6 @@ use rand;
 
 use tikv::raft::*;
 use tikv::raft::storage::MemStorage;
-use tikv::util::collections::FlatMap as RaftFlatMap;
 
 pub fn ltoa(raft_log: &RaftLog<MemStorage>) -> String {
     let mut s = format!("committed: {}\n", raft_log.committed);
@@ -111,7 +110,6 @@ pub fn new_test_raft_with_config(config: &Config, storage: MemStorage) -> Interf
     Interface::new(Raft::new(config, storage))
 }
 
-
 fn read_messages<T: Storage>(raft: &mut Raft<T>) -> Vec<Message> {
     raft.msgs.drain(..).collect()
 }
@@ -143,7 +141,6 @@ fn voted_with_config(vote: u64, term: u64, pre_vote: bool) -> Interface {
     raft
 }
 
-
 fn next_ents(r: &mut Raft<MemStorage>, s: &MemStorage) -> Vec<Entry> {
     s.wl()
         .append(r.raft_log.unstable_entries().unwrap_or(&[]))
@@ -154,6 +151,15 @@ fn next_ents(r: &mut Raft<MemStorage>, s: &MemStorage) -> Vec<Entry> {
     let committed = r.raft_log.committed;
     r.raft_log.applied_to(committed);
     ents.unwrap_or_else(Vec::new)
+}
+
+fn do_send_append(raft: &mut Raft<MemStorage>, to: u64) {
+    let mut prs = raft.take_prs();
+    {
+        let pr = prs.get_mut(to).unwrap();
+        raft.send_append(to, pr);
+    }
+    raft.set_prs(prs);
 }
 
 #[derive(Default, Debug, PartialEq, Eq, Hash)]
@@ -192,14 +198,21 @@ impl Interface {
     fn initial(&mut self, id: u64, ids: &[u64]) {
         if self.raft.is_some() {
             self.id = id;
-            self.prs = RaftFlatMap::with_capacity(ids.len());
+            let prs = self.take_prs();
+            self.set_prs(ProgressSet::new(ids.len(), prs.learners().len()));
             for id in ids {
-                self.prs.insert(
-                    *id,
-                    Progress {
+                if prs.learners().contains_key(id) {
+                    let progress = Progress {
+                        is_learner: true,
                         ..Default::default()
-                    },
-                );
+                    };
+                    self.mut_prs().insert_learner(*id, progress);
+                } else {
+                    let progress = Progress {
+                        ..Default::default()
+                    };
+                    self.mut_prs().insert_voter(*id, progress);
+                }
             }
             let term = self.term;
             self.reset(term);
@@ -574,16 +587,16 @@ fn test_progress_resume_by_heartbeat_resp() {
     let mut raft = new_test_raft(1, vec![1, 2], 5, 1, new_storage());
     raft.become_candidate();
     raft.become_leader();
-    raft.prs.get_mut(&2).unwrap().paused = true;
+    raft.mut_prs().get_mut(2).unwrap().paused = true;
 
     raft.step(new_message(1, 1, MessageType::MsgBeat, 0))
         .expect("");
-    assert!(raft.prs[&2].paused);
+    assert!(raft.prs().voters()[&2].paused);
 
-    raft.prs.get_mut(&2).unwrap().become_replicate();
+    raft.mut_prs().get_mut(2).unwrap().become_replicate();
     raft.step(new_message(2, 1, MessageType::MsgHeartbeatResponse, 0))
         .expect("");
-    assert!(!raft.prs[&2].paused);
+    assert!(!raft.prs().voters()[&2].paused);
 }
 
 #[test]
@@ -642,8 +655,7 @@ fn test_leader_election_with_config(pre_vote: bool) {
             StateRole::Leader,
             1,
         ),
-
-        // three logs futher along than 0, but in the same term so rejection
+        // three logs further along than 0, but in the same term so rejection
         // are returned instead of the votes being ignored.
         (
             Network::new_with_config(
@@ -710,24 +722,18 @@ fn test_leader_cycle_with_config(pre_vote: bool) {
             if sm.id == campaigner_id && sm.state != StateRole::Leader {
                 panic!(
                     "pre_vote={}: campaigning node {} state = {:?}, want Leader",
-                    pre_vote,
-                    sm.id,
-                    sm.state
+                    pre_vote, sm.id, sm.state
                 );
             } else if sm.id != campaigner_id && sm.state != StateRole::Follower {
                 panic!(
                     "pre_vote={}: after campaign of node {}, node {} had state = {:?}, want \
                      Follower",
-                    pre_vote,
-                    campaigner_id,
-                    sm.id,
-                    sm.state
+                    pre_vote, campaigner_id, sm.id, sm.state
                 );
             }
         }
     }
 }
-
 
 #[test]
 fn test_leader_election_overwrite_newer_logs() {
@@ -808,7 +814,6 @@ fn test_leader_election_overwrite_newer_logs_with_config(pre_vote: bool) {
         );
     }
 }
-
 
 #[test]
 fn test_vote_from_any_state() {
@@ -942,7 +947,6 @@ fn test_log_replicatioin() {
             vec![new_message(1, 1, MessageType::MsgPropose, 1)],
             2,
         ),
-
         (
             Network::new(vec![None, None, None]),
             vec![
@@ -964,15 +968,14 @@ fn test_log_replicatioin() {
             if x.raft_log.committed != wcommitted {
                 panic!(
                     "#{}.{}: committed = {}, want {}",
-                    i,
-                    j,
-                    x.raft_log.committed,
-                    wcommitted
+                    i, j, x.raft_log.committed, wcommitted
                 );
             }
 
             let mut ents = next_ents(x, &network.storage[j]);
-            let ents: Vec<Entry> = ents.drain(..).filter(|e| e.has_data()).collect();
+            let ents: Vec<Entry> = ents.drain(..)
+                .filter(|e| !e.get_data().is_empty())
+                .collect();
             for (k, m) in msgs.iter()
                 .filter(|m| m.get_msg_type() == MessageType::MsgPropose)
                 .enumerate()
@@ -1106,9 +1109,7 @@ fn test_dueling_candidates() {
         if nt.peers[&id].state != state {
             panic!(
                 "#{}: state = {:?}, want {:?}",
-                i,
-                nt.peers[&id].state,
-                state
+                i, nt.peers[&id].state, state
             );
         }
         if nt.peers[&id].term != term {
@@ -1157,9 +1158,7 @@ fn test_dueling_pre_candidates() {
         if nt.peers[&id].state != state {
             panic!(
                 "#{}: state = {:?}, want {:?}",
-                i,
-                nt.peers[&id].state,
-                state
+                i, nt.peers[&id].state, state
             );
         }
         if nt.peers[&id].term != term {
@@ -1340,7 +1339,6 @@ fn test_commit() {
         (vec![1], vec![empty_entry(1, 1)], 2, 0),
         (vec![2], vec![empty_entry(1, 1), empty_entry(2, 2)], 2, 2),
         (vec![1], vec![empty_entry(2, 1)], 2, 1),
-
         // odd
         (
             vec![2, 1, 1],
@@ -1366,7 +1364,6 @@ fn test_commit() {
             2,
             0,
         ),
-
         // even
         (
             vec![2, 1, 1, 1],
@@ -1415,7 +1412,10 @@ fn test_commit() {
 
         let mut sm = new_test_raft(1, vec![1], 5, 1, store);
         for (j, &v) in matches.iter().enumerate() {
-            sm.set_progress(j as u64 + 1, v, v + 1);
+            let id = j as u64 + 1;
+            if !sm.prs().voters().contains_key(&id) {
+                sm.set_progress(id, v, v + 1, false);
+            }
         }
         sm.maybe_commit();
         if sm.raft_log.committed != w {
@@ -1445,7 +1445,7 @@ fn test_pass_election_timeout() {
                 c += 1;
             }
         }
-        let mut got = c as f64 / 10000.0;
+        let mut got = f64::from(c) / 10000.0;
         if round {
             got = (got * 10.0 + 0.5).floor() / 10.0;
         }
@@ -1460,9 +1460,8 @@ fn test_pass_election_timeout() {
 #[test]
 fn test_step_ignore_old_term_msg() {
     let mut sm = new_test_raft(1, vec![1], 10, 1, new_storage());
-    let panic_before_step_state = Box::new(|_: &Message| {
-        panic!("before step state function hook called unexpectedly")
-    });
+    let panic_before_step_state =
+        Box::new(|_: &Message| panic!("before step state function hook called unexpectedly"));
     sm.before_step_state = Some(panic_before_step_state);
     sm.term = 2;
     let mut m = new_message(0, 0, MessageType::MsgAppend, 0);
@@ -1496,14 +1495,12 @@ fn test_handle_msg_append() {
         // Ensure 1
         (nm(2, 3, 2, 3, None), 2, 0, true), // previous log mismatch
         (nm(2, 3, 3, 3, None), 2, 0, true), // previous log non-exist
-
         // Ensure 2
         (nm(2, 1, 1, 1, None), 2, 1, false),
         (nm(2, 0, 0, 1, Some(vec![(1, 2)])), 1, 1, false),
         (nm(2, 2, 2, 3, Some(vec![(3, 2), (4, 2)])), 4, 3, false),
         (nm(2, 2, 2, 4, Some(vec![(3, 2)])), 3, 3, false),
         (nm(2, 1, 1, 4, Some(vec![(2, 2)])), 2, 2, false),
-
         // Ensure 3
         (nm(1, 1, 1, 3, None), 2, 1, false), // match entry 1, commit up to last new entry 1
         (nm(1, 1, 1, 3, Some(vec![(2, 2)])), 2, 2, false), // match entry 1, commit up to last new
@@ -1533,9 +1530,7 @@ fn test_handle_msg_append() {
         if sm.raft_log.committed != w_commit {
             panic!(
                 "#{}: committed = {}, want {}",
-                j,
-                sm.raft_log.committed,
-                w_commit
+                j, sm.raft_log.committed, w_commit
             );
         }
         let m = sm.read_messages();
@@ -1575,9 +1570,7 @@ fn test_handle_heartbeat() {
         if sm.raft_log.committed != w_commit {
             panic!(
                 "#{}: committed = {}, want = {}",
-                i,
-                sm.raft_log.committed,
-                w_commit
+                i, sm.raft_log.committed, w_commit
             );
         }
         let m = sm.read_messages();
@@ -1735,25 +1728,20 @@ fn test_recv_msg_request_vote_for_type(msg_type: MessageType) {
         (StateRole::Follower, 0, 1, INVALID_ID, true),
         (StateRole::Follower, 0, 2, INVALID_ID, true),
         (StateRole::Follower, 0, 3, INVALID_ID, false),
-
         (StateRole::Follower, 1, 0, INVALID_ID, true),
         (StateRole::Follower, 1, 1, INVALID_ID, true),
         (StateRole::Follower, 1, 2, INVALID_ID, true),
         (StateRole::Follower, 1, 3, INVALID_ID, false),
-
         (StateRole::Follower, 2, 0, INVALID_ID, true),
         (StateRole::Follower, 2, 1, INVALID_ID, true),
         (StateRole::Follower, 2, 2, INVALID_ID, false),
         (StateRole::Follower, 2, 3, INVALID_ID, false),
-
         (StateRole::Follower, 3, 0, INVALID_ID, true),
         (StateRole::Follower, 3, 1, INVALID_ID, true),
         (StateRole::Follower, 3, 2, INVALID_ID, false),
         (StateRole::Follower, 3, 3, INVALID_ID, false),
-
         (StateRole::Follower, 3, 2, 2, false),
         (StateRole::Follower, 3, 2, 1, true),
-
         (StateRole::Leader, 3, 3, 1, true),
         (StateRole::PreCandidate, 3, 3, 1, true),
         (StateRole::Candidate, 3, 3, 1, true),
@@ -1822,7 +1810,6 @@ fn test_state_transition() {
             INVALID_ID,
         ),
         (StateRole::Follower, StateRole::Leader, false, 0, INVALID_ID),
-
         (
             StateRole::PreCandidate,
             StateRole::Follower,
@@ -1845,7 +1832,6 @@ fn test_state_transition() {
             INVALID_ID,
         ),
         (StateRole::PreCandidate, StateRole::Leader, true, 0, 1),
-
         (
             StateRole::Candidate,
             StateRole::Follower,
@@ -1868,7 +1854,6 @@ fn test_state_transition() {
             INVALID_ID,
         ),
         (StateRole::Candidate, StateRole::Leader, true, 0, 1),
-
         (StateRole::Leader, StateRole::Follower, true, 1, INVALID_ID),
         (
             StateRole::Leader,
@@ -1890,13 +1875,11 @@ fn test_state_transition() {
         let sm: &mut Raft<MemStorage> = &mut new_test_raft(1, vec![1], 10, 1, new_storage());
         sm.state = from;
 
-        let res = recover_safe!(|| {
-            match to {
-                StateRole::Follower => sm.become_follower(wterm, wlead),
-                StateRole::PreCandidate => sm.become_pre_candidate(),
-                StateRole::Candidate => sm.become_candidate(),
-                StateRole::Leader => sm.become_leader(),
-            }
+        let res = recover_safe!(|| match to {
+            StateRole::Follower => sm.become_follower(wterm, wlead),
+            StateRole::PreCandidate => sm.become_pre_candidate(),
+            StateRole::Candidate => sm.become_candidate(),
+            StateRole::Leader => sm.become_leader(),
         });
         if res.is_ok() ^ wallow {
             panic!("#{}: allow = {}, want {}", i, res.is_ok(), wallow);
@@ -2163,7 +2146,7 @@ fn test_free_stuck_candidate_with_check_quorum() {
 }
 
 #[test]
-fn test_non_promotable_voter_wich_check_quorum() {
+fn test_non_promotable_voter_which_check_quorum() {
     let mut a = new_test_raft(1, vec![1, 2], 10, 1, new_storage());
     let mut b = new_test_raft(2, vec![1], 10, 1, new_storage());
 
@@ -2183,7 +2166,7 @@ fn test_non_promotable_voter_wich_check_quorum() {
 
     // Need to remove 2 again to make it a non-promotable node since newNetwork
     // overwritten some internal states
-    nt.peers.get_mut(&2).unwrap().prs.remove(&2).unwrap();
+    nt.peers.get_mut(&2).unwrap().mut_prs().remove(2).unwrap();
 
     assert_eq!(nt.peers[&2].promotable(), false);
 
@@ -2257,9 +2240,7 @@ fn test_read_only_option_safe() {
         if rs.request_ctx != vec_wctx {
             panic!(
                 "#{}: request_ctx = {:?}, want {:?}",
-                i,
-                rs.request_ctx,
-                vec_wctx
+                i, rs.request_ctx, vec_wctx
             )
         }
     }
@@ -2331,9 +2312,7 @@ fn test_read_only_option_lease() {
         if rs.request_ctx != vec_wctx {
             panic!(
                 "#{}: request_ctx = {:?}, want {:?}",
-                i,
-                rs.request_ctx,
-                vec_wctx
+                i, rs.request_ctx, vec_wctx
             );
         }
     }
@@ -2475,11 +2454,21 @@ fn test_leader_append_response() {
         m.set_reject_hint(index);
         sm.step(m).expect("");
 
-        if sm.prs[&2].matched != wmatch {
-            panic!("#{}: match = {}, want {}", i, sm.prs[&2].matched, wmatch);
+        if sm.prs().voters()[&2].matched != wmatch {
+            panic!(
+                "#{}: match = {}, want {}",
+                i,
+                sm.prs().voters()[&2].matched,
+                wmatch
+            );
         }
-        if sm.prs[&2].next_idx != wnext {
-            panic!("#{}: next = {}, want {}", i, sm.prs[&2].next_idx, wnext);
+        if sm.prs().voters()[&2].next_idx != wnext {
+            panic!(
+                "#{}: next = {}, want {}",
+                i,
+                sm.prs().voters()[&2].next_idx,
+                wnext
+            );
         }
 
         let mut msgs = sm.read_messages();
@@ -2522,7 +2511,7 @@ fn test_bcast_beat() {
     }
     // slow follower
     let mut_pr = |sm: &mut Interface, n, matched, next_idx| {
-        let m = sm.prs.get_mut(&n).unwrap();
+        let m = sm.mut_prs().get_mut(n).unwrap();
         m.matched = matched;
         m.next_idx = next_idx;
     };
@@ -2537,8 +2526,14 @@ fn test_bcast_beat() {
     let mut msgs = sm.read_messages();
     assert_eq!(msgs.len(), 2);
     let mut want_commit_map = HashMap::new();
-    want_commit_map.insert(2, cmp::min(sm.raft_log.committed, sm.prs[&2].matched));
-    want_commit_map.insert(3, cmp::min(sm.raft_log.committed, sm.prs[&3].matched));
+    want_commit_map.insert(
+        2,
+        cmp::min(sm.raft_log.committed, sm.prs().voters()[&2].matched),
+    );
+    want_commit_map.insert(
+        3,
+        cmp::min(sm.raft_log.committed, sm.prs().voters()[&3].matched),
+    );
     for (i, m) in msgs.drain(..).enumerate() {
         if m.get_msg_type() != MessageType::MsgHeartbeat {
             panic!(
@@ -2627,13 +2622,18 @@ fn test_leader_increase_next() {
         sm.raft_log.append(&previous_ents);
         sm.become_candidate();
         sm.become_leader();
-        sm.prs.get_mut(&2).unwrap().state = state;
-        sm.prs.get_mut(&2).unwrap().next_idx = next_idx;
+        sm.mut_prs().get_mut(2).unwrap().state = state;
+        sm.mut_prs().get_mut(2).unwrap().next_idx = next_idx;
         sm.step(new_message(1, 1, MessageType::MsgPropose, 1))
             .expect("");
 
-        if sm.prs[&2].next_idx != wnext {
-            panic!("#{}: next = {}, want {}", i, sm.prs[&2].next_idx, wnext);
+        if sm.prs().voters()[&2].next_idx != wnext {
+            panic!(
+                "#{}: next = {}, want {}",
+                i,
+                sm.prs().voters()[&2].next_idx,
+                wnext
+            );
         }
     }
 }
@@ -2644,7 +2644,7 @@ fn test_send_append_for_progress_probe() {
     r.become_candidate();
     r.become_leader();
     r.read_messages();
-    r.prs.get_mut(&2).unwrap().become_probe();
+    r.mut_prs().get_mut(2).unwrap().become_probe();
 
     // each round is a heartbeat
     for i in 0..3 {
@@ -2653,16 +2653,16 @@ fn test_send_append_for_progress_probe() {
             // loop. After that, the follower is paused until a heartbeat response is
             // received.
             r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-            r.send_append(2);
+            do_send_append(&mut r, 2);
             let msg = r.read_messages();
             assert_eq!(msg.len(), 1);
             assert_eq!(msg[0].get_index(), 0);
         }
 
-        assert!(r.prs[&2].paused);
+        assert!(r.prs().voters()[&2].paused);
         for _ in 0..10 {
             r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-            r.send_append(2);
+            do_send_append(&mut r, 2);
             assert_eq!(r.read_messages().len(), 0);
         }
 
@@ -2671,7 +2671,7 @@ fn test_send_append_for_progress_probe() {
             r.step(new_message(1, 1, MessageType::MsgBeat, 0))
                 .expect("");
         }
-        assert!(r.prs[&2].paused);
+        assert!(r.prs().voters()[&2].paused);
 
         // consume the heartbeat
         let msg = r.read_messages();
@@ -2685,7 +2685,7 @@ fn test_send_append_for_progress_probe() {
     let msg = r.read_messages();
     assert_eq!(msg.len(), 1);
     assert_eq!(msg[0].get_index(), 0);
-    assert!(r.prs[&2].paused);
+    assert!(r.prs().voters()[&2].paused);
 }
 
 #[test]
@@ -2694,11 +2694,11 @@ fn test_send_append_for_progress_replicate() {
     r.become_candidate();
     r.become_leader();
     r.read_messages();
-    r.prs.get_mut(&2).unwrap().become_replicate();
+    r.mut_prs().get_mut(2).unwrap().become_replicate();
 
     for _ in 0..10 {
         r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-        r.send_append(2);
+        do_send_append(&mut r, 2);
         assert_eq!(r.read_messages().len(), 1);
     }
 }
@@ -2709,11 +2709,11 @@ fn test_send_append_for_progress_snapshot() {
     r.become_candidate();
     r.become_leader();
     r.read_messages();
-    r.prs.get_mut(&2).unwrap().become_snapshot(10);
+    r.mut_prs().get_mut(2).unwrap().become_snapshot(10);
 
     for _ in 0..10 {
         r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-        r.send_append(2);
+        do_send_append(&mut r, 2);
         assert_eq!(r.read_messages().len(), 0);
     }
 }
@@ -2728,15 +2728,18 @@ fn test_recv_msg_unreachable() {
     r.become_leader();
     r.read_messages();
     // set node 2 to state replicate
-    r.prs.get_mut(&2).unwrap().matched = 3;
-    r.prs.get_mut(&2).unwrap().become_replicate();
-    r.prs.get_mut(&2).unwrap().optimistic_update(5);
+    r.mut_prs().get_mut(2).unwrap().matched = 3;
+    r.mut_prs().get_mut(2).unwrap().become_replicate();
+    r.mut_prs().get_mut(2).unwrap().optimistic_update(5);
 
     r.step(new_message(2, 1, MessageType::MsgUnreachable, 0))
         .expect("");
 
-    assert_eq!(r.prs[&2].state, ProgressState::Probe);
-    assert_eq!(r.prs[&2].matched + 1, r.prs[&2].next_idx);
+    assert_eq!(r.prs().voters()[&2].state, ProgressState::Probe);
+    assert_eq!(
+        r.prs().voters()[&2].matched + 1,
+        r.prs().voters()[&2].next_idx
+    );
 }
 
 #[test]
@@ -2751,7 +2754,10 @@ fn test_restore() {
         sm.raft_log.term(s.get_metadata().get_index()).unwrap(),
         s.get_metadata().get_term()
     );
-    assert_eq!(sm.nodes(), s.get_metadata().get_conf_state().get_nodes());
+    assert_eq!(
+        sm.prs().nodes(),
+        s.get_metadata().get_conf_state().get_nodes()
+    );
     assert!(!sm.restore(s));
 }
 
@@ -2787,9 +2793,9 @@ fn test_provide_snap() {
     sm.become_leader();
 
     // force set the next of node 2, so that node 2 needs a snapshot
-    sm.prs.get_mut(&2).unwrap().next_idx = sm.raft_log.first_index();
+    sm.mut_prs().get_mut(2).unwrap().next_idx = sm.raft_log.first_index();
     let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
-    m.set_index(sm.prs[&2].next_idx - 1);
+    m.set_index(sm.prs().voters()[&2].next_idx - 1);
     m.set_reject(true);
     sm.step(m).expect("");
 
@@ -2810,8 +2816,8 @@ fn test_ignore_providing_snapshot() {
 
     // force set the next of node 2, so that node 2 needs a snapshot
     // change node 2 to be inactive, expect node 1 ignore sending snapshot to 2
-    sm.prs.get_mut(&2).unwrap().next_idx = sm.raft_log.first_index() - 1;
-    sm.prs.get_mut(&2).unwrap().recent_active = false;
+    sm.mut_prs().get_mut(2).unwrap().next_idx = sm.raft_log.first_index() - 1;
+    sm.mut_prs().get_mut(2).unwrap().recent_active = false;
 
     sm.step(new_message(1, 1, MessageType::MsgPropose, 1))
         .expect("");
@@ -2845,7 +2851,7 @@ fn test_slow_node_restore() {
     }
     next_ents(&mut nt.peers.get_mut(&1).unwrap(), &nt.storage[&1]);
     let mut cs = ConfState::new();
-    cs.set_nodes(nt.peers[&1].nodes());
+    cs.set_nodes(nt.peers[&1].prs().nodes());
     nt.storage[&1]
         .wl()
         .create_snapshot(nt.peers[&1].raft_log.applied, Some(cs), vec![])
@@ -2860,7 +2866,7 @@ fn test_slow_node_restore() {
     // node 3 will only be considered as active when node 1 receives a reply from it.
     loop {
         nt.send(vec![new_message(1, 1, MessageType::MsgBeat, 0)]);
-        if nt.peers[&1].prs[&3].recent_active {
+        if nt.peers[&1].prs().voters()[&3].recent_active {
             break;
         }
     }
@@ -2937,9 +2943,7 @@ fn test_recover_pending_config() {
         if r.pending_conf != wpending {
             panic!(
                 "#{}: pending_conf = {}, want {}",
-                i,
-                r.pending_conf,
-                wpending
+                i, r.pending_conf, wpending
             );
         }
     }
@@ -2965,7 +2969,7 @@ fn test_add_node() {
     r.pending_conf = true;
     r.add_node(2);
     assert!(!r.pending_conf);
-    assert_eq!(r.nodes(), vec![1, 2]);
+    assert_eq!(r.prs().nodes(), vec![1, 2]);
 }
 
 // test_remove_node tests that removeNode could update pendingConf, nodes and
@@ -2976,11 +2980,11 @@ fn test_remove_node() {
     r.pending_conf = true;
     r.remove_node(2);
     assert!(!r.pending_conf);
-    assert_eq!(r.nodes(), vec![1]);
+    assert_eq!(r.prs().nodes(), vec![1]);
 
     // remove all nodes from cluster
     r.remove_node(1);
-    assert!(r.nodes().is_empty());
+    assert!(r.prs().nodes().is_empty());
 }
 
 #[test]
@@ -3008,8 +3012,8 @@ fn test_raft_nodes() {
     ];
     for (i, (ids, wids)) in tests.drain(..).enumerate() {
         let r = new_test_raft(1, ids, 10, 1, new_storage());
-        if r.nodes() != wids {
-            panic!("#{}: nodes = {:?}, want {:?}", i, r.nodes(), wids);
+        if r.prs().nodes() != wids {
+            panic!("#{}: nodes = {:?}, want {:?}", i, r.prs().nodes(), wids);
         }
     }
 }
@@ -3023,7 +3027,6 @@ fn test_campaign_while_leader() {
 fn test_pre_campaign_while_leader() {
     test_campaign_while_leader_with_pre_vote(true);
 }
-
 
 fn test_campaign_while_leader_with_pre_vote(pre_vote: bool) {
     let mut r = new_test_raft_with_prevote(1, vec![1], 5, 1, new_storage(), pre_vote);
@@ -3076,7 +3079,7 @@ fn test_commit_after_remove_node() {
     let ents = next_ents(&mut r, &s);
     assert_eq!(ents.len(), 2);
     assert_eq!(ents[0].get_entry_type(), EntryType::EntryNormal);
-    assert!(!ents[0].has_data());
+    assert!(ents[0].get_data().is_empty());
     assert_eq!(ents[1].get_entry_type(), EntryType::EntryConfChange);
 
     // Apply the config change. This reduces quorum requirements so the
@@ -3176,7 +3179,7 @@ fn test_leader_transfer_to_slow_follower() {
     nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
 
     nt.recover();
-    assert_eq!(nt.peers[&1].prs[&3].matched, 1);
+    assert_eq!(nt.peers[&1].prs().voters()[&3].matched, 1);
 
     // Transfer leadership to 3 when node 3 is lack of log.
     nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
@@ -3194,7 +3197,7 @@ fn test_leader_transfer_after_snapshot() {
     nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
     next_ents(&mut nt.peers.get_mut(&1).unwrap(), &nt.storage[&1]);
     let mut cs = ConfState::new();
-    cs.set_nodes(nt.peers[&1].nodes());
+    cs.set_nodes(nt.peers[&1].prs().nodes());
     nt.storage[&1]
         .wl()
         .create_snapshot(nt.peers[&1].raft_log.applied, Some(cs), vec![])
@@ -3205,7 +3208,7 @@ fn test_leader_transfer_after_snapshot() {
         .expect("");
 
     nt.recover();
-    assert_eq!(nt.peers[&1].prs[&3].matched, 1);
+    assert_eq!(nt.peers[&1].prs().voters()[&3].matched, 1);
 
     // Transfer leadership to 3 when node 3 is lack of snapshot.
     nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
@@ -3272,7 +3275,7 @@ fn test_leader_transfer_ignore_proposal() {
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
 
     nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    assert_eq!(nt.peers[&1].prs[&1].matched, 1);
+    assert_eq!(nt.peers[&1].prs().voters()[&1].matched, 1);
 }
 
 #[test]
@@ -3377,10 +3380,7 @@ fn check_leader_transfer_state(r: &Raft<MemStorage>, state: StateRole, lead: u64
     if r.state != state || r.leader_id != lead {
         panic!(
             "after transferring, node has state {:?} lead {}, want state {:?} lead {}",
-            r.state,
-            r.leader_id,
-            state,
-            lead
+            r.state, r.leader_id, state, lead
         );
     }
     assert_eq!(r.lead_transferee, None);
@@ -3401,4 +3401,271 @@ fn test_transfer_non_member() {
     raft.step(new_message(3, 1, MessageType::MsgRequestVoteResponse, 0))
         .expect("");;
     assert_eq!(raft.state, StateRole::Follower);
+}
+
+pub fn new_test_learner_raft(
+    id: u64,
+    peers: Vec<u64>,
+    learners: Vec<u64>,
+    election: usize,
+    heartbeat: usize,
+    storage: MemStorage,
+) -> Interface {
+    let mut cfg = new_test_config(id, peers, election, heartbeat);
+    cfg.learners = learners;
+    Interface::new(Raft::new(&cfg, storage))
+}
+
+// TestLearnerElectionTimeout verfies that the leader should not start election
+// even when times out.
+#[test]
+fn test_learner_election_timeout() {
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage());
+    n1.become_follower(1, INVALID_ID);
+
+    let mut n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage());
+    n2.become_follower(1, INVALID_ID);
+
+    let timeout = n2.get_election_timeout();
+    n2.set_randomized_election_timeout(timeout);
+
+    // n2 is a learner. Learner should not start election even when time out.
+    for _ in 0..timeout {
+        n2.tick();
+    }
+    assert_eq!(n2.state, StateRole::Follower);
+}
+
+// TestLearnerPromotion verifies that the leaner should not election until
+// it is promoted to a normal peer.
+#[test]
+fn test_learner_promotion() {
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage());
+    n1.become_follower(1, INVALID_ID);
+
+    let mut n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage());
+    n2.become_follower(1, INVALID_ID);
+
+    let mut network = Network::new(vec![Some(n1), Some(n2)]);
+    assert_eq!(network.peers[&1].state, StateRole::Follower);
+
+    // n1 should become leader.
+    let timeout = network.peers[&1].get_election_timeout();
+    network
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .set_randomized_election_timeout(timeout);
+    for _ in 0..timeout {
+        network.peers.get_mut(&1).unwrap().tick();
+    }
+    assert_eq!(network.peers[&1].state, StateRole::Leader);
+    assert_eq!(network.peers[&2].state, StateRole::Follower);
+
+    let mut heart_beat = new_message(1, 1, MessageType::MsgBeat, 0);
+    network.send(vec![heart_beat.clone()]);
+
+    // Promote n2 from learner to follower.
+    network.peers.get_mut(&1).unwrap().add_node(2);
+    network.peers.get_mut(&2).unwrap().add_node(2);
+    assert_eq!(network.peers[&2].state, StateRole::Follower);
+    assert!(!network.peers[&2].is_learner);
+
+    let timeout = network.peers[&2].get_election_timeout();
+    network
+        .peers
+        .get_mut(&2)
+        .unwrap()
+        .set_randomized_election_timeout(timeout);
+    for _ in 0..timeout {
+        network.peers.get_mut(&2).unwrap().tick();
+    }
+
+    heart_beat.set_to(2);
+    heart_beat.set_from(2);
+    network.send(vec![heart_beat]);
+    assert_eq!(network.peers[&1].state, StateRole::Follower);
+    assert_eq!(network.peers[&2].state, StateRole::Leader);
+}
+
+// TestLearnerCannotVote checks that a learner can't vote even it receives a valid Vote request.
+#[test]
+fn test_learner_cannot_vote() {
+    let mut n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage());
+    n2.become_follower(1, INVALID_ID);
+
+    let mut msg_vote = new_message(1, 2, MessageType::MsgRequestVote, 0);
+    msg_vote.set_term(2);
+    msg_vote.set_log_term(11);
+    msg_vote.set_index(11);
+    n2.step(msg_vote).unwrap();
+
+    assert_eq!(n2.msgs.len(), 0);
+}
+
+// TestLearnerLogReplication tests that a learner can receive entries from the leader.
+#[test]
+fn test_learner_log_replication() {
+    let n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage());
+    let n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage());
+    let mut network = Network::new(vec![Some(n1), Some(n2)]);
+
+    network
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .become_follower(1, INVALID_ID);
+    network
+        .peers
+        .get_mut(&2)
+        .unwrap()
+        .become_follower(1, INVALID_ID);
+
+    let timeout = network.peers[&1].get_election_timeout();
+    network
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .set_randomized_election_timeout(timeout);
+
+    for _ in 0..timeout {
+        network.peers.get_mut(&1).unwrap().tick();
+    }
+
+    let heart_beat = new_message(1, 1, MessageType::MsgBeat, 0);
+    network.send(vec![heart_beat.clone()]);
+
+    assert_eq!(network.peers[&1].state, StateRole::Leader);
+    assert_eq!(network.peers[&2].state, StateRole::Follower);
+    assert!(network.peers[&2].is_learner);
+
+    let next_committed = network.peers[&1].raft_log.committed + 1;
+
+    let msg = new_message(1, 1, MessageType::MsgPropose, 1);
+    network.send(vec![msg]);
+
+    assert_eq!(network.peers[&1].raft_log.committed, next_committed);
+    assert_eq!(network.peers[&2].raft_log.committed, next_committed);
+
+    let matched = network
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .prs()
+        .get(2)
+        .unwrap()
+        .matched;
+    assert_eq!(matched, network.peers[&2].raft_log.committed);
+}
+
+// TestRestoreWithLearner restores a snapshot which contains learners.
+#[test]
+fn test_restore_with_learner() {
+    let mut s = new_snapshot(11, 11, vec![1, 2]);
+    s.mut_metadata().mut_conf_state().mut_learners().push(3);
+
+    let mut sm = new_test_learner_raft(3, vec![1, 2], vec![3], 10, 1, new_storage());
+    assert!(sm.is_learner);
+    assert!(sm.restore(s.clone()));
+    assert_eq!(sm.raft_log.last_index(), 11);
+    assert_eq!(sm.raft_log.term(11).unwrap(), 11);
+    assert_eq!(sm.prs().nodes().len(), 3);
+
+    for node in s.get_metadata().get_conf_state().get_nodes() {
+        assert!(sm.prs().voters().get(node).is_some());
+        assert!(!sm.prs().voters()[node].is_learner);
+    }
+
+    for node in s.get_metadata().get_conf_state().get_learners() {
+        assert!(sm.prs().learners().get(node).is_some());
+        assert!(sm.prs().learners()[node].is_learner);
+    }
+
+    assert!(!sm.restore(s));
+}
+
+// TestRestoreInvalidLearner verfies that a normal peer can't become learner again
+// when restores snapshot.
+#[test]
+fn test_restore_invalid_learner() {
+    let mut s = new_snapshot(11, 11, vec![1, 2]);
+    s.mut_metadata().mut_conf_state().mut_learners().push(3);
+
+    let mut sm = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage());
+    assert!(!sm.is_learner);
+    assert!(!sm.restore(s));
+}
+
+// TestRestoreLearnerPromotion checks that a learner can become to a follower after
+// restoring snapshot.
+#[test]
+fn test_restore_learner_promotion() {
+    let s = new_snapshot(11, 11, vec![1, 2, 3]);
+    let mut sm = new_test_learner_raft(3, vec![1, 2], vec![3], 10, 1, new_storage());
+    assert!(sm.is_learner);
+    assert!(sm.restore(s));
+    assert!(!sm.is_learner);
+}
+
+// TestLearnerReceiveSnapshot tests that a learner can receive a snpahost from leader.
+#[test]
+fn test_learner_receive_snapshot() {
+    let mut s = new_snapshot(11, 11, vec![1]);
+    s.mut_metadata().mut_conf_state().mut_learners().push(2);
+
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage());
+    let n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage());
+
+    n1.restore(s);
+    let committed = n1.raft_log.committed;
+    n1.raft_log.applied_to(committed);
+
+    let mut network = Network::new(vec![Some(n1), Some(n2)]);
+
+    let timeout = network.peers[&1].get_election_timeout();
+    network
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .set_randomized_election_timeout(timeout);
+
+    for _ in 0..timeout {
+        network.peers.get_mut(&1).unwrap().tick();
+    }
+
+    let mut msg = Message::new();
+    msg.set_from(1);
+    msg.set_to(1);
+    msg.set_msg_type(MessageType::MsgBeat);
+    network.send(vec![msg]);
+
+    let n1_committed = network.peers[&1].raft_log.committed;
+    let n2_committed = network.peers[&2].raft_log.committed;
+    assert_eq!(n1_committed, n2_committed);
+}
+
+// TestAddLearner tests that addLearner could update pendingConf and nodes correctly.
+#[test]
+fn test_add_learner() {
+    let mut n1 = new_test_raft(1, vec![1], 10, 1, new_storage());
+    n1.pending_conf = true;
+    n1.add_learner(2);
+    assert!(!n1.pending_conf);
+
+    assert_eq!(n1.prs().nodes(), vec![1, 2]);
+    assert!(n1.prs().learners()[&2].is_learner);
+}
+
+// TestRemoveLearner tests that removeNode could update pendingConf, nodes and
+// and removed list correctly.
+#[test]
+fn test_remove_learner() {
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage());
+    n1.pending_conf = true;
+    n1.remove_node(2);
+    assert!(!n1.pending_conf);
+    assert_eq!(n1.prs().nodes(), vec![1]);
+
+    n1.remove_node(1);
+    assert!(n1.prs().nodes().is_empty());
 }

@@ -11,61 +11,77 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 /// Worker contains all workers that do the expensive job in background.
 
 mod metrics;
 mod future;
 
+use std::{io, usize};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, Builder, JoinHandle};
-use std::io;
+use std::thread::{self, Builder as ThreadBuilder, JoinHandle};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SendError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, SyncSender,
+                      TryRecvError, TrySendError};
 use std::error::Error;
+use std::time::Duration;
 
-use util::time::SlowTimer;
+use util::time::{Instant, SlowTimer};
+use util::timer::Timer;
 use self::metrics::*;
 
 pub use self::future::Runnable as FutureRunnable;
 pub use self::future::Scheduler as FutureScheduler;
-pub use self::future::Worker as FutureWorker;
+pub use self::future::{Stopped, Worker as FutureWorker};
 
-pub struct Stopped<T>(pub T);
+#[derive(Eq, PartialEq)]
+pub enum ScheduleError<T> {
+    Stopped(T),
+    Full(T),
+}
 
-impl<T> Display for Stopped<T> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "channel has been closed")
+impl<T> ScheduleError<T> {
+    pub fn into_inner(self) -> T {
+        match self {
+            ScheduleError::Stopped(t) | ScheduleError::Full(t) => t,
+        }
     }
 }
 
-impl<T> Debug for Stopped<T> {
+impl<T> Display for ScheduleError<T> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "channel has been closed")
+        match *self {
+            ScheduleError::Stopped(_) => write!(f, "channel has been closed"),
+            ScheduleError::Full(_) => write!(f, "channel is full"),
+        }
     }
 }
 
-impl<T> From<Stopped<T>> for Box<Error + Sync + Send + 'static> {
-    fn from(_: Stopped<T>) -> Box<Error + Sync + Send + 'static> {
-        box_err!("channel has been closed")
+impl<T> Debug for ScheduleError<T> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match *self {
+            ScheduleError::Stopped(_) => write!(f, "channel has been closed"),
+            ScheduleError::Full(_) => write!(f, "channel is full"),
+        }
+    }
+}
+
+impl<T> From<ScheduleError<T>> for Box<Error + Sync + Send + 'static> {
+    fn from(e: ScheduleError<T>) -> Box<Error + Sync + Send + 'static> {
+        match e {
+            ScheduleError::Stopped(_) => box_err!("channel has been closed"),
+            ScheduleError::Full(_) => box_err!("channel is full"),
+        }
     }
 }
 
 pub trait Runnable<T: Display> {
+    /// Run a task.
     fn run(&mut self, t: T);
-    fn shutdown(&mut self) {}
-}
 
-pub trait BatchRunnable<T: Display> {
-    /// run a batch of tasks.
+    /// Run a batch of tasks.
     ///
     /// Please note that ts will be clear after invoking this method.
-    fn run_batch(&mut self, ts: &mut Vec<T>);
-    fn shutdown(&mut self) {}
-}
-
-impl<T: Display, R: Runnable<T>> BatchRunnable<T> for R {
     fn run_batch(&mut self, ts: &mut Vec<T>) {
         for t in ts.drain(..) {
             let task_str = format!("{}", t);
@@ -75,8 +91,46 @@ impl<T: Display, R: Runnable<T>> BatchRunnable<T> for R {
         }
     }
 
+    fn on_tick(&mut self) {}
+    fn shutdown(&mut self) {}
+}
+
+pub trait RunnableWithTimer<T: Display, U>: Runnable<T> {
+    fn on_timeout(&mut self, &mut Timer<U>, U);
+}
+
+struct DefaultRunnerWithTimer<R>(R);
+
+impl<T: Display, R: Runnable<T>> Runnable<T> for DefaultRunnerWithTimer<R> {
+    fn run(&mut self, t: T) {
+        self.0.run(t)
+    }
+    fn run_batch(&mut self, ts: &mut Vec<T>) {
+        self.0.run_batch(ts)
+    }
+    fn on_tick(&mut self) {
+        self.0.on_tick()
+    }
     fn shutdown(&mut self) {
-        Runnable::shutdown(self)
+        self.0.shutdown()
+    }
+}
+
+impl<T: Display, R: Runnable<T>> RunnableWithTimer<T, ()> for DefaultRunnerWithTimer<R> {
+    fn on_timeout(&mut self, _: &mut Timer<()>, _: ()) {}
+}
+
+enum TaskSender<T> {
+    Bounded(SyncSender<Option<T>>),
+    Unbounded(Sender<Option<T>>),
+}
+
+impl<T> Clone for TaskSender<T> {
+    fn clone(&self) -> TaskSender<T> {
+        match *self {
+            TaskSender::Bounded(ref tx) => TaskSender::Bounded(tx.clone()),
+            TaskSender::Unbounded(ref tx) => TaskSender::Unbounded(tx.clone()),
+        }
     }
 }
 
@@ -84,15 +138,14 @@ impl<T: Display, R: Runnable<T>> BatchRunnable<T> for R {
 pub struct Scheduler<T> {
     name: Arc<String>,
     counter: Arc<AtomicUsize>,
-    sender: Sender<Option<T>>,
+    sender: TaskSender<T>,
 }
 
 impl<T: Display> Scheduler<T> {
-    fn new<S: Into<String>>(
-        name: S,
-        counter: AtomicUsize,
-        sender: Sender<Option<T>>,
-    ) -> Scheduler<T> {
+    fn new<S>(name: S, counter: AtomicUsize, sender: TaskSender<T>) -> Scheduler<T>
+    where
+        S: Into<String>,
+    {
         Scheduler {
             name: Arc::new(name.into()),
             counter: Arc::new(counter),
@@ -102,12 +155,21 @@ impl<T: Display> Scheduler<T> {
 
     /// Schedule a task to run.
     ///
-    /// If the worker is stopped, an error will return.
-    pub fn schedule(&self, task: T) -> Result<(), Stopped<T>> {
+    /// If the worker is stopped or number pending tasks exceeds capacity, an error will return.
+    pub fn schedule(&self, task: T) -> Result<(), ScheduleError<T>> {
         debug!("scheduling task {}", task);
-        if let Err(SendError(Some(t))) = self.sender.send(Some(task)) {
-            return Err(Stopped(t));
-        }
+        match self.sender {
+            TaskSender::Unbounded(ref tx) => if let Err(SendError(Some(t))) = tx.send(Some(task)) {
+                return Err(ScheduleError::Stopped(t));
+            },
+            TaskSender::Bounded(ref tx) => if let Err(e) = tx.try_send(Some(task)) {
+                match e {
+                    TrySendError::Disconnected(Some(t)) => return Err(ScheduleError::Stopped(t)),
+                    TrySendError::Full(Some(t)) => return Err(ScheduleError::Full(t)),
+                    _ => unreachable!(),
+                }
+            },
+        };
         self.counter.fetch_add(1, Ordering::SeqCst);
         WORKER_PENDING_TASK_VEC
             .with_label_values(&[&self.name])
@@ -121,11 +183,11 @@ impl<T: Display> Scheduler<T> {
     }
 }
 
-impl<T: Display> Clone for Scheduler<T> {
+impl<T> Clone for Scheduler<T> {
     fn clone(&self) -> Scheduler<T> {
         Scheduler {
-            name: self.name.clone(),
-            counter: self.counter.clone(),
+            name: Arc::clone(&self.name),
+            counter: Arc::clone(&self.counter),
             sender: self.sender.clone(),
         }
     }
@@ -137,7 +199,55 @@ impl<T: Display> Clone for Scheduler<T> {
 #[cfg(test)]
 pub fn dummy_scheduler<T: Display>() -> Scheduler<T> {
     let (tx, _) = mpsc::channel();
-    Scheduler::new("dummy scheduler", AtomicUsize::new(0), tx)
+    let sender = TaskSender::Unbounded(tx);
+    Scheduler::new("dummy scheduler", AtomicUsize::new(0), sender)
+}
+
+#[derive(Copy, Clone)]
+pub struct Builder<S: Into<String>> {
+    name: S,
+    batch_size: usize,
+    pending_capacity: usize,
+}
+
+impl<S: Into<String>> Builder<S> {
+    pub fn new(name: S) -> Self {
+        Builder {
+            name: name,
+            batch_size: 1,
+            pending_capacity: usize::MAX,
+        }
+    }
+
+    pub fn batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    /// Pending tasks won't exceed `pending_capacity`.
+    pub fn pending_capacity(mut self, pending_capacity: usize) -> Self {
+        self.pending_capacity = pending_capacity;
+        self
+    }
+
+    pub fn create<T: Display>(self) -> Worker<T> {
+        let (scheduler, rx) = if self.pending_capacity == usize::MAX {
+            let (tx, rx) = mpsc::channel::<Option<T>>();
+            let sender = TaskSender::Unbounded(tx);
+            (Scheduler::new(self.name, AtomicUsize::new(0), sender), rx)
+        } else {
+            let (tx, rx) = mpsc::sync_channel::<Option<T>>(self.pending_capacity);
+            let sender = TaskSender::Bounded(tx);
+            (Scheduler::new(self.name, AtomicUsize::new(0), sender), rx)
+        };
+
+        Worker {
+            scheduler: scheduler,
+            receiver: Mutex::new(Some(rx)),
+            handle: None,
+            batch_size: self.batch_size,
+        }
+    }
 }
 
 /// A worker that can schedule time consuming tasks.
@@ -145,65 +255,100 @@ pub struct Worker<T: Display> {
     scheduler: Scheduler<T>,
     receiver: Mutex<Option<Receiver<Option<T>>>>,
     handle: Option<JoinHandle<()>>,
+    batch_size: usize,
 }
 
-fn poll<R, T>(mut runner: R, rx: Receiver<Option<T>>, counter: Arc<AtomicUsize>, batch_size: usize)
-where
-    R: BatchRunnable<T> + Send + 'static,
+fn poll<R, T, U>(
+    mut runner: R,
+    rx: Receiver<Option<T>>,
+    counter: Arc<AtomicUsize>,
+    batch_size: usize,
+    mut timer: Timer<U>,
+) where
+    R: RunnableWithTimer<T, U> + Send + 'static,
     T: Display + Send + 'static,
+    U: Send + 'static,
 {
     let name = thread::current().name().unwrap().to_owned();
+    let mut batch = Vec::with_capacity(batch_size);
     let mut keep_going = true;
-    let mut buffer = Vec::with_capacity(batch_size);
+    let mut tick_time = None;
     while keep_going {
-        let t = rx.recv();
-        match t {
-            Ok(Some(t)) => buffer.push(t),
-            _ => break,
+        tick_time = tick_time.or_else(|| timer.next_timeout());
+        let timeout = tick_time.map(|t| t.checked_sub(Instant::now()).unwrap_or_default());
+
+        keep_going = fill_task_batch(&rx, &mut batch, batch_size, timeout);
+        if !batch.is_empty() {
+            counter.fetch_sub(batch.len(), Ordering::SeqCst);
+            WORKER_PENDING_TASK_VEC
+                .with_label_values(&[&name])
+                .sub(batch.len() as f64);
+            WORKER_HANDLED_TASK_VEC
+                .with_label_values(&[&name])
+                .inc_by(batch.len() as f64)
+                .unwrap();
+            runner.run_batch(&mut batch);
+            batch.clear();
         }
-        while buffer.len() < batch_size {
-            match rx.try_recv() {
-                Ok(None) => {
-                    keep_going = false;
-                    break;
-                }
-                Ok(Some(t)) => buffer.push(t),
-                _ => break,
+
+        if tick_time.is_some() {
+            let now = Instant::now();
+            while let Some(task) = timer.pop_task_before(now) {
+                runner.on_timeout(&mut timer, task);
+                tick_time = None;
             }
         }
-        counter.fetch_sub(buffer.len(), Ordering::SeqCst);
-        WORKER_PENDING_TASK_VEC
-            .with_label_values(&[&name])
-            .sub(buffer.len() as f64);
-        WORKER_HANDLED_TASK_VEC
-            .with_label_values(&[&name])
-            .inc_by(buffer.len() as f64)
-            .unwrap();
-        runner.run_batch(&mut buffer);
-        buffer.clear();
+        runner.on_tick();
     }
     runner.shutdown();
+}
+
+// Fill buffer with next task batch comes from `rx`.
+fn fill_task_batch<T>(
+    rx: &Receiver<Option<T>>,
+    buffer: &mut Vec<T>,
+    batch_size: usize,
+    timeout: Option<Duration>,
+) -> bool {
+    let head_task = match timeout {
+        Some(dur) => match rx.recv_timeout(dur) {
+            Err(RecvTimeoutError::Timeout) => return true,
+            Err(RecvTimeoutError::Disconnected) | Ok(None) => return false,
+            Ok(Some(task)) => task,
+        },
+        None => match rx.recv() {
+            Err(_) | Ok(None) => return false,
+            Ok(Some(task)) => task,
+        },
+    };
+    buffer.push(head_task);
+    while buffer.len() < batch_size {
+        match rx.try_recv() {
+            Ok(Some(t)) => buffer.push(t),
+            Err(TryRecvError::Empty) => return true,
+            Err(_) | Ok(None) => return false,
+        }
+    }
+    true
 }
 
 impl<T: Display + Send + 'static> Worker<T> {
     /// Create a worker.
     pub fn new<S: Into<String>>(name: S) -> Worker<T> {
-        let (tx, rx) = mpsc::channel();
-        Worker {
-            scheduler: Scheduler::new(name, AtomicUsize::new(0), tx),
-            receiver: Mutex::new(Some(rx)),
-            handle: None,
-        }
+        Builder::new(name).create()
     }
 
     /// Start the worker.
     pub fn start<R: Runnable<T> + Send + 'static>(&mut self, runner: R) -> Result<(), io::Error> {
-        self.start_batch(runner, 1)
+        let runner = DefaultRunnerWithTimer(runner);
+        let timer: Timer<()> = Timer::new(0);
+        self.start_with_timer(runner, timer)
     }
 
-    pub fn start_batch<R>(&mut self, runner: R, batch_size: usize) -> Result<(), io::Error>
+    pub fn start_with_timer<R, U>(&mut self, runner: R, timer: Timer<U>) -> Result<(), io::Error>
     where
-        R: BatchRunnable<T> + Send + 'static,
+        R: RunnableWithTimer<T, U> + Send + 'static,
+        U: Send + 'static,
     {
         let mut receiver = self.receiver.lock().unwrap();
         info!("starting working thread: {}", self.scheduler.name);
@@ -213,10 +358,11 @@ impl<T: Display + Send + 'static> Worker<T> {
         }
 
         let rx = receiver.take().unwrap();
-        let counter = self.scheduler.counter.clone();
-        let h = Builder::new()
+        let counter = Arc::clone(&self.scheduler.counter);
+        let batch_size = self.batch_size;
+        let h = ThreadBuilder::new()
             .name(thd_name!(self.scheduler.name.as_ref()))
-            .spawn(move || poll(runner, rx, counter, batch_size))?;
+            .spawn(move || poll(runner, rx, counter, batch_size, timer))?;
         self.handle = Some(h);
         Ok(())
     }
@@ -229,7 +375,7 @@ impl<T: Display + Send + 'static> Worker<T> {
     /// Schedule a task to run.
     ///
     /// If the worker is stopped, an error will return.
-    pub fn schedule(&self, task: T) -> Result<(), Stopped<T>> {
+    pub fn schedule(&self, task: T) -> Result<(), ScheduleError<T>> {
         self.scheduler.schedule(task)
     }
 
@@ -249,7 +395,11 @@ impl<T: Display + Send + 'static> Worker<T> {
         if self.handle.is_none() {
             return None;
         }
-        if let Err(e) = self.scheduler.sender.send(None) {
+        let send_result = match self.scheduler.sender {
+            TaskSender::Unbounded(ref tx) => tx.send(None),
+            TaskSender::Bounded(ref tx) => tx.send(None),
+        };
+        if let Err(e) = send_result {
             warn!("failed to stop worker thread: {:?}", e);
         }
         self.handle.take()
@@ -284,13 +434,33 @@ mod test {
         ch: Sender<Vec<u64>>,
     }
 
-    impl BatchRunnable<u64> for BatchRunner {
+    impl Runnable<u64> for BatchRunner {
+        fn run(&mut self, _: u64) {
+            panic!("should call run_batch");
+        }
+
         fn run_batch(&mut self, ms: &mut Vec<u64>) {
             self.ch.send(ms.to_vec()).unwrap();
         }
 
         fn shutdown(&mut self) {
             self.ch.send(vec![]).unwrap();
+        }
+    }
+
+    struct TickRunner {
+        ch: Sender<&'static str>,
+    }
+
+    impl Runnable<&'static str> for TickRunner {
+        fn run(&mut self, msg: &'static str) {
+            self.ch.send(msg).unwrap();
+        }
+        fn on_tick(&mut self) {
+            self.ch.send("tick msg").unwrap();
+        }
+        fn shutdown(&mut self) {
+            self.ch.send("").unwrap();
         }
     }
 
@@ -333,9 +503,9 @@ mod test {
 
     #[test]
     fn test_batch() {
-        let mut worker = Worker::new("test-worker-batch");
+        let mut worker = Builder::new("test-worker-batch").batch_size(10).create();
         let (tx, rx) = mpsc::channel();
-        worker.start_batch(BatchRunner { ch: tx }, 10).unwrap();
+        worker.start(BatchRunner { ch: tx }).unwrap();
         for _ in 0..20 {
             worker.schedule(50).unwrap();
         }
@@ -355,9 +525,9 @@ mod test {
 
     #[test]
     fn test_autowired_batch() {
-        let mut worker = Worker::new("test-worker-batch");
+        let mut worker = Builder::new("test-worker-batch").batch_size(10).create();
         let (tx, rx) = mpsc::channel();
-        worker.start_batch(StepRunner { ch: tx }, 10).unwrap();
+        worker.start(StepRunner { ch: tx }).unwrap();
         for _ in 0..20 {
             worker.schedule(50).unwrap();
         }
@@ -366,5 +536,45 @@ mod test {
             rx.recv_timeout(Duration::from_secs(3)).unwrap();
         }
         assert_eq!(rx.recv().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_on_tick() {
+        let mut worker = Builder::new("test-worker-tick").batch_size(4).create();
+        for _ in 0..10 {
+            worker.schedule("normal msg").unwrap();
+        }
+        let (tx, rx) = mpsc::channel();
+        worker.start(TickRunner { ch: tx }).unwrap();
+        for i in 0..13 {
+            let msg = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            if i != 4 && i != 9 && i != 12 {
+                assert_eq!(msg, "normal msg");
+            } else {
+                assert_eq!(msg, "tick msg");
+            }
+        }
+        worker.stop().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn test_pending_capacity() {
+        let mut worker = Builder::new("test-worker-busy")
+            .batch_size(4)
+            .pending_capacity(3)
+            .create();
+        let scheduler = worker.scheduler();
+
+        for i in 0..3 {
+            scheduler.schedule(i).unwrap();
+        }
+        assert_eq!(scheduler.schedule(3).unwrap_err(), ScheduleError::Full(3));
+
+        let (tx, rx) = mpsc::channel();
+        worker.start(BatchRunner { ch: tx }).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(3)).is_ok());
+
+        worker.stop().unwrap().join().unwrap();
+        drop(rx);
     }
 }

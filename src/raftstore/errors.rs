@@ -23,10 +23,11 @@ use pd;
 use raft;
 use kvproto::{errorpb, metapb};
 
+use super::store::SnapError;
 use super::coprocessor::Error as CopError;
 use util::{escape, transport};
 
-const RAFTSTORE_IS_BUSY: &'static str = "raftstore is busy";
+const RAFTSTORE_IS_BUSY: &str = "raftstore is busy";
 
 quick_error!{
     #[derive(Debug)]
@@ -133,9 +134,14 @@ quick_error!{
             description(err.description())
             display("Transport {}", err)
         }
+        Snapshot(err: SnapError) {
+            from()
+            cause(err)
+            description(err.description())
+            display("Snapshot {}", err)
+        }
     }
 }
-
 
 pub type Result<T> = result::Result<T, Error>;
 

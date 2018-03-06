@@ -13,14 +13,13 @@
 
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::io;
 use std::{slice, thread};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use std::collections::hash_map::Entry;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::vec_deque::{Iter, VecDeque};
-use std::u64;
+use std::{io, u64};
 
 use prometheus;
 use rand::{self, ThreadRng};
@@ -42,6 +41,11 @@ pub mod metrics;
 pub mod threadpool;
 pub mod collections;
 pub mod time;
+pub mod io_limiter;
+pub mod security;
+pub mod timer;
+pub mod sys;
+pub mod futurepool;
 
 pub use self::rocksdb::properties;
 
@@ -49,6 +53,10 @@ pub use self::rocksdb::properties;
 mod thread_metrics;
 
 pub const NO_LIMIT: u64 = u64::MAX;
+
+pub trait AssertSend: Send {}
+
+pub trait AssertSync: Sync {}
 
 pub fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: u64) {
     if max == NO_LIMIT || entries.len() <= 1 {
@@ -58,12 +66,14 @@ pub fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: u64) {
     let mut size = 0;
     let limit = entries
         .iter()
-        .take_while(|&e| if size == 0 {
-            size += Message::compute_size(e) as u64;
-            true
-        } else {
-            size += Message::compute_size(e) as u64;
-            size <= max
+        .take_while(|&e| {
+            if size == 0 {
+                size += u64::from(Message::compute_size(e));
+                true
+            } else {
+                size += u64::from(Message::compute_size(e));
+                size <= max
+            }
         })
         .count();
 
@@ -135,13 +145,6 @@ impl<T> HandyRwLock<T> for RwLock<T> {
     }
 }
 
-
-pub fn make_std_tcp_conn<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
-    let stream = TcpStream::connect(addr)?;
-    stream.set_nodelay(true)?;
-    Ok(stream)
-}
-
 // A helper function to parse SocketAddr for mio.
 // In mio example, it uses "127.0.0.1:80".parse() to get the SocketAddr,
 // but it is just ok for "ip:port", not "host:port".
@@ -152,7 +155,7 @@ pub fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> io::Result<SocketAddr> {
 
 /// A function to escape a byte array to a readable ascii string.
 /// escape rules follow golang/protobuf.
-/// https://github.com/golang/protobuf/blob/master/proto/text.go#L578
+/// <https://github.com/golang/protobuf/blob/master/proto/text.go#L578>
 ///
 /// # Examples
 ///
@@ -306,6 +309,14 @@ impl<L, R> Either<L, R> {
     }
 
     #[inline]
+    pub fn as_mut(&mut self) -> Either<&mut L, &mut R> {
+        match *self {
+            Either::Left(ref mut l) => Either::Left(l),
+            Either::Right(ref mut r) => Either::Right(r),
+        }
+    }
+
+    #[inline]
     pub fn left(self) -> Option<L> {
         match self {
             Either::Left(l) => Some(l),
@@ -443,12 +454,54 @@ pub fn is_even(n: usize) -> bool {
     n & 1 == 0
 }
 
+pub struct MustConsumeVec<T> {
+    tag: &'static str,
+    v: Vec<T>,
+}
+
+impl<T> MustConsumeVec<T> {
+    #[inline]
+    pub fn new(tag: &'static str) -> MustConsumeVec<T> {
+        MustConsumeVec::with_capacity(tag, 0)
+    }
+
+    #[inline]
+    pub fn with_capacity(tag: &'static str, cap: usize) -> MustConsumeVec<T> {
+        MustConsumeVec {
+            tag: tag,
+            v: Vec::with_capacity(cap),
+        }
+    }
+}
+
+impl<T> Deref for MustConsumeVec<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Vec<T> {
+        &self.v
+    }
+}
+
+impl<T> DerefMut for MustConsumeVec<T> {
+    fn deref_mut(&mut self) -> &mut Vec<T> {
+        &mut self.v
+    }
+}
+
+impl<T> Drop for MustConsumeVec<T> {
+    fn drop(&mut self) {
+        if !self.is_empty() {
+            panic!("resource leak detected: {}.", self.tag);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::*;
     use std::net::{AddrParseError, SocketAddr};
     use std::rc::Rc;
-    use std::cmp;
+    use std::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use kvproto::eraftpb::Entry;
     use protobuf::Message;
@@ -500,7 +553,7 @@ mod tests {
     #[test]
     fn test_defer() {
         let should_panic = Rc::new(AtomicBool::new(true));
-        let sp = should_panic.clone();
+        let sp = Rc::clone(&should_panic);
         defer!(assert!(!sp.load(Ordering::SeqCst)));
         should_panic.store(false, Ordering::SeqCst);
     }
@@ -535,7 +588,7 @@ mod tests {
     fn test_limit_size() {
         let mut e = Entry::new();
         e.set_data(b"0123456789".to_vec());
-        let size = e.compute_size() as u64;
+        let size = u64::from(e.compute_size());
 
         let tbls = vec![
             (vec![], NO_LIMIT, 0),
@@ -607,5 +660,23 @@ mod tests {
         let a_diff_d = cfs_diff(&a, &d);
         assert!(a_diff_d.is_empty());
         assert_eq!(vec!["4"], cfs_diff(&d, &a));
+    }
+
+    #[test]
+    fn test_must_consume_vec() {
+        let mut v = MustConsumeVec::new("test");
+        v.push(2);
+        v.push(3);
+        assert_eq!(v.len(), 2);
+        v.drain(..);
+    }
+
+    #[test]
+    fn test_resource_leak() {
+        let res = recover_safe!(|| {
+            let mut v = MustConsumeVec::new("test");
+            v.push(2);
+        });
+        res.unwrap_err();
     }
 }

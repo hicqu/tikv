@@ -15,7 +15,7 @@ use std::u64;
 
 use time::Duration as TimeDuration;
 
-use raftstore::Result;
+use raftstore::{coprocessor, Result};
 use util::config::{ReadableDuration, ReadableSize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -50,11 +50,6 @@ pub struct Config {
 
     // Interval (ms) to check region whether need to be split or not.
     pub split_region_check_tick_interval: ReadableDuration,
-    /// When region [a, b) size meets region_max_size, it will be split
-    /// into two region into [a, c), [c, b). And the size of [a, c) will
-    /// be region_split_size (or a little bit smaller).
-    pub region_max_size: ReadableSize,
-    pub region_split_size: ReadableSize,
     /// When size change of region exceed the diff since last check, it
     /// will be checked again whether it should be split.
     pub region_split_check_diff: ReadableSize,
@@ -81,6 +76,9 @@ pub struct Config {
     /// the peer would ask pd to confirm whether it is valid in any region.
     /// If the peer is stale and is not valid in any region, it will destroy itself.
     pub max_leader_missing_duration: ReadableDuration,
+    /// Similar to the max_leader_missing_duration, instead it will log warnings and
+    /// try to alert monitoring systems, if there is any.
+    pub abnormal_leader_missing_duration: ReadableDuration,
 
     pub snap_apply_batch_size: ReadableSize,
 
@@ -96,11 +94,22 @@ pub struct Config {
     pub right_derive_when_split: bool,
 
     pub allow_remove_leader: bool,
+
+    pub use_delete_range: bool,
+
+    // Deprecated! These two configuration has been moved to Coprocessor.
+    // They are preserved for compatibility check.
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
+    pub region_max_size: ReadableSize,
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
+    pub region_split_size: ReadableSize,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        let split_size = ReadableSize::mb(96);
+        let split_size = ReadableSize::mb(coprocessor::config::SPLIT_SIZE_MB);
         Config {
             sync_log: true,
             raftdb_path: String::new(),
@@ -117,8 +126,6 @@ impl Default for Config {
             raft_log_gc_count_limit: split_size * 3 / 4 / ReadableSize::kb(1),
             raft_log_gc_size_limit: split_size * 3 / 4,
             split_region_check_tick_interval: ReadableDuration::secs(10),
-            region_max_size: split_size / 2 * 3,
-            region_split_size: split_size,
             region_split_check_diff: split_size / 16,
             // Disable manual compaction by default.
             region_compact_check_interval: ReadableDuration::secs(0),
@@ -131,6 +138,7 @@ impl Default for Config {
             messages_per_tick: 4096,
             max_peer_down_duration: ReadableDuration::minutes(5),
             max_leader_missing_duration: ReadableDuration::hours(2),
+            abnormal_leader_missing_duration: ReadableDuration::minutes(2),
             snap_apply_batch_size: ReadableSize::mb(10),
             lock_cf_compact_interval: ReadableDuration::minutes(10),
             lock_cf_compact_bytes_threshold: ReadableSize::mb(256),
@@ -141,6 +149,11 @@ impl Default for Config {
             raft_store_max_leader_lease: ReadableDuration::secs(9),
             right_derive_when_split: true,
             allow_remove_leader: false,
+            use_delete_range: false,
+
+            // They are preserved for compatibility check.
+            region_max_size: ReadableSize(0),
+            region_split_size: ReadableSize(0),
         }
     }
 }
@@ -183,14 +196,6 @@ impl Config {
             return Err(box_err!("raft log gc size limit should large than 0."));
         }
 
-        if self.region_max_size.0 < self.region_split_size.0 {
-            return Err(box_err!(
-                "region max size {} must >= split size {}",
-                self.region_max_size.0,
-                self.region_split_size.0
-            ));
-        }
-
         let election_timeout =
             self.raft_base_tick_interval.as_millis() * self.raft_election_timeout_ticks as u64;
         let lease = self.raft_store_max_leader_lease.as_millis() as u64;
@@ -199,6 +204,24 @@ impl Config {
                 "election timeout {} ms is less than lease {} ms",
                 election_timeout,
                 lease
+            ));
+        }
+
+        let abnormal_leader_missing = self.abnormal_leader_missing_duration.as_millis() as u64;
+        if abnormal_leader_missing < election_timeout * 2 {
+            return Err(box_err!(
+                "abnormal leader missing {} ms is less than election timeout x2 {} ms",
+                abnormal_leader_missing,
+                election_timeout * 2
+            ));
+        }
+
+        let max_leader_missing = self.max_leader_missing_duration.as_millis() as u64;
+        if max_leader_missing < abnormal_leader_missing {
+            return Err(box_err!(
+                "max leader missing {} ms is less than abnormal leader missing {} ms",
+                max_leader_missing,
+                abnormal_leader_missing
             ));
         }
 
@@ -237,14 +260,20 @@ mod tests {
         assert!(cfg.validate().is_err());
 
         cfg = Config::new();
-        cfg.region_max_size = ReadableSize(10);
-        cfg.region_split_size = ReadableSize(20);
+        cfg.raft_base_tick_interval = ReadableDuration::secs(1);
+        cfg.raft_election_timeout_ticks = 10;
+        cfg.raft_store_max_leader_lease = ReadableDuration::secs(20);
         assert!(cfg.validate().is_err());
 
         cfg = Config::new();
         cfg.raft_base_tick_interval = ReadableDuration::secs(1);
         cfg.raft_election_timeout_ticks = 10;
-        cfg.raft_store_max_leader_lease = ReadableDuration::secs(20);
+        cfg.abnormal_leader_missing_duration = ReadableDuration::secs(5);
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.abnormal_leader_missing_duration = ReadableDuration::minutes(2);
+        cfg.max_leader_missing_duration = ReadableDuration::minutes(1);
         assert!(cfg.validate().is_err());
     }
 }

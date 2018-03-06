@@ -16,24 +16,26 @@
 #![cfg_attr(not(feature = "dev"), allow(unknown_lints))]
 #![allow(needless_pass_by_value)]
 
-extern crate tikv;
 extern crate clap;
-extern crate protobuf;
-extern crate kvproto;
-extern crate rocksdb;
-extern crate grpcio;
 extern crate futures;
+extern crate grpcio;
+extern crate kvproto;
+extern crate protobuf;
+extern crate rocksdb;
 extern crate rustc_serialize;
+extern crate tikv;
+extern crate toml;
 
+use std::fs::File;
+use std::io::Read;
 use std::{process, str, u64};
 use std::iter::FromIterator;
 use std::cmp::Ordering;
 use std::error::Error;
 use std::sync::Arc;
-use std::path::PathBuf;
 use rustc_serialize::hex::{FromHex, ToHex};
 
-use clap::{App, Arg, SubCommand};
+use clap::{App, Arg, ArgMatches, SubCommand};
 use protobuf::Message;
 use futures::{future, stream, Future, Stream};
 use grpcio::{ChannelBuilder, Environment};
@@ -42,16 +44,19 @@ use protobuf::RepeatedField;
 use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::raft_serverpb::PeerState;
 use kvproto::metapb::Region;
-use kvproto::eraftpb::Entry;
+use kvproto::eraftpb::{ConfChange, Entry, EntryType};
 use kvproto::kvrpcpb::MvccInfo;
 use kvproto::debugpb::*;
 use kvproto::debugpb::DB as DBType;
 use kvproto::debugpb_grpc::DebugClient;
-use tikv::util::{self, escape, unescape};
+use tikv::util::{escape, unescape};
+use tikv::util::security::{SecurityConfig, SecurityManager};
+use tikv::util::rocksdb as rocksdb_util;
 use tikv::raftstore::store::{keys, Engines};
-use tikv::raftstore::store::debug::{Debugger, RegionInfo};
-use tikv::storage::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE};
-use tikv::pd::{PdClient, RpcClient};
+use tikv::server::debug::{Debugger, RegionInfo};
+use tikv::storage::{CF_DEFAULT, CF_LOCK, CF_WRITE};
+use tikv::pd::{Config as PdConfig, PdClient, RpcClient};
+use tikv::config::TiKvConfig;
 
 fn perror_and_exit<E: Error>(prefix: &str, e: E) -> ! {
     eprintln!("{}: {}", prefix, e);
@@ -62,22 +67,42 @@ fn new_debug_executor(
     db: Option<&str>,
     raft_db: Option<&str>,
     host: Option<&str>,
+    cfg_path: Option<&str>,
+    mgr: Arc<SecurityManager>,
 ) -> Box<DebugExecutor> {
     match (host, db) {
         (None, Some(kv_path)) => {
-            let db = util::rocksdb::open(kv_path, ALL_CFS).unwrap();
-            let raft_db = if let Some(raft_path) = raft_db {
-                util::rocksdb::open(raft_path, &[CF_DEFAULT]).unwrap()
-            } else {
-                let raft_path = PathBuf::from(kv_path).join("../raft");
-                util::rocksdb::open(raft_path.to_str().unwrap(), &[CF_DEFAULT]).unwrap()
-            };
-            Box::new(Debugger::new(Engines::new(Arc::new(db), Arc::new(raft_db)))) as
-                Box<DebugExecutor>
+            let cfg = cfg_path.map_or_else(TiKvConfig::default, |path| {
+                File::open(&path)
+                    .and_then(|mut f| {
+                        let mut s = String::new();
+                        f.read_to_string(&mut s).unwrap();
+                        let c = toml::from_str(&s).unwrap();
+                        Ok(c)
+                    })
+                    .unwrap()
+            });
+            let kv_db_opts = cfg.rocksdb.build_opt();
+            let kv_cfs_opts = cfg.rocksdb.build_cf_opts();
+            let kv_db = rocksdb_util::new_engine_opt(kv_path, kv_db_opts, kv_cfs_opts).unwrap();
+
+            let raft_path = raft_db
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| format!("{}/../raft", kv_path));
+            let raft_db_opts = cfg.raftdb.build_opt();
+            let raft_db_cf_opts = cfg.raftdb.build_cf_opts();
+            let raft_db =
+                rocksdb_util::new_engine_opt(&raft_path, raft_db_opts, raft_db_cf_opts).unwrap();
+
+            Box::new(Debugger::new(Engines::new(
+                Arc::new(kv_db),
+                Arc::new(raft_db),
+            ))) as Box<DebugExecutor>
         }
         (Some(remote), None) => {
             let env = Arc::new(Environment::new(1));
-            let channel = ChannelBuilder::new(env).connect(remote);
+            let cb = ChannelBuilder::new(env);
+            let channel = mgr.connect(cb, remote);
             let client = DebugClient::new(channel);
             Box::new(client) as Box<DebugExecutor>
         }
@@ -150,9 +175,26 @@ trait DebugExecutor {
         println!("entry {:?}", entry);
         println!("msg len: {}", data.len());
 
-        let mut msg = RaftCmdRequest::new();
-        msg.merge_from_bytes(&data).unwrap();
-        println!("{:?}", msg);
+        if data.is_empty() {
+            return;
+        }
+
+        match entry.get_entry_type() {
+            EntryType::EntryNormal => {
+                let mut msg = RaftCmdRequest::new();
+                msg.merge_from_bytes(&data).unwrap();
+                println!("Normal: {:#?}", msg);
+            }
+            EntryType::EntryConfChange => {
+                let mut msg = ConfChange::new();
+                msg.merge_from_bytes(&data).unwrap();
+                let ctx = msg.take_context();
+                println!("ConfChange: {:?}", msg);
+                let mut cmd = RaftCmdRequest::new();
+                cmd.merge_from_bytes(&ctx).unwrap();
+                println!("ConfChange.RaftCmdRequest: {:#?}", cmd);
+            }
+        }
     }
 
     fn dump_mvccs_infos(
@@ -174,8 +216,8 @@ trait DebugExecutor {
             eprintln!("The region's from pos must greater than the to pos.");
             process::exit(-1);
         }
-        let scan_future = self.get_mvcc_infos(from, to, limit).for_each(
-            move |(key, mvcc)| {
+        let scan_future = self.get_mvcc_infos(from, to, limit)
+            .for_each(move |(key, mvcc)| {
                 println!("key: {}", escape(&key));
                 if cfs.contains(&CF_LOCK) && mvcc.has_lock() {
                     let lock_info = mvcc.get_lock();
@@ -193,18 +235,17 @@ trait DebugExecutor {
                 }
                 if cfs.contains(&CF_WRITE) {
                     for write_info in mvcc.get_writes() {
-                        if start_ts.map_or(true, |ts| write_info.get_start_ts() == ts) &&
-                            commit_ts.map_or(true, |ts| write_info.get_commit_ts() == ts)
+                        if start_ts.map_or(true, |ts| write_info.get_start_ts() == ts)
+                            && commit_ts.map_or(true, |ts| write_info.get_commit_ts() == ts)
                         {
                             // FIXME: short_value is lost in kvproto.
                             println!("\t write cf value: {:?}", write_info);
                         }
                     }
                 }
-                println!("");
+                println!();
                 future::ok::<(), String>(())
-            },
-        );
+            });
         if let Err(e) = scan_future.wait() {
             eprintln!("{}", e);
             process::exit(-1);
@@ -217,8 +258,10 @@ trait DebugExecutor {
         db: Option<&str>,
         raft_db: Option<&str>,
         host: Option<&str>,
+        cfg_path: Option<&str>,
+        mgr: Arc<SecurityManager>,
     ) {
-        let rhs_debug_executor = new_debug_executor(db, raft_db, host);
+        let rhs_debug_executor = new_debug_executor(db, raft_db, host, cfg_path, mgr);
 
         let r1 = self.get_region_info(region);
         let r2 = rhs_debug_executor.get_region_info(region);
@@ -312,8 +355,7 @@ trait DebugExecutor {
                 }
                 println!(
                     "db1 has {} keys, db2 has {} keys",
-                    key_counts[0],
-                    key_counts[1]
+                    key_counts[0], key_counts[1]
                 );
             }
         }
@@ -325,20 +367,33 @@ trait DebugExecutor {
         self.do_compact(db, cf, from, to);
     }
 
-    fn set_region_tombstone_after_remove_peer(&self, region_id: u64, endpoints: Vec<String>) {
+    fn print_bad_regions(&self);
+
+    fn set_region_tombstone_after_remove_peer(
+        &self,
+        mgr: Arc<SecurityManager>,
+        cfg: &PdConfig,
+        region_ids: Vec<u64>,
+    ) {
         self.check_local_mode();
-        match RpcClient::new(&endpoints)
-            .unwrap_or_else(|e| perror_and_exit("RpcClient::new", e))
-            .get_region_by_id(region_id)
-            .wait()
-            .unwrap_or_else(|e| perror_and_exit("Get region id from PD", e))
-        {
-            Some(region) => self.set_region_tombstone(region_id, region),
-            None => {
+        let rpc_client =
+            RpcClient::new(cfg, mgr).unwrap_or_else(|e| perror_and_exit("RpcClient::new", e));
+
+        let regions = region_ids
+            .into_iter()
+            .map(|region_id| {
+                if let Some(region) = rpc_client
+                    .get_region_by_id(region_id)
+                    .wait()
+                    .unwrap_or_else(|e| perror_and_exit("Get region id from PD", e))
+                {
+                    return region;
+                }
                 eprintln!("no such region in pd: {}", region_id);
                 process::exit(-1);
-            }
-        }
+            })
+            .collect();
+        self.set_region_tombstone(regions);
     }
 
     fn check_local_mode(&self);
@@ -362,9 +417,8 @@ trait DebugExecutor {
 
     fn do_compact(&self, db: DBType, cf: &str, from: Vec<u8>, to: Vec<u8>);
 
-    fn set_region_tombstone(&self, region_id: u64, region: Region);
+    fn set_region_tombstone(&self, regions: Vec<Region>);
 }
-
 
 impl DebugExecutor for DebugClient {
     fn check_local_mode(&self) {
@@ -381,7 +435,7 @@ impl DebugExecutor for DebugClient {
         req.set_db(DBType::KV);
         req.set_cf(cf.to_owned());
         req.set_key(key);
-        self.get(req)
+        self.get(&req)
             .unwrap_or_else(|e| perror_and_exit("DebugClient::get", e))
             .take_value()
     }
@@ -391,7 +445,7 @@ impl DebugExecutor for DebugClient {
         let mut req = RegionSizeRequest::new();
         req.set_cfs(RepeatedField::from_vec(cfs));
         req.set_region_id(region);
-        self.region_size(req)
+        self.region_size(&req)
             .unwrap_or_else(|e| perror_and_exit("DebugClient::region_size", e))
             .take_entries()
             .into_iter()
@@ -402,7 +456,7 @@ impl DebugExecutor for DebugClient {
     fn get_region_info(&self, region: u64) -> RegionInfo {
         let mut req = RegionInfoRequest::new();
         req.set_region_id(region);
-        let mut resp = self.region_info(req)
+        let mut resp = self.region_info(&req)
             .unwrap_or_else(|e| perror_and_exit("DebugClient::region_info", e));
 
         let mut region_info = RegionInfo::default();
@@ -422,7 +476,7 @@ impl DebugExecutor for DebugClient {
         let mut req = RaftLogRequest::new();
         req.set_region_id(region);
         req.set_log_index(index);
-        self.raft_log(req)
+        self.raft_log(&req)
             .unwrap_or_else(|e| perror_and_exit("DebugClient::raft_log", e))
             .take_entry()
     }
@@ -438,7 +492,8 @@ impl DebugExecutor for DebugClient {
         req.set_to_key(to);
         req.set_limit(limit);
         Box::new(
-            self.scan_mvcc(req)
+            self.scan_mvcc(&req)
+                .unwrap()
                 .map_err(|e| e.to_string())
                 .map(|mut resp| (resp.take_key(), resp.take_info())),
         ) as Box<Stream<Item = (Vec<u8>, MvccInfo), Error = String>>
@@ -450,13 +505,17 @@ impl DebugExecutor for DebugClient {
         req.set_cf(cf.to_owned());
         req.set_from_key(from);
         req.set_to_key(to);
-        self.compact(req)
+        self.compact(&req)
             .unwrap_or_else(|e| perror_and_exit("DebugClient::compact", e));
         println!("success!");
     }
 
-    fn set_region_tombstone(&self, _: u64, _: Region) {
-        unimplemented!();
+    fn set_region_tombstone(&self, _: Vec<Region>) {
+        unimplemented!("only avaliable for local mode");
+    }
+
+    fn print_bad_regions(&self) {
+        unimplemented!("only avaliable for local mode");
     }
 }
 
@@ -510,18 +569,35 @@ impl DebugExecutor for Debugger {
         println!("success!");
     }
 
-    fn set_region_tombstone(&self, region_id: u64, region: Region) {
-        self.set_region_tombstone(region_id, region)
-            .unwrap_or_else(|e| perror_and_exit("Debugger::set_region_tombstone", e))
+    fn set_region_tombstone(&self, regions: Vec<Region>) {
+        let ret = self.set_region_tombstone(regions)
+            .unwrap_or_else(|e| perror_and_exit("Debugger::set_region_tombstone", e));
+        if ret.is_empty() {
+            println!("success!");
+            return;
+        }
+        for (region_id, error) in ret {
+            eprintln!("region: {}, error: {}", region_id, error);
+        }
+    }
+
+    fn print_bad_regions(&self) {
+        let bad_regions = self.bad_regions()
+            .unwrap_or_else(|e| perror_and_exit("Debugger::bad_regions", e));
+        if !bad_regions.is_empty() {
+            for (region_id, error) in bad_regions {
+                println!("{}: {}", region_id, error);
+            }
+            return;
+        }
+        println!("all regions are healthy")
     }
 }
 
 fn main() {
     let mut app = App::new("TiKV Ctl")
         .author("PingCAP")
-        .about(
-            "Distributed transactional key value database powered by Rust and Raft",
-        )
+        .about("Distributed transactional key value database powered by Rust and Raft")
         .arg(
             Arg::with_name("db")
                 .required(true)
@@ -538,12 +614,40 @@ fn main() {
                 .help("set raft rocksdb path"),
         )
         .arg(
+            Arg::with_name("config")
+                .conflicts_with_all(&["host", "hex-to-escaped", "escaped-to-hex"])
+                .long("config")
+                .takes_value(true)
+                .help("set config for rocksdb"),
+        )
+        .arg(
             Arg::with_name("host")
                 .required(true)
-                .conflicts_with_all(&["db", "raftdb", "hex-to-escaped", "escaped-to-hex"])
+                .conflicts_with_all(&["db", "raftdb", "hex-to-escaped", "escaped-to-hex", "config"])
                 .long("host")
                 .takes_value(true)
                 .help("set remote host"),
+        )
+        .arg(
+            Arg::with_name("ca_path")
+                .required(false)
+                .long("ca-path")
+                .takes_value(true)
+                .help("set CA certificate path"),
+        )
+        .arg(
+            Arg::with_name("cert_path")
+                .required(false)
+                .long("cert-path")
+                .takes_value(true)
+                .help("set certificate path"),
+        )
+        .arg(
+            Arg::with_name("key_path")
+                .required(false)
+                .long("key-path")
+                .takes_value(true)
+                .help("set private key path"),
         )
         .arg(
             Arg::with_name("hex-to-escaped")
@@ -785,10 +889,14 @@ fn main() {
             SubCommand::with_name("tombstone")
                 .about("set a region on the node to tombstone by manual")
                 .arg(
-                    Arg::with_name("region")
+                    Arg::with_name("regions")
                         .required(true)
                         .short("r")
                         .takes_value(true)
+                        .multiple(true)
+                        .use_delimiter(true)
+                        .require_delimiter(true)
+                        .value_delimiter(",")
                         .help("the target region"),
                 )
                 .arg(
@@ -802,6 +910,9 @@ fn main() {
                         .value_delimiter(",")
                         .help("PD endpoints"),
                 ),
+        )
+        .subcommand(
+            SubCommand::with_name("bad-regions").about("get all regions with corrupt raft"),
         );
     let matches = app.clone().get_matches();
 
@@ -823,8 +934,10 @@ fn main() {
     let db = matches.value_of("db");
     let raft_db = matches.value_of("raftdb");
     let host = matches.value_of("host");
+    let cfg_path = matches.value_of("config");
 
-    let debug_executor = new_debug_executor(db, raft_db, host);
+    let mgr = new_security_mgr(&matches);
+    let debug_executor = new_debug_executor(db, raft_db, host, cfg_path, Arc::clone(&mgr));
 
     if let Some(matches) = matches.subcommand_matches("print") {
         let cf = matches.value_of("cf").unwrap();
@@ -875,7 +988,7 @@ fn main() {
         let region = matches.value_of("region").unwrap().parse().unwrap();
         let to_db = matches.value_of("to_db");
         let to_host = matches.value_of("to_host");
-        debug_executor.diff_region(region, to_db, None, to_host);
+        debug_executor.diff_region(region, to_db, None, to_host, cfg_path, mgr);
     } else if let Some(matches) = matches.subcommand_matches("compact") {
         let db = matches.value_of("db").unwrap();
         let db_type = if db == "kv" { DBType::KV } else { DBType::RAFT };
@@ -884,13 +997,24 @@ fn main() {
         let to_key = matches.value_of("to").map(|k| unescape(k));
         debug_executor.compact(db_type, cf, from_key, to_key);
     } else if let Some(matches) = matches.subcommand_matches("tombstone") {
-        let region = matches.value_of("region").unwrap().parse().unwrap();
+        let regions = matches
+            .values_of("regions")
+            .unwrap()
+            .map(|r| r.parse())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse regions fail");
         let pd_urls = Vec::from_iter(matches.values_of("pd").unwrap().map(|u| u.to_owned()));
-        debug_executor.set_region_tombstone_after_remove_peer(region, pd_urls);
+        let mut cfg = PdConfig::default();
+        cfg.endpoints = pd_urls;
+        if let Err(e) = cfg.validate() {
+            panic!("invalid pd configuration: {:?}", e);
+        }
+        debug_executor.set_region_tombstone_after_remove_peer(mgr, &cfg, regions);
+    } else if matches.subcommand_matches("bad-regions").is_some() {
+        debug_executor.print_bad_regions();
     } else {
         let _ = app.print_help();
     }
-
 }
 
 fn from_hex(key: &str) -> Vec<u8> {
@@ -922,4 +1046,23 @@ fn convert_gbmb(mut bytes: u64) -> String {
         format!("{} GB ", bytes)
     };
     format!("{}{}", gb, mb)
+}
+
+fn new_security_mgr(matches: &ArgMatches) -> Arc<SecurityManager> {
+    let ca_path = matches.value_of("ca_path");
+    let cert_path = matches.value_of("cert_path");
+    let key_path = matches.value_of("key_path");
+
+    let mut cfg = SecurityConfig::default();
+    if ca_path.is_none() && cert_path.is_none() && key_path.is_none() {
+        return Arc::new(SecurityManager::new(&cfg).unwrap());
+    }
+
+    if ca_path.is_none() || cert_path.is_none() || key_path.is_none() {
+        panic!("CA certificate and private key should all be set.");
+    }
+    cfg.ca_path = ca_path.unwrap().to_owned();
+    cfg.cert_path = cert_path.unwrap().to_owned();
+    cfg.key_path = key_path.unwrap().to_owned();
+    Arc::new(SecurityManager::new(&cfg).expect("failed to initialize security manager"))
 }

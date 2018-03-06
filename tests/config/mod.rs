@@ -17,11 +17,16 @@ use std::fs::File;
 
 use log::LogLevelFilter;
 use rocksdb::{CompactionPriority, DBCompressionType, DBRecoveryMode};
+use tikv::pd::Config as PdConfig;
 use tikv::server::Config as ServerConfig;
+use tikv::server::readpool::Config as ReadPoolConfig;
 use tikv::raftstore::store::Config as RaftstoreConfig;
+use tikv::raftstore::coprocessor::Config as CopConfig;
 use tikv::config::*;
 use tikv::storage::Config as StorageConfig;
+use tikv::import::Config as ImportConfig;
 use tikv::util::config::{ReadableDuration, ReadableSize};
+use tikv::util::security::SecurityConfig;
 
 use toml;
 
@@ -64,6 +69,22 @@ fn test_serde_custom_tikv_config() {
         end_point_concurrency: 12,
         end_point_max_tasks: 12,
         end_point_stack_size: ReadableSize::mb(12),
+        end_point_recursion_limit: 100,
+        end_point_stream_channel_size: 16,
+        end_point_batch_row_limit: 64,
+        end_point_stream_batch_row_limit: 4096,
+        end_point_request_max_handle_duration: ReadableDuration::secs(12),
+        snap_max_write_bytes_per_sec: ReadableSize::mb(10),
+        snap_max_total_size: ReadableSize::gb(10),
+    };
+    value.readpool = ReadPoolConfig {
+        high_concurrency: 1,
+        normal_concurrency: 3,
+        low_concurrency: 7,
+        max_tasks_high: 10000,
+        max_tasks_normal: 20000,
+        max_tasks_low: 30000,
+        stack_size: ReadableSize::mb(20),
     };
     value.metric = MetricConfig {
         interval: ReadableDuration::secs(12),
@@ -85,8 +106,6 @@ fn test_serde_custom_tikv_config() {
         raft_log_gc_count_limit: 12,
         raft_log_gc_size_limit: ReadableSize::kb(1),
         split_region_check_tick_interval: ReadableDuration::secs(12),
-        region_max_size: ReadableSize::mb(12),
-        region_split_size: ReadableSize::mb(12),
         region_split_check_diff: ReadableSize::mb(6),
         region_compact_check_interval: ReadableDuration::secs(12),
         region_compact_delete_keys_count: 1_234,
@@ -98,6 +117,7 @@ fn test_serde_custom_tikv_config() {
         messages_per_tick: 12_345,
         max_peer_down_duration: ReadableDuration::minutes(12),
         max_leader_missing_duration: ReadableDuration::hours(12),
+        abnormal_leader_missing_duration: ReadableDuration::hours(6),
         snap_apply_batch_size: ReadableSize::mb(12),
         lock_cf_compact_interval: ReadableDuration::minutes(12),
         lock_cf_compact_bytes_threshold: ReadableSize::mb(123),
@@ -106,6 +126,9 @@ fn test_serde_custom_tikv_config() {
         raft_store_max_leader_lease: ReadableDuration::secs(12),
         right_derive_when_split: false,
         allow_remove_leader: true,
+        use_delete_range: true,
+        region_max_size: ReadableSize(0),
+        region_split_size: ReadableSize(0),
     };
     value.pd = PdConfig {
         endpoints: vec!["example.com:443".to_owned()],
@@ -127,15 +150,16 @@ fn test_serde_custom_tikv_config() {
         info_log_roll_time: ReadableDuration::secs(12),
         info_log_dir: "/var".to_owned(),
         rate_bytes_per_sec: ReadableSize::kb(1),
-        wal_bytes_per_sync: ReadableSize::mb(1),
+        bytes_per_sync: ReadableSize::mb(1),
+        wal_bytes_per_sync: ReadableSize::kb(32),
         max_sub_compactions: 12,
         writable_file_max_buffer_size: ReadableSize::mb(12),
         use_direct_io_for_flush_and_compaction: true,
         enable_pipelined_write: false,
-        backup_dir: "/var".to_owned(),
         defaultcf: DefaultCfConfig {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: false,
             pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
@@ -162,10 +186,14 @@ fn test_serde_custom_tikv_config() {
             level0_stop_writes_trigger: 123,
             max_compaction_bytes: ReadableSize::gb(1),
             compaction_pri: CompactionPriority::MinOverlappingRatio,
+            dynamic_level_bytes: true,
+            num_levels: 4,
+            max_bytes_for_level_multiplier: 8,
         },
         writecf: WriteCfConfig {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: false,
             pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
@@ -192,10 +220,14 @@ fn test_serde_custom_tikv_config() {
             level0_stop_writes_trigger: 123,
             max_compaction_bytes: ReadableSize::gb(1),
             compaction_pri: CompactionPriority::MinOverlappingRatio,
+            dynamic_level_bytes: true,
+            num_levels: 4,
+            max_bytes_for_level_multiplier: 8,
         },
         lockcf: LockCfConfig {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: false,
             pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
@@ -222,10 +254,14 @@ fn test_serde_custom_tikv_config() {
             level0_stop_writes_trigger: 123,
             max_compaction_bytes: ReadableSize::gb(1),
             compaction_pri: CompactionPriority::MinOverlappingRatio,
+            dynamic_level_bytes: true,
+            num_levels: 4,
+            max_bytes_for_level_multiplier: 8,
         },
         raftcf: RaftCfConfig {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: false,
             pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
@@ -252,6 +288,9 @@ fn test_serde_custom_tikv_config() {
             level0_stop_writes_trigger: 123,
             max_compaction_bytes: ReadableSize::gb(1),
             compaction_pri: CompactionPriority::MinOverlappingRatio,
+            dynamic_level_bytes: true,
+            num_levels: 4,
+            max_bytes_for_level_multiplier: 8,
         },
     };
     value.raftdb = RaftDbConfig {
@@ -274,10 +313,12 @@ fn test_serde_custom_tikv_config() {
         use_direct_io_for_flush_and_compaction: true,
         enable_pipelined_write: false,
         allow_concurrent_memtable_write: true,
-        wal_bytes_per_sync: ReadableSize::mb(1),
+        bytes_per_sync: ReadableSize::mb(1),
+        wal_bytes_per_sync: ReadableSize::kb(32),
         defaultcf: RaftDefaultCfConfig {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
+            disable_block_cache: false,
             cache_index_and_filter_blocks: false,
             pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
@@ -304,17 +345,36 @@ fn test_serde_custom_tikv_config() {
             level0_stop_writes_trigger: 123,
             max_compaction_bytes: ReadableSize::gb(1),
             compaction_pri: CompactionPriority::MinOverlappingRatio,
+            dynamic_level_bytes: true,
+            num_levels: 4,
+            max_bytes_for_level_multiplier: 8,
         },
     };
     value.storage = StorageConfig {
         data_dir: "/var".to_owned(),
         gc_ratio_threshold: 1.2,
+        max_key_size: 8192,
         scheduler_notify_capacity: 123,
 
         scheduler_messages_per_tick: 123,
         scheduler_concurrency: 123,
         scheduler_worker_pool_size: 1,
         scheduler_pending_write_threshold: ReadableSize::kb(123),
+    };
+    value.coprocessor = CopConfig {
+        split_region_on_table: true,
+        region_max_size: ReadableSize::mb(12),
+        region_split_size: ReadableSize::mb(12),
+    };
+    value.security = SecurityConfig {
+        ca_path: "invalid path".to_owned(),
+        cert_path: "invalid path".to_owned(),
+        key_path: "invalid path".to_owned(),
+        override_ssl_target: "".to_owned(),
+    };
+    value.import = ImportConfig {
+        num_threads: 123,
+        stream_channel_window: 123,
     };
 
     let custom = read_file_in_project_dir("tests/config/test-custom.toml");

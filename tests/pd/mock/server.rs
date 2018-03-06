@@ -17,6 +17,7 @@ use futures::{Future, Sink, Stream};
 use grpc::{DuplexSink, EnvBuilder, RequestStream, RpcContext, RpcStatus, RpcStatusCode,
            Server as GrpcServer, ServerBuilder, UnarySink, WriteFlags};
 use tikv::pd::Error as PdError;
+use tikv::util::security::*;
 
 use kvproto::pdpb::*;
 use kvproto::pdpb_grpc::{self, Pd};
@@ -33,10 +34,12 @@ impl Server {
         C: PdMocker + Send + Sync + 'static,
     {
         let eps = vec![("127.0.0.1".to_owned(), 0); eps_count];
-        Server::run_with_eps(eps, handler, case)
+        let mgr = SecurityManager::new(&SecurityConfig::default()).unwrap();
+        Server::run_with_eps(&mgr, eps, handler, case)
     }
 
     pub fn run_with_eps<C>(
+        mgr: &SecurityManager,
         eps: Vec<(String, u16)>,
         handler: Arc<Service>,
         case: Option<Arc<C>>,
@@ -45,7 +48,7 @@ impl Server {
         C: PdMocker + Send + Sync + 'static,
     {
         let m = PdMock {
-            default_handler: handler.clone(),
+            default_handler: Arc::clone(&handler),
             case: case.clone(),
         };
         let service = pdpb_grpc::create_pd(m);
@@ -57,7 +60,7 @@ impl Server {
         );
         let mut sb = ServerBuilder::new(env).register_service(service);
         for (host, port) in eps {
-            sb = sb.bind(host, port);
+            sb = mgr.bind(sb, &host, port);
         }
 
         let mut server = sb.build().unwrap();
@@ -132,7 +135,7 @@ struct PdMock<C: PdMocker> {
 impl<C: PdMocker> Clone for PdMock<C> {
     fn clone(&self) -> Self {
         PdMock {
-            default_handler: self.default_handler.clone(),
+            default_handler: Arc::clone(&self.default_handler),
             case: self.case.clone(),
         }
     }
@@ -182,6 +185,15 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
         hijack_unary(self, ctx, sink, |c| c.put_store(&req))
     }
 
+    fn get_all_stores(
+        &self,
+        ctx: RpcContext,
+        req: GetAllStoresRequest,
+        sink: UnarySink<GetAllStoresResponse>,
+    ) {
+        hijack_unary(self, ctx, sink, |c| c.get_all_stores(&req))
+    }
+
     fn store_heartbeat(
         &self,
         ctx: RpcContext,
@@ -203,10 +215,11 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
                 stream
                     .map_err(PdError::from)
                     .and_then(move |req| {
-                        match mock.case.as_ref().map_or_else(
-                            || mock.default_handler.region_heartbeat(&req),
-                            |s| s.region_heartbeat(&req),
-                        ) {
+                        let resp = mock.case
+                            .as_ref()
+                            .and_then(|case| case.region_heartbeat(&req))
+                            .or_else(|| mock.default_handler.region_heartbeat(&req));
+                        match resp {
                             None => Ok(None),
                             Some(Ok(resp)) => Ok(Some((resp, WriteFlags::default()))),
                             Some(Err(e)) => Err(box_err!("{:?}", e)),
@@ -266,5 +279,14 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
         sink: UnarySink<PutClusterConfigResponse>,
     ) {
         hijack_unary(self, ctx, sink, |c| c.put_cluster_config(&req))
+    }
+
+    fn scatter_region(
+        &self,
+        ctx: RpcContext,
+        req: ScatterRegionRequest,
+        sink: UnarySink<ScatterRegionResponse>,
+    ) {
+        hijack_unary(self, ctx, sink, |c| c.scatter_region(&req))
     }
 }

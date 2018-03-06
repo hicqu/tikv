@@ -16,10 +16,10 @@ use std::borrow::Cow;
 use std::ops::{Add, Mul, Sub};
 use coprocessor::codec::{mysql, Datum};
 use coprocessor::codec::mysql::{Decimal, Res};
-use super::{Error, FnCall, Result, StatementContext};
+use super::{Error, EvalContext, FnCall, Result};
 
 impl FnCall {
-    pub fn plus_real(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<f64>> {
+    pub fn plus_real(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<f64>> {
         let lhs = try_opt!(self.children[0].eval_real(ctx, row));
         let rhs = try_opt!(self.children[1].eval_real(ctx, row));
         let res = lhs + rhs;
@@ -31,7 +31,7 @@ impl FnCall {
 
     pub fn plus_decimal<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Decimal>>> {
         let lhs = try_opt!(self.children[0].eval_decimal(ctx, row));
@@ -40,7 +40,7 @@ impl FnCall {
         result.map(|t| Some(Cow::Owned(t)))
     }
 
-    pub fn plus_int(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn plus_int(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         let lhs = try_opt!(self.children[0].eval_int(ctx, row));
         let rhs = try_opt!(self.children[1].eval_int(ctx, row));
         let lus = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
@@ -66,7 +66,7 @@ impl FnCall {
         res.ok_or(Error::Overflow).map(Some)
     }
 
-    pub fn minus_real(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<f64>> {
+    pub fn minus_real(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<f64>> {
         let lhs = try_opt!(self.children[0].eval_real(ctx, row));
         let rhs = try_opt!(self.children[1].eval_real(ctx, row));
         let res = lhs - rhs;
@@ -78,7 +78,7 @@ impl FnCall {
 
     pub fn minus_decimal<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Decimal>>> {
         let lhs = try_opt!(self.children[0].eval_decimal(ctx, row));
@@ -87,7 +87,7 @@ impl FnCall {
         result.map(Cow::Owned).map(Some)
     }
 
-    pub fn minus_int(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn minus_int(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         let lhs = try_opt!(self.children[0].eval_int(ctx, row));
         let rhs = try_opt!(self.children[1].eval_int(ctx, row));
         let lus = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
@@ -111,7 +111,7 @@ impl FnCall {
         res.ok_or(Error::Overflow).map(Some)
     }
 
-    pub fn multiply_real(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<f64>> {
+    pub fn multiply_real(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<f64>> {
         let lhs = try_opt!(self.children[0].eval_real(ctx, row));
         let rhs = try_opt!(self.children[1].eval_real(ctx, row));
         let res = lhs * rhs;
@@ -123,7 +123,7 @@ impl FnCall {
 
     pub fn multiply_decimal<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Decimal>>> {
         let lhs = try_opt!(self.children[0].eval_decimal(ctx, row));
@@ -132,15 +132,17 @@ impl FnCall {
         result.map(Cow::Owned).map(Some)
     }
 
-    pub fn multiply_int(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn multiply_int(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         let lhs = try_opt!(self.children[0].eval_int(ctx, row));
         let rhs = try_opt!(self.children[1].eval_int(ctx, row));
         let lus = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
         let rus = mysql::has_unsigned_flag(self.children[1].get_tp().get_flag());
-        let u64_mul_i64 = |u, s| if s >= 0 {
-            (u as u64).checked_mul(s as u64).map(|t| t as i64)
-        } else {
-            None
+        let u64_mul_i64 = |u, s| {
+            if s >= 0 {
+                (u as u64).checked_mul(s as u64).map(|t| t as i64)
+            } else {
+                None
+            }
         };
         let res = match (lus, rus) {
             (true, true) => (lhs as u64).checked_mul(rhs as u64).map(|t| t as i64),
@@ -151,7 +153,7 @@ impl FnCall {
         res.ok_or(Error::Overflow).map(Some)
     }
 
-    pub fn divide_real(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<f64>> {
+    pub fn divide_real(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<f64>> {
         let lhs = try_opt!(self.children[0].eval_real(ctx, row));
         let rhs = try_opt!(self.children[1].eval_real(ctx, row));
         if rhs == 0f64 {
@@ -167,7 +169,7 @@ impl FnCall {
 
     pub fn divide_decimal<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Decimal>>> {
         let lhs = try_opt!(self.children[0].eval_decimal(ctx, row));
@@ -188,9 +190,8 @@ mod test {
     use tipb::expression::ScalarFuncSig;
     use coprocessor::codec::{mysql, Datum};
     use coprocessor::codec::mysql::types;
-    use coprocessor::dag::expr::{Expression, StatementContext};
-    use coprocessor::dag::expr::test::{check_overflow, fncall_expr, str2dec};
-    use coprocessor::select::xeval::evaluator::test::datum_expr;
+    use coprocessor::dag::expr::{EvalContext, Expression};
+    use coprocessor::dag::expr::test::{check_overflow, datum_expr, fncall_expr, str2dec};
 
     #[test]
     fn test_arithmetic_int() {
@@ -244,7 +245,7 @@ mod test {
                 Datum::I64(i64::MIN),
             ),
         ];
-        let ctx = StatementContext::default();
+        let ctx = EvalContext::default();
         for tt in tests {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
@@ -322,7 +323,7 @@ mod test {
                //     Datum::F64(41f64)
                // )
         ];
-        let ctx = StatementContext::default();
+        let ctx = EvalContext::default();
         for tt in tests {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
@@ -385,7 +386,7 @@ mod test {
                 Datum::Null,
             ),
         ];
-        let ctx = StatementContext::default();
+        let ctx = EvalContext::default();
         for tt in tests {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
@@ -439,7 +440,7 @@ mod test {
                 Datum::U64(1),
             ),
         ];
-        let ctx = StatementContext::default();
+        let ctx = EvalContext::default();
         for tt in tests {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
@@ -483,7 +484,7 @@ mod test {
                 Datum::F64(0.00001),
             ),
         ];
-        let ctx = StatementContext::default();
+        let ctx = EvalContext::default();
         for tt in tests {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);

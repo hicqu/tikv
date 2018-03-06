@@ -30,7 +30,8 @@ use kvproto::pdpb::{ErrorType, GetMembersRequest, GetMembersResponse, Member,
 use kvproto::pdpb_grpc::PdClient;
 
 use util::{Either, HandyRwLock};
-use super::{Error, PdFuture, Result, REQUEST_TIMEOUT};
+use util::security::SecurityManager;
+use super::{Config, Error, PdFuture, Result, REQUEST_TIMEOUT};
 
 pub struct Inner {
     env: Arc<Environment>,
@@ -41,6 +42,8 @@ pub struct Inner {
     pub hb_receiver: Either<Option<ClientDuplexReceiver<RegionHeartbeatResponse>>, Task>,
     pub client: PdClient,
     members: GetMembersResponse,
+    security_mgr: Arc<SecurityManager>,
+    on_reconnect: Option<Box<Fn() + Sync + Send + 'static>>,
 
     last_update: Instant,
 }
@@ -73,6 +76,7 @@ impl Stream for HeartbeatReceiver {
                 receiver = recv.take();
             }
             if receiver.is_some() {
+                info!("heartbeat receiver is refreshed.");
                 self.receiver = receiver;
             } else {
                 inner.hb_receiver = Either::Right(task::current());
@@ -91,10 +95,11 @@ pub struct LeaderClient {
 impl LeaderClient {
     pub fn new(
         env: Arc<Environment>,
+        security_mgr: Arc<SecurityManager>,
         client: PdClient,
         members: GetMembersResponse,
     ) -> LeaderClient {
-        let (tx, rx) = client.region_heartbeat();
+        let (tx, rx) = client.region_heartbeat().unwrap();
         LeaderClient {
             timer: Timer::default(),
             inner: Arc::new(RwLock::new(Inner {
@@ -103,6 +108,8 @@ impl LeaderClient {
                 hb_receiver: Either::Left(Some(rx)),
                 client: client,
                 members: members,
+                security_mgr: security_mgr,
+                on_reconnect: None,
 
                 last_update: Instant::now(),
             })),
@@ -115,14 +122,17 @@ impl LeaderClient {
     {
         let recv = HeartbeatReceiver {
             receiver: None,
-            inner: self.inner.clone(),
+            inner: Arc::clone(&self.inner),
         };
-        Box::new(
-            recv.for_each(move |resp| {
-                f(resp);
-                Ok(())
-            }).map_err(|e| panic!("unexpected error: {:?}", e)),
-        )
+        Box::new(recv.for_each(move |resp| {
+            f(resp);
+            Ok(())
+        }).map_err(|e| panic!("unexpected error: {:?}", e)))
+    }
+
+    pub fn on_reconnect(&self, f: Box<Fn() + Sync + Send + 'static>) {
+        let mut inner = self.inner.wl();
+        inner.on_reconnect = Some(f);
     }
 
     pub fn request<Req, Resp, F>(&self, req: Req, f: F, retry: usize) -> Request<Req, Resp, F>
@@ -135,7 +145,7 @@ impl LeaderClient {
             request_sent: 0,
             client: LeaderClient {
                 timer: self.timer.clone(),
-                inner: self.inner.clone(),
+                inner: Arc::clone(&self.inner),
             },
             req: req,
             resp: None,
@@ -158,14 +168,21 @@ impl LeaderClient {
 
             let start = Instant::now();
             (
-                try_connect_leader(inner.env.clone(), &inner.members)?,
+                try_connect_leader(Arc::clone(&inner.env), &inner.security_mgr, &inner.members)?,
                 start,
             )
         };
 
         {
             let mut inner = self.inner.wl();
-            let (tx, rx) = client.region_heartbeat();
+            let (tx, rx) = client.region_heartbeat().unwrap();
+            warn!("heartbeat sender and receiver are stale, refreshing..");
+
+            // Try to cancel an unused heartbeat sender.
+            if let Either::Left(Some(ref mut r)) = inner.hb_sender {
+                info!("cancel region heartbeat sender");
+                r.cancel();
+            }
             inner.hb_sender = Either::Left(Some(tx));
             if let Either::Right(ref mut task) = inner.hb_receiver {
                 task.notify();
@@ -174,13 +191,16 @@ impl LeaderClient {
             inner.client = client;
             inner.members = members;
             inner.last_update = Instant::now();
+            if let Some(ref on_reconnect) = inner.on_reconnect {
+                on_reconnect();
+            }
         }
         warn!("updating PD client done, spent {:?}", start.elapsed());
         Ok(())
     }
 }
 
-const RECONNECT_INTERVAL_SEC: u64 = 1; // 1s
+pub const RECONNECT_INTERVAL_SEC: u64 = 1; // 1s
 
 /// The context of sending requets.
 pub struct Request<Req, Resp, F> {
@@ -285,7 +305,9 @@ where
     F: Fn(&PdClient) -> GrpcResult<R>,
 {
     for _ in 0..retry {
-        match func(&client.inner.rl().client).map_err(Error::Grpc) {
+        // DO NOT put any lock operation in match statement, or it will cause dead lock!
+        let ret = { func(&client.inner.rl().client).map_err(Error::Grpc) };
+        match ret {
             Ok(r) => {
                 return Ok(r);
             }
@@ -303,23 +325,20 @@ where
 
 pub fn validate_endpoints(
     env: Arc<Environment>,
-    endpoints: &[String],
+    cfg: &Config,
+    security_mgr: &SecurityManager,
 ) -> Result<(PdClient, GetMembersResponse)> {
-    if endpoints.is_empty() {
-        return Err(box_err!("empty PD endpoints"));
-    }
-
-    let len = endpoints.len();
+    let len = cfg.endpoints.len();
     let mut endpoints_set = HashSet::with_capacity(len);
 
     let mut members = None;
     let mut cluster_id = None;
-    for ep in endpoints {
+    for ep in &cfg.endpoints {
         if !endpoints_set.insert(ep) {
             return Err(box_err!("duplicate PD endpoint {}", ep));
         }
 
-        let (_, resp) = match connect(env.clone(), ep) {
+        let (_, resp) = match connect(Arc::clone(&env), security_mgr, ep) {
             Ok(resp) => resp,
             // Ignore failed PD node.
             Err(e) => {
@@ -350,21 +369,27 @@ pub fn validate_endpoints(
 
     match members {
         Some(members) => {
-            let (client, members) = try_connect_leader(env.clone(), &members)?;
-            info!("All PD endpoints are consistent: {:?}", endpoints);
+            let (client, members) = try_connect_leader(Arc::clone(&env), security_mgr, &members)?;
+            info!("All PD endpoints are consistent: {:?}", cfg.endpoints);
             Ok((client, members))
         }
         _ => Err(box_err!("PD cluster failed to respond")),
     }
 }
 
-fn connect(env: Arc<Environment>, addr: &str) -> Result<(PdClient, GetMembersResponse)> {
-    debug!("connect to PD endpoint: {:?}", addr);
-    let addr = addr.trim_left_matches("http://");
-    let channel = ChannelBuilder::new(env).connect(addr);
+fn connect(
+    env: Arc<Environment>,
+    security_mgr: &SecurityManager,
+    addr: &str,
+) -> Result<(PdClient, GetMembersResponse)> {
+    info!("connect to PD endpoint: {:?}", addr);
+    let addr = addr.trim_left_matches("http://")
+        .trim_left_matches("https://");
+    let cb = ChannelBuilder::new(env);
+    let channel = security_mgr.connect(cb, addr);
     let client = PdClient::new(channel);
     let option = CallOption::default().timeout(Duration::from_secs(REQUEST_TIMEOUT));
-    match client.get_members_opt(GetMembersRequest::new(), option) {
+    match client.get_members_opt(&GetMembersRequest::new(), option) {
         Ok(resp) => Ok((client, resp)),
         Err(e) => Err(Error::Grpc(e)),
     }
@@ -372,6 +397,7 @@ fn connect(env: Arc<Environment>, addr: &str) -> Result<(PdClient, GetMembersRes
 
 pub fn try_connect_leader(
     env: Arc<Environment>,
+    security_mgr: &SecurityManager,
     previous: &GetMembersResponse,
 ) -> Result<(PdClient, GetMembersResponse)> {
     let previous_leader = previous.get_leader();
@@ -385,7 +411,7 @@ pub fn try_connect_leader(
         .chain(&[previous_leader.clone()])
     {
         for ep in m.get_client_urls() {
-            match connect(env.clone(), ep.as_str()) {
+            match connect(Arc::clone(&env), security_mgr, ep.as_str()) {
                 Ok((_, r)) => {
                     let new_cluster_id = r.get_header().get_cluster_id();
                     if new_cluster_id == cluster_id {
@@ -394,9 +420,7 @@ pub fn try_connect_leader(
                     } else {
                         panic!(
                             "{} no longer belongs to cluster {}, it is in {}",
-                            ep,
-                            cluster_id,
-                            new_cluster_id
+                            ep, cluster_id, new_cluster_id
                         );
                     }
                 }
@@ -412,7 +436,7 @@ pub fn try_connect_leader(
     if let Some(resp) = resp {
         let leader = resp.get_leader().clone();
         for ep in leader.get_client_urls() {
-            if let Ok((client, _)) = connect(env.clone(), ep.as_str()) {
+            if let Ok((client, _)) = connect(Arc::clone(&env), security_mgr, ep.as_str()) {
                 info!("connect to PD leader {:?}", ep);
                 return Ok((client, resp));
             }

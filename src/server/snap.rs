@@ -12,7 +12,6 @@
 // limitations under the License.
 
 use std::fmt::{self, Display, Formatter};
-use std::net::SocketAddr;
 use std::boxed::FnBox;
 use std::time::Instant;
 use std::sync::{Arc, RwLock};
@@ -29,6 +28,7 @@ use raftstore::store::{SnapEntry, SnapKey, SnapManager, Snapshot};
 use util::threadpool::{DefaultContext, ThreadPool, ThreadPoolBuilder};
 use util::worker::Runnable;
 use util::buf::PipeBuffer;
+use util::security::SecurityManager;
 use util::collections::{HashMap, HashMapEntry as Entry};
 use util::HandyRwLock;
 
@@ -53,7 +53,7 @@ pub enum Task {
     Close(Token),
     Discard(Token),
     SendTo {
-        addr: SocketAddr,
+        addr: String,
         msg: RaftMessage,
         cb: Callback,
     },
@@ -90,14 +90,16 @@ impl Stream for SnapChunk {
             n if n > SNAP_CHUNK_LEN => vec![0; SNAP_CHUNK_LEN],
             n => vec![0; n],
         };
-        match self.snap.wl().read_exact(buf.as_mut_slice()) {
+        let result = self.snap.wl().read_exact(buf.as_mut_slice());
+        match result {
             Ok(_) => {
                 self.remain_bytes -= buf.len();
                 let mut chunk = SnapshotChunk::new();
                 chunk.set_data(buf);
-                Ok(Async::Ready(
-                    Some((chunk, WriteFlags::default().buffer_hint(true))),
-                ))
+                Ok(Async::Ready(Some((
+                    chunk,
+                    WriteFlags::default().buffer_hint(true),
+                ))))
             }
             Err(e) => Err(box_err!("failed to read snapshot chunk: {}", e)),
         }
@@ -110,7 +112,8 @@ impl Stream for SnapChunk {
 fn send_snap(
     env: Arc<Environment>,
     mgr: SnapManager,
-    addr: SocketAddr,
+    security_mgr: Arc<SecurityManager>,
+    addr: &str,
     msg: RaftMessage,
 ) -> Result<()> {
     assert!(msg.get_message().has_snapshot());
@@ -137,7 +140,7 @@ fn send_snap(
 
     let chunks = {
         let snap_chunk = SnapChunk {
-            snap: s.clone(),
+            snap: Arc::clone(&s),
             remain_bytes: total_size as usize,
         };
         let first: Once<(SnapshotChunk, _), Error> = stream::once({
@@ -148,9 +151,10 @@ fn send_snap(
         first.chain(snap_chunk)
     };
 
-    let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
+    let cb = ChannelBuilder::new(env);
+    let channel = security_mgr.connect(cb, addr);
     let client = TikvClient::new(channel);
-    let (sink, receiver) = client.snapshot();
+    let (sink, receiver) = client.snapshot()?;
     let send = chunks.forward(sink);
     let res = send.and_then(|_| receiver.map_err(Error::from))
         .and_then(|_| {
@@ -177,10 +181,16 @@ pub struct Runner<R: RaftStoreRouter + 'static> {
     files: HashMap<Token, (Box<Snapshot>, RaftMessage)>,
     pool: ThreadPool<DefaultContext>,
     raft_router: R,
+    security_mgr: Arc<SecurityManager>,
 }
 
 impl<R: RaftStoreRouter + 'static> Runner<R> {
-    pub fn new(env: Arc<Environment>, snap_mgr: SnapManager, r: R) -> Runner<R> {
+    pub fn new(
+        env: Arc<Environment>,
+        snap_mgr: SnapManager,
+        r: R,
+        security_mgr: Arc<SecurityManager>,
+    ) -> Runner<R> {
         Runner {
             env: env,
             snap_mgr: snap_mgr,
@@ -189,6 +199,7 @@ impl<R: RaftStoreRouter + 'static> Runner<R> {
                 .thread_count(DEFAULT_SENDER_POOL_SIZE)
                 .build(),
             raft_router: r,
+            security_mgr: security_mgr,
         }
     }
 }
@@ -228,8 +239,7 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                     Err(e) => {
                         error!(
                             "failed to create snapshot file for token {:?}: {:?}",
-                            token,
-                            e
+                            token, e
                         );
                         return;
                     }
@@ -290,10 +300,11 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
             }
             Task::SendTo { addr, msg, cb } => {
                 SNAP_TASK_COUNTER.with_label_values(&["send"]).inc();
-                let env = self.env.clone();
+                let env = Arc::clone(&self.env);
                 let mgr = self.snap_mgr.clone();
+                let security_mgr = Arc::clone(&self.security_mgr);
                 self.pool.execute(move |_| {
-                    let res = send_snap(env, mgr, addr, msg);
+                    let res = send_snap(env, mgr, security_mgr, &addr, msg);
                     if res.is_err() {
                         error!("failed to send snap to {}: {:?}", addr, res);
                     }

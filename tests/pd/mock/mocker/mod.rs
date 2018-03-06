@@ -60,6 +60,10 @@ pub trait PdMocker {
         None
     }
 
+    fn get_all_stores(&self, _: &GetAllStoresRequest) -> Option<Result<GetAllStoresResponse>> {
+        None
+    }
+
     fn store_heartbeat(&self, _: &StoreHeartbeatRequest) -> Option<Result<StoreHeartbeatResponse>> {
         None
     }
@@ -98,6 +102,10 @@ pub trait PdMocker {
         &self,
         _: &PutClusterConfigRequest,
     ) -> Option<Result<PutClusterConfigResponse>> {
+        None
+    }
+
+    fn scatter_region(&self, _: &ScatterRegionRequest) -> Option<Result<ScatterRegionResponse>> {
         None
     }
 

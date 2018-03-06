@@ -17,23 +17,23 @@
 use tipb::executor::Limit;
 
 use coprocessor::Result;
-use coprocessor::metrics::*;
-
-use super::{Executor, Row};
+use coprocessor::dag::executor::{Executor, Row};
+use super::ExecutorMetrics;
 
 pub struct LimitExecutor<'a> {
     limit: u64,
     cursor: u64,
-    src: Box<Executor + 'a>,
+    src: Box<Executor + Send + 'a>,
+    first_collect: bool,
 }
 
 impl<'a> LimitExecutor<'a> {
-    pub fn new(limit: Limit, src: Box<Executor + 'a>) -> LimitExecutor {
-        COPR_EXECUTOR_COUNT.with_label_values(&["limit"]).inc();
+    pub fn new(limit: Limit, src: Box<Executor + Send + 'a>) -> LimitExecutor {
         LimitExecutor {
             limit: limit.get_limit(),
             cursor: 0,
             src: src,
+            first_collect: true,
         }
     }
 }
@@ -50,6 +50,18 @@ impl<'a> Executor for LimitExecutor<'a> {
             Ok(None)
         }
     }
+
+    fn collect_output_counts(&mut self, _: &mut Vec<i64>) {
+        // We do not know whether `limit` has consumed all of it's source, so just ignore it.
+    }
+
+    fn collect_metrics_into(&mut self, metrics: &mut ExecutorMetrics) {
+        self.src.collect_metrics_into(metrics);
+        if self.first_collect {
+            metrics.executor_count.limit += 1;
+            self.first_collect = false;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -60,7 +72,7 @@ mod test {
 
     use coprocessor::codec::mysql::types;
     use coprocessor::codec::datum::Datum;
-    use storage::{SnapshotStore, Statistics};
+    use storage::SnapshotStore;
 
     use super::*;
     use super::super::table_scan::TableScanExecutor;
@@ -97,8 +109,7 @@ mod test {
         // init TableScan
         let (snapshot, start_ts) = test_store.get_snapshot();
         let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
-        let mut statistics = Statistics::default();
-        let ts_ect = TableScanExecutor::new(&table_scan, key_ranges, store, &mut statistics);
+        let ts_ect = TableScanExecutor::new(&table_scan, key_ranges, store).unwrap();
 
         // init Limit meta
         let mut limit_meta = Limit::default();

@@ -11,7 +11,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use prometheus::local::LocalHistogram;
 
 use super::metrics::*;
@@ -309,7 +308,6 @@ impl RaftProposeMetrics {
     }
 }
 
-
 /// The buffered metrics counters for raft.
 #[derive(Clone)]
 pub struct RaftMetrics {
@@ -320,6 +318,7 @@ pub struct RaftMetrics {
     pub process_tick: LocalHistogram,
     pub process_ready: LocalHistogram,
     pub append_log: LocalHistogram,
+    pub leader_missing: usize,
 }
 
 impl Default for RaftMetrics {
@@ -336,6 +335,7 @@ impl Default for RaftMetrics {
                 .with_label_values(&["ready"])
                 .local(),
             append_log: PEER_APPEND_LOG_HISTOGRAM.local(),
+            leader_missing: 0,
         }
     }
 }
@@ -350,5 +350,6 @@ impl RaftMetrics {
         self.process_ready.flush();
         self.append_log.flush();
         self.message_dropped.flush();
+        LEADER_MISSING.set(self.leader_missing as f64);
     }
 }

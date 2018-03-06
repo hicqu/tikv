@@ -11,15 +11,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{char, str, i64};
-use std::str::Chars;
+use std::i64;
+use std::slice::Iter;
 use std::cmp::Ordering;
 use std::borrow::Cow;
 
 use coprocessor::codec::{datum, mysql, Datum};
 use coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
 use coprocessor::dag::expr::Expression;
-use super::{Error, FnCall, Result, StatementContext};
+use super::{Error, EvalContext, FnCall, Result};
 
 const MAX_RECURSE_LEVEL: usize = 1024;
 
@@ -35,12 +35,7 @@ pub enum CmpOp {
 }
 
 impl FnCall {
-    pub fn compare_int(
-        &self,
-        ctx: &StatementContext,
-        row: &[Datum],
-        op: CmpOp,
-    ) -> Result<Option<i64>> {
+    pub fn compare_int(&self, ctx: &EvalContext, row: &[Datum], op: CmpOp) -> Result<Option<i64>> {
         let e = |i: usize| self.children[i].eval_int(ctx, row);
         do_compare(e, op, |l, r| {
             let lhs_unsigned = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
@@ -49,12 +44,7 @@ impl FnCall {
         })
     }
 
-    pub fn compare_real(
-        &self,
-        ctx: &StatementContext,
-        row: &[Datum],
-        op: CmpOp,
-    ) -> Result<Option<i64>> {
+    pub fn compare_real(&self, ctx: &EvalContext, row: &[Datum], op: CmpOp) -> Result<Option<i64>> {
         do_compare(
             |i| self.children[i].eval_real(ctx, row),
             op,
@@ -64,7 +54,7 @@ impl FnCall {
 
     pub fn compare_decimal(
         &self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &[Datum],
         op: CmpOp,
     ) -> Result<Option<i64>> {
@@ -74,7 +64,7 @@ impl FnCall {
 
     pub fn compare_string(
         &self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &[Datum],
         op: CmpOp,
     ) -> Result<Option<i64>> {
@@ -82,19 +72,14 @@ impl FnCall {
         do_compare(e, op, |l, r| Ok(l.cmp(&r)))
     }
 
-    pub fn compare_time(
-        &self,
-        ctx: &StatementContext,
-        row: &[Datum],
-        op: CmpOp,
-    ) -> Result<Option<i64>> {
+    pub fn compare_time(&self, ctx: &EvalContext, row: &[Datum], op: CmpOp) -> Result<Option<i64>> {
         let e = |i: usize| self.children[i].eval_time(ctx, row);
         do_compare(e, op, |l, r| Ok(l.cmp(&r)))
     }
 
     pub fn compare_duration(
         &self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &[Datum],
         op: CmpOp,
     ) -> Result<Option<i64>> {
@@ -102,28 +87,23 @@ impl FnCall {
         do_compare(e, op, |l, r| Ok(l.cmp(&r)))
     }
 
-    pub fn compare_json(
-        &self,
-        ctx: &StatementContext,
-        row: &[Datum],
-        op: CmpOp,
-    ) -> Result<Option<i64>> {
+    pub fn compare_json(&self, ctx: &EvalContext, row: &[Datum], op: CmpOp) -> Result<Option<i64>> {
         let e = |i: usize| self.children[i].eval_json(ctx, row);
         do_compare(e, op, |l, r| Ok(l.cmp(&r)))
     }
 
     /// See http://dev.mysql.com/doc/refman/5.7/en/comparison-operators.html#function_coalesce
-    pub fn coalesce_int(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn coalesce_int(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         do_coalesce(self, |v| v.eval_int(ctx, row))
     }
 
-    pub fn coalesce_real(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<f64>> {
+    pub fn coalesce_real(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<f64>> {
         do_coalesce(self, |v| v.eval_real(ctx, row))
     }
 
     pub fn coalesce_decimal<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Decimal>>> {
         do_coalesce(self, |v| v.eval_decimal(ctx, row))
@@ -131,7 +111,7 @@ impl FnCall {
 
     pub fn coalesce_time<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Time>>> {
         do_coalesce(self, |v| v.eval_time(ctx, row))
@@ -139,7 +119,7 @@ impl FnCall {
 
     pub fn coalesce_duration<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Duration>>> {
         do_coalesce(self, |v| v.eval_duration(ctx, row))
@@ -147,7 +127,7 @@ impl FnCall {
 
     pub fn coalesce_string<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, [u8]>>> {
         do_coalesce(self, |v| v.eval_string(ctx, row))
@@ -155,13 +135,13 @@ impl FnCall {
 
     pub fn coalesce_json<'a, 'b: 'a>(
         &'b self,
-        ctx: &StatementContext,
+        ctx: &EvalContext,
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Json>>> {
         do_coalesce(self, |v| v.eval_json(ctx, row))
     }
 
-    pub fn in_int(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn in_int(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         do_in(
             self,
             |v| v.eval_int(ctx, row),
@@ -178,7 +158,7 @@ impl FnCall {
         )
     }
 
-    pub fn in_real(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn in_real(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         do_in(
             self,
             |v| v.eval_real(ctx, row),
@@ -186,35 +166,34 @@ impl FnCall {
         )
     }
 
-    pub fn in_decimal(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn in_decimal(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         do_in(self, |v| v.eval_decimal(ctx, row), |l, r| Ok(l.cmp(r)))
     }
 
-    pub fn in_time(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn in_time(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         do_in(self, |v| v.eval_time(ctx, row), |l, r| Ok(l.cmp(r)))
     }
 
-    pub fn in_duration(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn in_duration(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         do_in(self, |v| v.eval_duration(ctx, row), |l, r| Ok(l.cmp(r)))
     }
 
-    pub fn in_string(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn in_string(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         do_in(self, |v| v.eval_string(ctx, row), |l, r| Ok(l.cmp(r)))
     }
 
-    pub fn in_json(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+    pub fn in_json(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         do_in(self, |v| v.eval_json(ctx, row), |l, r| Ok(l.cmp(r)))
     }
 
-    #[inline]
-    pub fn like(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
-        let target = try_opt!(self.children[0].eval_string_and_decode(ctx, row));
-        let pattern = try_opt!(self.children[1].eval_string_and_decode(ctx, row));
-        let escape = {
-            let c = try_opt!(self.children[2].eval_int(ctx, row)) as u32;
-            char::from_u32(c)
-                .ok_or::<Error>(box_err!("invalid escape char: {}", c))?
-        };
+    /// NOTE: LIKE compare target with pattern as bytes, even if they have different
+    /// charsets. This behaviour is for keeping compatible with TiDB. But MySQL
+    /// compare them as bytes only if any charset of pattern or target is binary,
+    /// otherwise MySQL will compare decoded string.
+    pub fn like(&self, ctx: &EvalContext, row: &[Datum]) -> Result<Option<i64>> {
+        let target = try_opt!(self.children[0].eval_string(ctx, row));
+        let pattern = try_opt!(self.children[1].eval_string(ctx, row));
+        let escape = try_opt!(self.children[2].eval_int(ctx, row)) as u32;
         Ok(Some(like(&target, &pattern, escape, 0)? as i64))
     }
 }
@@ -314,22 +293,22 @@ where
 
 // Do match until '%' is found.
 #[inline]
-fn partial_like<'a>(tcs: &mut Chars<'a>, pcs: &mut Chars<'a>, escape: char) -> Option<bool> {
+fn partial_like(tcs: &mut Iter<u8>, pcs: &mut Iter<u8>, escape: u32) -> Option<bool> {
     loop {
-        match pcs.next() {
+        match pcs.next().cloned() {
             None => return Some(tcs.next().is_none()),
-            Some('%') => return None,
+            Some(b'%') => return None,
             Some(c) => {
-                let (npc, escape) = if c == escape {
-                    pcs.next().map_or((c, false), |c| (c, true))
+                let (npc, escape) = if u32::from(c) == escape {
+                    pcs.next().map_or((c, false), |&c| (c, true))
                 } else {
                     (c, false)
                 };
                 let nsc = match tcs.next() {
                     None => return Some(false),
-                    Some(c) => c,
+                    Some(&c) => c,
                 };
-                if nsc != npc && (npc != '_' || escape) {
+                if nsc != npc && (npc != b'_' || escape) {
                     return Some(false);
                 }
             }
@@ -337,26 +316,26 @@ fn partial_like<'a>(tcs: &mut Chars<'a>, pcs: &mut Chars<'a>, escape: char) -> O
     }
 }
 
-fn like(target: &str, pattern: &str, escape: char, recurse_level: usize) -> Result<bool> {
-    let mut tcs = target.chars();
-    let mut pcs = pattern.chars();
+fn like(target: &[u8], pattern: &[u8], escape: u32, recurse_level: usize) -> Result<bool> {
+    let mut tcs = target.iter();
+    let mut pcs = pattern.iter();
     loop {
         if let Some(res) = partial_like(&mut tcs, &mut pcs, escape) {
             return Ok(res);
         }
         let next_char = loop {
-            match pcs.next() {
-                Some('%') => {}
-                Some('_') => if tcs.next().is_none() {
+            match pcs.next().cloned() {
+                Some(b'%') => {}
+                Some(b'_') => if tcs.next().is_none() {
                     return Ok(false);
                 },
                 // So the pattern should be some thing like 'xxx%'
                 None => return Ok(true),
                 Some(c) => {
-                    break if c == escape {
-                        pcs.next().unwrap_or(escape)
+                    break if u32::from(c) == escape {
+                        pcs.next().map_or(escape, |&c| u32::from(c))
                     } else {
-                        c
+                        u32::from(c)
                     };
                 }
             }
@@ -372,9 +351,9 @@ fn like(target: &str, pattern: &str, escape: char, recurse_level: usize) -> Resu
         loop {
             let s = match tcs.next() {
                 None => return Ok(false),
-                Some(s) => s,
+                Some(&s) => u32::from(s),
             };
-            if s == next_char && like(tcs.as_str(), pcs.as_str(), escape, recurse_level + 1)? {
+            if s == next_char && like(tcs.as_slice(), pcs.as_slice(), escape, recurse_level + 1)? {
                 return Ok(true);
             }
         }
@@ -386,11 +365,10 @@ mod test {
     use std::{i64, u64};
     use tipb::expression::{Expr, ExprType, ScalarFuncSig};
     use protobuf::RepeatedField;
-    use coprocessor::select::xeval::evaluator::test::{col_expr, datum_expr};
     use coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
     use coprocessor::codec::Datum;
-    use coprocessor::dag::expr::{Expression, StatementContext};
-    use coprocessor::dag::expr::test::fncall_expr;
+    use coprocessor::dag::expr::{EvalContext, Expression};
+    use coprocessor::dag::expr::test::{col_expr, datum_expr, fncall_expr};
     use super::*;
 
     #[test]
@@ -480,7 +458,7 @@ mod test {
             ),
         ];
 
-        let ctx = StatementContext::default();
+        let ctx = EvalContext::default();
 
         for (sig, row, exp) in cases {
             let children: Vec<Expr> = (0..row.len()).map(|id| col_expr(id as i64)).collect();
@@ -615,7 +593,7 @@ mod test {
             ),
         ];
 
-        let ctx = StatementContext::default();
+        let ctx = EvalContext::default();
 
         for (sig, row, exp) in cases {
             let children: Vec<Expr> = (0..row.len()).map(|id| col_expr(id as i64)).collect();
@@ -664,7 +642,7 @@ mod test {
             (r#"3hello"#, r#"__hello"#, '_', false),
             (r#"3hello"#, r#"%_hello"#, '%', true),
         ];
-        let ctx = StatementContext::default();
+        let ctx = EvalContext::default();
         for (target_str, pattern_str, escape, exp) in cases {
             let target = datum_expr(Datum::Bytes(target_str.as_bytes().to_vec()));
             let pattern = datum_expr(Datum::Bytes(pattern_str.as_bytes().to_vec()));
