@@ -41,10 +41,10 @@ use pd::PdTask;
 use super::codec::mysql;
 use super::codec::datum::Datum;
 use super::dag::DAGContext;
-use super::dag::executor::ExecutorMetrics;
 use super::statistics::analyze::AnalyzeContext;
 use super::metrics::*;
-use super::local_metrics::*;
+use super::local_metrics::{BasicLocalMetrics, ExecLocalMetrics};
+use super::dag::executor::ExecutorMetrics;
 use super::{Error, Result};
 
 pub const REQ_TYPE_DAG: i64 = 103;
