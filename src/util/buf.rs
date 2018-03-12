@@ -15,8 +15,11 @@ use std::io::{BufRead, ErrorKind, Read, Result, Write};
 use std::fmt::{self, Debug, Formatter};
 use alloc::raw_vec::RawVec;
 use std::{cmp, mem, ptr, slice};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use util::escape;
+
+pub static SNAP_RECV_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// `PipeBuffer` is useful when you want to move data from `Write` to a `Read` or vice versa.
 pub struct PipeBuffer {
@@ -27,8 +30,15 @@ pub struct PipeBuffer {
     buf: RawVec<u8>,
 }
 
+impl Drop for PipeBuffer {
+    fn drop(&mut self) {
+        SNAP_RECV_BYTES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl PipeBuffer {
     pub fn new(capacity: usize) -> PipeBuffer {
+        SNAP_RECV_BYTES.fetch_add(1, Ordering::SeqCst);
         PipeBuffer {
             start: 0,
             end: 0,

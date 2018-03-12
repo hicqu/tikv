@@ -32,7 +32,7 @@ use prometheus::Histogram;
 
 use util::worker::Scheduler;
 use util::collections::HashMap;
-use util::buf::PipeBuffer;
+use util::buf::{PipeBuffer, SNAP_RECV_BYTES};
 use storage::{self, Key, Mutation, Options, Storage, Value};
 use storage::txn::Error as TxnError;
 use storage::mvcc::{Error as MvccError, Write as MvccWrite, WriteType};
@@ -829,6 +829,10 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     future::result(res)
                 })
                 .then(move |res| {
+                    debug!(
+                        "snapshot receive bytes: {}",
+                        SNAP_RECV_BYTES.load(Ordering::Acquire)
+                    );
                     let res = match res {
                         Ok(_) => sched2.schedule(SnapTask::Close(token)),
                         Err(e) => {
