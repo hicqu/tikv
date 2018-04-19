@@ -21,7 +21,7 @@ use kvproto::kvrpcpb;
 use kvproto::kvrpcpb::*;
 use kvproto::raft_serverpb::*;
 use kvproto::tikvpb_grpc;
-use prometheus::Histogram;
+use prometheus::*;
 use protobuf::RepeatedField;
 use std::iter::{self, FromIterator};
 
@@ -38,6 +38,7 @@ use storage::txn::Error as TxnError;
 use storage::{self, Key, Mutation, Options, Storage, Value};
 use util::collections::HashMap;
 use util::future::paired_future_callback;
+use util::time::{duration_to_sec, Instant};
 use util::worker::Scheduler;
 
 const SCHEDULER_IS_BUSY: &str = "scheduler is busy";
@@ -115,6 +116,15 @@ impl Metrics {
             split_region: GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["split_region"]),
         }
     }
+}
+
+lazy_static! {
+    static ref GRPC_RESP_WITH_ERR: HistogramVec = register_histogram_vec!(
+        "tikv_grpc_resp_with_err_duration_seconds",
+        "Bucketed histogram of grpc server messages",
+        &["msg"],
+        exponential_buckets(0.0005, 2.0, 20).unwrap()
+    ).unwrap();
 }
 
 impl<T: RaftStoreRouter + 'static> Service<T> {
@@ -753,7 +763,8 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
 
     fn raw_put(&self, ctx: RpcContext, mut req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
         const LABEL: &str = "raw_put";
-        let timer = self.metrics.raw_put.start_coarse_timer();
+        let instant = Instant::now();
+        let raw_put = self.metrics.raw_put.clone();
 
         let (cb, future) = paired_future_callback();
         let res =
@@ -766,17 +777,25 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
 
         let future = future
             .map_err(Error::from)
-            .map(|v| {
+            .map(move |v| {
                 let mut resp = RawPutResponse::new();
                 if let Some(err) = extract_region_error(&v) {
+                    GRPC_RESP_WITH_ERR
+                        .with_label_values(&[err.get_message()])
+                        .observe(duration_to_sec(instant.elapsed()));
                     resp.set_region_error(err);
                 } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
+                    let e = format!("{}", e);
+                    GRPC_RESP_WITH_ERR
+                        .with_label_values(&[&e])
+                        .observe(duration_to_sec(instant.elapsed()));
+                    resp.set_error(e.clone());
+                } else {
+                    raw_put.observe(duration_to_sec(instant.elapsed()));
                 }
                 resp
             })
             .and_then(|res| sink.success(res).map_err(Error::from))
-            .map(|_| timer.observe_duration())
             .map_err(move |e| {
                 debug!("{} failed: {:?}", LABEL, e);
                 GRPC_MSG_FAIL_COUNTER.with_label_values(&[LABEL]).inc();
