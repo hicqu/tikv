@@ -336,129 +336,54 @@ impl Snap {
     }
 
     fn register_for_build(&self) -> Result<()> {
+        static err_msg: &'static str = "{} try to register Generating, but {} exists";
         let registry = self.snap_mgr_core.registry.wl();
-        if let Some(entry) = registered.get(&self.key) {
-            return box_err!("{} try to register Generating, but {} exists", self.key, entry);
+        match registry.entry(self.key.clone()) {
+            Entry::Occupied(e) => return box_err!(err_msg, self.key, entry),
+            Entry::Vacant(e) => e.insert(SnapEntry::Generating),
         }
+        Ok(())
+    }
+
+    fn register_for_sending(&self) -> Result<()> {
+        static err_msg: &'static str = "{} try to register Sending, but {} exists";
+        let registry = self.snap_mgr_core.registry.wl();
+        if let Some(entry) = registry.get_mut(&self.key) {
+            match entry {
+                SnapEntry::Generating => {
+                    let sender_count = AtomicUsize::new(0);
+                    *entry = SnapEntry::Sending(sender_count);
+                },
+                SnapEntry::Sending(count) => count.fetch_add(1, Ordering::SeqCst),
+                _ => return box_err!(err_msg, self.key, entry),
+            }
+            return Ok(());
+        }
+        return box_err!(err_msg, self.key, "None");
     }
 
 
     fn build_snapshot_data(&self, db_snap: &DbSnapshot) -> Result<RaftSnapshotData>> {
-        self.register_for_build // TODO: here
-    }
-
-        // load snapshot meta if meta_file exists
-        if file_exists(&s.meta_file.path) {
-            if let Err(e) = s.load_snapshot_meta() {
-                if !to_build {
-                    return Err(e);
-                }
-                warn!(
-                    "failed to load existent snapshot meta when try to build {}: {:?}",
-                    s.path(),
-                    e
-                );
-                if !retry_delete_snapshot(deleter, key, &s) {
-                    warn!(
-                        "failed to delete snapshot {} because it's already registered elsewhere",
-                        s.path()
-                    );
-                    return Err(e);
-                }
+        self.register_for_build()?;
+        if file_exists(self.meta_file.path) {
+            if let Ok(snap_meta) = self.load_snapshot_meta() {
+                // TODO: fix here.
+            } else {
+                self.init_for_building();
+                self.do_build();
             }
         }
-        Ok(s)
-    }
-
-    pub fn new_for_building<T: Into<PathBuf>>(
-        dir: T,
-        key: &SnapKey,
-        snap: &DbSnapshot,
-        size_track: Arc<RwLock<u64>>,
-        deleter: Box<SnapshotDeleter>,
-        limiter: Option<Arc<IOLimiter>>,
-    ) -> RaftStoreResult<Snap> {
-        let mut s = Snap::new(dir, key, size_track, true, true, deleter, limiter)?;
-        s.init_for_building(snap)?;
-        Ok(s)
-    }
-
-    pub fn new_for_sending<T: Into<PathBuf>>(
-        dir: T,
-        key: &SnapKey,
-        size_track: Arc<RwLock<u64>>,
-        deleter: Box<SnapshotDeleter>,
-    ) -> RaftStoreResult<Snap> {
-        let mut s = Snap::new(dir, key, size_track, true, false, deleter, None)?;
-
-        if !s.exists() {
-            // Skip the initialization below if it doesn't exists.
-            return Ok(s);
-        }
-        for cf_file in &mut s.cf_files {
-            // initialize cf file size and reader
-            if cf_file.size > 0 {
-                let file = File::open(&cf_file.path)?;
-                cf_file.file = Some(file);
-            }
-        }
-        Ok(s)
-    }
-
-    pub fn new_for_receiving<T: Into<PathBuf>>(
-        dir: T,
-        key: &SnapKey,
-        snapshot_meta: SnapshotMeta,
-        size_track: Arc<RwLock<u64>>,
-        deleter: Box<SnapshotDeleter>,
-        limiter: Option<Arc<IOLimiter>>,
-    ) -> RaftStoreResult<Snap> {
-        let mut s = Snap::new(dir, key, size_track, false, false, deleter, limiter)?;
-        s.set_snapshot_meta(snapshot_meta)?;
-
-        if s.exists() {
-            return Ok(s);
-        }
-        for cf_file in &mut s.cf_files {
-            if cf_file.size == 0 {
-                continue;
-            }
-            let f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&cf_file.tmp_path)?;
-            cf_file.file = Some(f);
-            cf_file.write_digest = Some(Digest::new(crc32::IEEE));
-        }
-        let f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&s.meta_file.tmp_path)?;
-        s.meta_file.file = Some(f);
-        Ok(s)
-    }
-
-    pub fn new_for_applying<T: Into<PathBuf>>(
-        dir: T,
-        key: &SnapKey,
-        size_track: Arc<RwLock<u64>>,
-        deleter: Box<SnapshotDeleter>,
-    ) -> RaftStoreResult<Snap> {
-        let s = Snap::new(dir, key, size_track, false, false, deleter, None)?;
-        Ok(s)
     }
 
     fn init_for_building(&mut self, snap: &DbSnapshot) -> RaftStoreResult<()> {
-        if self.exists() {
-            return Ok(());
-        }
         for cf_file in &mut self.cf_files {
+            let tmp_path = format!("{}{}", cf_file.path.as_str().unwrap(), TMP_FILE_SUFFIX);
             if plain_file_used(cf_file.cf) {
                 let f = OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
-                    .open(&cf_file.tmp_path)?;
+                    .open(&tmp_path)?;
                 cf_file.file = Some(f);
             } else {
                 let handle = snap.cf_handle(cf_file.cf)?;
@@ -470,14 +395,16 @@ impl Snap {
                 io_options.compression_per_level(&[]);
                 io_options.bottommost_compression(DBCompressionType::Disable);
                 let mut writer = SstFileWriter::new(EnvOptions::new(), io_options);
-                box_try!(writer.open(cf_file.tmp_path.as_path().to_str().unwrap()));
+                box_try!(writer.open(&tmp_path));
                 cf_file.sst_writer = Some(writer);
             }
         }
+        let meta_tmp_path = format!("{}{}", self.meta_file.path.as_str().unwrap(), TMP_FILE_SUFFIX);
         let file = OpenOptions::new()
             .write(true)
-            .create_new(true)
-            .open(&self.meta_file.tmp_path)?;
+            .create(true)
+            .truncate(true)
+            .open(&meta_tmp_path)?;
         self.meta_file.file = Some(file);
         Ok(())
     }
@@ -632,60 +559,27 @@ impl Snap {
         snap: &DbSnapshot,
         region: &Region,
         stat: &mut SnapshotStatistics,
-        deleter: Box<SnapshotDeleter>,
     ) -> RaftStoreResult<()> {
-        fail_point!("snapshot_enter_do_build");
-        if self.exists() {
-            match self.validate(snap.get_db()) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    error!(
-                        "[region {}] file {} is corrupted, will rebuild: {:?}",
-                        region.get_id(),
-                        self.path(),
-                        e
-                    );
-                    if !retry_delete_snapshot(deleter, &self.key, self) {
-                        error!(
-                            "[region {}] failed to delete corrupted snapshot because it's \
-                             already registered elsewhere",
-                            self.path()
-                        );
-                        return Err(e);
-                    }
-                    self.init_for_building(snap)?;
-                }
-            }
-        }
-
         let mut snap_key_count = 0;
         let (begin_key, end_key) = (enc_start_key(region), enc_end_key(region));
         for cf in SNAPSHOT_CFS {
             self.switch_to_cf_file(cf)?;
             let (cf_key_count, cf_size) = if plain_file_used(cf) {
-                // If the relative files are deleted after `Snap::new` and
-                // `init_for_building`, the file could be None.
-                let file = match self.cf_files[self.cf_index].file.as_mut() {
-                    Some(f) => f,
-                    None => {
-                        let e = box_err!("cf_file is none for cf {}", cf);
-                        return Err(RaftStoreError::Snapshot(e));
-                    }
-                };
+                let file = self.cf_files[self.cf_index].file.as_mut().unwrap();
                 build_plain_cf_file(file, snap, cf, &begin_key, &end_key)?
             } else {
                 let mut key_count = 0;
                 let mut size = 0;
-                let base = self.limiter
+                let base = self.snap_mgr_core.io_limiter
                     .as_ref()
-                    .map_or(0 as i64, |l| l.get_max_bytes_per_time());
+                    .map_or(0i64, |l| l.get_max_bytes_per_time());
                 let mut bytes: i64 = 0;
                 snap.scan_cf(cf, &begin_key, &end_key, false, |key, value| {
                     let l = key.len() + value.len();
                     if let Some(ref limiter) = self.limiter {
                         if bytes >= base {
                             bytes = 0;
-                            limiter.request(base);
+                            self.snap_mgr_core.io_limiter.request(base);
                         }
                         bytes += l as i64;
                     }
@@ -713,12 +607,14 @@ impl Snap {
             );
         }
 
-        self.save_cf_files()?;
         stat.kv_count = snap_key_count;
+
+        self.save_cf_files()?;
         // save snapshot meta to meta file
         let snapshot_meta = gen_snapshot_meta(&self.cf_files[..])?;
         self.meta_file.meta = snapshot_meta;
         self.save_meta_file()?;
+        // TODO: I am here. Should return a SnapshotData.
 
         Ok(())
     }
@@ -1056,6 +952,7 @@ struct SnapManagerCore {
     base: String,
     registry: RwLock<HashMap<SnapKey, SnapEntry>>,
     snap_size: AtomicUsize,
+    io_limiter: Option<IOLimiter>,
 }
 
 impl SnapManagerCore {
