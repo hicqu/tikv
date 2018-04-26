@@ -1246,11 +1246,6 @@ pub fn do_snapshot(
         }
     };
 
-    let key = SnapKey::new(region_id, term, idx);
-
-    mgr.register(key.clone(), SnapEntry::Generating);
-    defer!(mgr.deregister(&key, &SnapEntry::Generating));
-
     let state: RegionLocalState = snap.get_msg_cf(CF_RAFT, &keys::region_state_key(key.region_id))
         .and_then(|res| match res {
             None => Err(box_err!("could not find region info")),
@@ -1264,30 +1259,16 @@ pub fn do_snapshot(
         )));
     }
 
-    let mut snapshot = Snapshot::new();
+    let key = SnapKey::new(region_id, term, idx);
 
-    // Set snapshot metadata.
+    let mut snapshot = Snapshot::new();
     snapshot.mut_metadata().set_index(key.idx);
     snapshot.mut_metadata().set_term(key.term);
-
     let conf_state = conf_state_from_region(state.get_region());
     snapshot.mut_metadata().set_conf_state(conf_state);
 
-    let mut s = mgr.get_snapshot_for_building(&key, snap)?;
-    // Set snapshot data.
-    let mut snap_data = RaftSnapshotData::new();
-    snap_data.set_region(state.get_region().clone());
-    let mut stat = SnapshotStatistics::new();
-    s.build(
-        snap,
-        state.get_region(),
-        &mut snap_data,
-        &mut stat,
-        Box::new(mgr.clone()),
-    )?;
-    let mut v = vec![];
-    snap_data.write_to_vec(&mut v)?;
-    snapshot.set_data(v);
+    let snap_data = mgr.build_snapshot_data(&key, state.get_region(), snap)?;
+    snap_data.write_to_vec(snapshot.mut_data())?;
 
     SNAPSHOT_KV_COUNT_HISTOGRAM.observe(stat.kv_count as f64);
     SNAPSHOT_SIZE_HISTOGRAM.observe(stat.size as f64);
