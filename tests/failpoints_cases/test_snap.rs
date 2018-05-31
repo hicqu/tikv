@@ -230,6 +230,31 @@ fn test_generate_snapshot() {
     fail::remove("snapshot_delete_after_send");
 }
 
+#[test]
+fn test_load_snapshot_meta_race() {
+    ::util::ci_setup();
+    let _guard = ::setup();
+
+    let mut cluster = new_server_cluster(1, 3);
+    configure_for_snapshot(&mut cluster);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+    let r1 = cluster.run_conf_change();
+    cluster.must_put(b"k1", b"v1");
+
+    fail::cfg("snapshot_delete_after_send", "pause").unwrap();
+    fail::cfg("snapshot_load_meta_race", "pause").unwrap();
+
+    pd_client.must_add_peer(r1, new_peer(2, 2));
+
+    sleep_ms(100);
+    fail::remove("snapshot_delete_after_send");
+    sleep_ms(100);
+    fail::remove("snapshot_load_meta_race");
+    sleep_ms(100);
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+}
+
 fn must_empty_dir(path: String) {
     for _ in 0..200 {
         let snap_dir = fs::read_dir(&path).unwrap();

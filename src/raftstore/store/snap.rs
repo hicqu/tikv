@@ -561,6 +561,18 @@ impl Snap {
     fn load_snapshot_meta(&mut self) -> RaftStoreResult<()> {
         let snapshot_meta = self.read_snapshot_meta()?;
         self.set_snapshot_meta(snapshot_meta)?;
+
+        let snapshot_load_meta_race = || {
+            fail_point!(
+                "snapshot_load_meta_race",
+                thread::current()
+                    .name()
+                    .map_or(false, |n| n.contains("raftstore")),
+                |_| return
+            );
+        };
+        snapshot_load_meta_race();
+
         // check if there is a data corruption when the meta file exists
         // but cf files are deleted.
         if !self.exists() {
