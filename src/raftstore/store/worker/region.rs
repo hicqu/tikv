@@ -26,9 +26,8 @@ use raftstore::store::engine::{Mutable, Snapshot};
 use raftstore::store::peer_storage::{JOB_STATUS_CANCELLED, JOB_STATUS_CANCELLING,
                                      JOB_STATUS_FAILED, JOB_STATUS_FINISHED, JOB_STATUS_PENDING,
                                      JOB_STATUS_RUNNING};
-use raftstore::store::snap::{Error, Result};
-use raftstore::store::{self, check_abort, keys, ApplyOptions, Peekable, SnapEntry, SnapKey,
-                       SnapManager};
+use raftstore::store::snap::Error;
+use raftstore::store::{self, keys, Peekable, SnapKey, SnapManager};
 use storage::CF_RAFT;
 use util::threadpool::{DefaultContext, ThreadPool, ThreadPoolBuilder};
 use util::time;
@@ -211,7 +210,11 @@ struct SnapContext {
 }
 
 impl SnapContext {
-    fn generate_snap(&self, region_id: u64, notifier: SyncSender<RaftSnapshot>) -> Result<()> {
+    fn generate_snap(
+        &self,
+        region_id: u64,
+        notifier: SyncSender<RaftSnapshot>,
+    ) -> Result<(), Error> {
         // do we need to check leader here?
         let raft_db = Arc::clone(&self.raft_db);
         let raw_snap = Snapshot::new(Arc::clone(&self.kv_db));
@@ -253,7 +256,8 @@ impl SnapContext {
         timer.observe_duration();
     }
 
-    fn apply_snap(&mut self, region_id: u64, abort: Arc<AtomicUsize>) -> Result<()> {
+    fn apply_snap(&mut self, region_id: u64, abort: Arc<AtomicUsize>) -> Result<(), Error> {
+        /*******************************************************
         info!("[region {}] begin apply snap data", region_id);
         fail_point!("region_apply_snap");
         check_abort(&abort)?;
@@ -329,6 +333,7 @@ impl SnapContext {
             timer.elapsed()
         );
         Ok(())
+        *******************************************************/
     }
 
     fn handle_apply(&mut self, region_id: u64, status: Arc<AtomicUsize>) {

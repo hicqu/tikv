@@ -41,9 +41,7 @@ pub use self::peer_storage::{clear_meta, do_snapshot, init_apply_state, init_raf
                              write_peer_state, CacheQueryStats, PeerStorage, SnapState,
                              RAFT_INIT_LOG_INDEX, RAFT_INIT_LOG_TERM};
 pub use self::region_snapshot::{RegionIterator, RegionSnapshot};
-pub use self::snap::{check_abort, copy_snapshot, ApplyOptions, Error as SnapError, SnapEntry,
-                     SnapKey, SnapManager, SnapManagerBuilder, Snapshot, SnapshotDeleter,
-                     SnapshotStatistics};
+pub use self::snap::{Error as SnapError, Snap, SnapKey, SnapManager, SnapManagerBuilder};
 pub use self::store::{create_event_loop, new_compaction_listener, Engines, Store, StoreChannel,
                       StoreStat};
 pub use self::transport::Transport;

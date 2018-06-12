@@ -67,7 +67,7 @@ use super::worker::{ApplyRunner, ApplyTask, ApplyTaskRes, CleanupSSTRunner, Clea
                     CompactRunner, CompactTask, ConsistencyCheckRunner, ConsistencyCheckTask,
                     RaftlogGcRunner, RaftlogGcTask, RegionRunner, RegionTask, SplitCheckRunner,
                     SplitCheckTask, STALE_PEER_CHECK_INTERVAL};
-use super::{util, Msg, SignificantMsg, SnapKey, SnapManager, SnapshotDeleter, Tick};
+use super::{util, Msg, SignificantMsg, SnapKey, SnapManager, Tick};
 use import::SSTImporter;
 
 type Key = Vec<u8>;
@@ -831,8 +831,8 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             // delete them here. If the snapshot file will be reused when
             // receiving, then it will fail to pass the check again, so
             // missing snapshot files should not be noticed.
-            let s = self.snap_mgr.get_snapshot_for_applying(&key)?;
-            self.snap_mgr.delete_snapshot(&key, s.as_ref(), false);
+            let s = self.snap_mgr.get_snapshot_for_applying(key)?;
+            self.snap_mgr.delete_snapshot(key);
             return Ok(());
         }
 
@@ -1226,7 +1226,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             }
         }
         // check if snapshot file exists.
-        self.snap_mgr.get_snapshot_for_applying(&key)?;
+        self.snap_mgr.get_snapshot_for_applying(key)?;
 
         self.pending_snapshot_regions.push(snap_region);
         self.pending_cross_snap.remove(&region_id);
@@ -2667,62 +2667,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
     }
 
     fn handle_snap_mgr_gc(&mut self) -> Result<()> {
-        let snap_keys = self.snap_mgr.list_idle_snap()?;
-        if snap_keys.is_empty() {
-            return Ok(());
-        }
-        let (mut last_region_id, mut compacted_idx, mut compacted_term) = (0, u64::MAX, u64::MAX);
-        let mut is_applying_snap = false;
-        for (key, is_sending) in snap_keys {
-            if last_region_id != key.region_id {
-                last_region_id = key.region_id;
-                match self.region_peers.get(&key.region_id) {
-                    None => {
-                        // region is deleted
-                        compacted_idx = u64::MAX;
-                        compacted_term = u64::MAX;
-                        is_applying_snap = false;
-                    }
-                    Some(peer) => {
-                        let s = peer.get_store();
-                        compacted_idx = s.truncated_index();
-                        compacted_term = s.truncated_term();
-                        is_applying_snap = s.is_applying_snapshot();
-                    }
-                };
-            }
-
-            if is_sending {
-                let s = self.snap_mgr.get_snapshot_for_sending(&key)?;
-                if key.term < compacted_term || key.idx < compacted_idx {
-                    info!(
-                        "[region {}] snap file {} has been compacted, delete.",
-                        key.region_id, key
-                    );
-                    self.snap_mgr.delete_snapshot(&key, s.as_ref(), false);
-                } else if let Ok(meta) = s.meta() {
-                    let modified = box_try!(meta.modified());
-                    if let Ok(elapsed) = modified.elapsed() {
-                        if elapsed > self.cfg.snap_gc_timeout.0 {
-                            info!(
-                                "[region {}] snap file {} has been expired, delete.",
-                                key.region_id, key
-                            );
-                            self.snap_mgr.delete_snapshot(&key, s.as_ref(), false);
-                        }
-                    }
-                }
-            } else if key.term <= compacted_term
-                && (key.idx < compacted_idx || key.idx == compacted_idx && !is_applying_snap)
-            {
-                info!(
-                    "[region {}] snap file {} has been applied, delete.",
-                    key.region_id, key
-                );
-                let a = self.snap_mgr.get_snapshot_for_applying(&key)?;
-                self.snap_mgr.delete_snapshot(&key, a.as_ref(), false);
-            }
-        }
+        // TODO: reimplement it.
         Ok(())
     }
 

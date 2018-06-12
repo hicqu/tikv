@@ -25,7 +25,7 @@ use kvproto::raft_serverpb::RaftMessage;
 use kvproto::raft_serverpb::{Done, SnapshotChunk};
 use kvproto::tikvpb_grpc::TikvClient;
 
-use raftstore::store::{SnapEntry, SnapKey, SnapManager, Snapshot};
+use raftstore::store::{Snap, SnapKey, SnapManager};
 use util::DeferContext;
 use util::security::SecurityManager;
 use util::worker::Runnable;
@@ -63,7 +63,7 @@ impl Display for Task {
 
 struct SnapChunk {
     first: Option<SnapshotChunk>,
-    snap: Box<Snapshot>,
+    snap: Snap,
     remain_bytes: usize,
 }
 
@@ -117,6 +117,7 @@ fn send_snap(
     addr: &str,
     msg: RaftMessage,
 ) -> Result<impl Future<Item = SendStat, Error = Error>> {
+    /*********************************************************
     assert!(msg.get_message().has_snapshot());
     let timer = Instant::now();
 
@@ -180,11 +181,13 @@ fn send_snap(
             })
         });
     Ok(send)
+    *********************************************************/
+    unimplemented!();
 }
 
 struct RecvSnapContext {
     key: SnapKey,
-    file: Option<Box<Snapshot>>,
+    file: Option<Snap>,
     raft_msg: RaftMessage,
 }
 
@@ -248,6 +251,7 @@ fn recv_snap<R: RaftStoreRouter + 'static>(
     snap_mgr: SnapManager,
     raft_router: R,
 ) -> impl Future<Item = (), Error = Error> {
+    /*************************************************
     let stream = stream.map_err(Error::from);
 
     let f = stream.into_future().map_err(|(e, _)| e).and_then(
@@ -287,6 +291,8 @@ fn recv_snap<R: RaftStoreRouter + 'static>(
         },
     );
     f.and_then(move |_| sink.success(Done::new()).map_err(Error::from))
+    *************************************************/
+    unimplemented!();
 }
 
 pub struct Runner<R: RaftStoreRouter + 'static> {

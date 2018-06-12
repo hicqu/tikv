@@ -40,7 +40,7 @@ use super::keys::{self, enc_end_key, enc_start_key};
 use super::metrics::*;
 use super::peer::ReadyContext;
 use super::worker::RegionTask;
-use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
+use super::{SnapKey, SnapManager};
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -1279,12 +1279,7 @@ pub fn do_snapshot(
         }
     };
 
-    let key = SnapKey::new(region_id, term, idx);
-
-    mgr.register(key.clone(), SnapEntry::Generating);
-    defer!(mgr.deregister(&key, &SnapEntry::Generating));
-
-    let state: RegionLocalState = snap.get_msg_cf(CF_RAFT, &keys::region_state_key(key.region_id))
+    let state: RegionLocalState = snap.get_msg_cf(CF_RAFT, &keys::region_state_key(region_id))
         .and_then(|res| match res {
             None => Err(box_err!("could not find region info")),
             Some(state) => Ok(state),
@@ -1297,35 +1292,24 @@ pub fn do_snapshot(
         )));
     }
 
-    let mut snapshot = Snapshot::new();
-
     // Set snapshot metadata.
-    snapshot.mut_metadata().set_index(key.idx);
-    snapshot.mut_metadata().set_term(key.term);
-
+    let mut snapshot = Snapshot::new();
     let conf_state = conf_state_from_region(state.get_region());
     snapshot.mut_metadata().set_conf_state(conf_state);
+    snapshot.mut_metadata().set_term(term);
+    snapshot.mut_metadata().set_index(idx);
 
-    let mut s = mgr.get_snapshot_for_building(&key, snap)?;
-    // Set snapshot data.
-    let mut snap_data = RaftSnapshotData::new();
-    snap_data.set_region(state.get_region().clone());
-    let mut stat = SnapshotStatistics::new();
-    s.build(
-        snap,
-        state.get_region(),
-        &mut snap_data,
-        &mut stat,
-        Box::new(mgr.clone()),
-    )?;
-    let mut v = vec![];
-    snap_data.write_to_vec(&mut v)?;
-    snapshot.set_data(v);
+    let key = SnapKey::new(region_id, term, idx);
 
-    SNAPSHOT_KV_COUNT_HISTOGRAM.observe(stat.kv_count as f64);
-    SNAPSHOT_SIZE_HISTOGRAM.observe(stat.size as f64);
-
-    Ok(snapshot)
+    match mgr.build_snapshot(key, state.get_region(), snap)? {
+        Some(snap_data) => {
+            snap_data.write_to_vec(snapshot.mut_data())?;
+            Ok(snapshot)
+        }
+        None => Err(RaftError::Store(
+            StorageError::SnapshotTemporarilyUnavailable,
+        )),
+    }
 }
 
 // When we bootstrap the region we must call this to initialize region local state first.
