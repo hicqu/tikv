@@ -67,6 +67,10 @@ quick_error! {
             description("abort")
             display("abort")
         }
+        Conflict(registered: &'static str, new: &'static str) {
+            description("want to register {}, but {} exists", new, registered)
+            display("Register Conflict")
+        }
         Other(err: Box<error::Error + Sync + Send>) {
             from()
             cause(err.as_ref())
@@ -233,8 +237,22 @@ impl Snap {
         Ok(())
     }
 
-    fn load_for_read(&self) -> RaftStoreResult<()> {
-        // TODO: finish this.
+    fn init_for_sending(&mut self) -> RaftStoreResult<()> {
+        self.meta_file.file = Some(File::open(&self.meta_file.path)?);
+        for cf_file in &mut self.cf_files {
+            cf_file.file = Some(File::open(&cf_file.path)?);
+        }
+        Ok(())
+    }
+
+    fn init_for_receiving(&mut self) -> RaftStoreResult<()> {
+        let open_options = OpenOptions::new().write(true).create_new(true);
+        self.meta_file.file = Some(open_options.open(&self.meta_file.tmp_path())?);
+        self.hold_tmp_files = true;
+        for cf_file in &mut self.cf_files {
+            cf_file.file = Some(open_options.open(&cf_file.tmp_path())?);
+            cf_file.write_digest = Some(Digest::new(crc32::IEEE));
+        }
         Ok(())
     }
 
@@ -300,7 +318,6 @@ impl Snap {
         region: &Region,
         db_snap: &DbSnapshot,
         limiter: Option<&IOLimiter>,
-        core: &SnapManagerCore,
     ) -> RaftStoreResult<()> {
         let t = Instant::now();
         let (start_key, end_key) = (enc_start_key(region), enc_end_key(region));
@@ -360,7 +377,6 @@ impl Snap {
 
         self.rename_tmp_files()?;
         let total_size = self.total_size();
-        core.snap_size.fetch_add(total_size, Ordering::SeqCst);
 
         SNAPSHOT_BUILD_TIME_HISTOGRAM.observe(duration_to_sec(t.elapsed()) as f64);
         SNAPSHOT_KV_COUNT_HISTOGRAM.observe(snap_key_count as f64);
@@ -376,12 +392,39 @@ impl Snap {
         Ok(())
     }
 
-    fn total_size(&self) -> u64 {
+    pub fn path(&self) -> &str {
+        &self.display_path
+    }
+
+    pub fn total_size(&self) -> u64 {
         self.meta_file
             .meta
             .get_cf_files()
             .iter()
             .fold(0, |acc, x| acc + x.get_size() as u64)
+    }
+}
+
+impl Read for Snap {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.cf_index < self.cf_files.len() {
+            let cf_size = self.meta_file.meta.get_cf_files()[self.cf_index].get_size();
+            if cf_size == 0 {
+                self.cf_index += 1;
+                continue;
+            }
+
+            let file = self.cf_files[self.cf_index].file.as_mut().unwrap();
+            match file.read(buf) {
+                Ok(0) => self.cf_index += 1,
+                Ok(n) => return Ok(n),
+                e => return e,
+            }
+        }
+        Ok(0)
     }
 }
 
@@ -428,6 +471,19 @@ enum SnapEntry {
     Receiving,
     Received,
     Applying,
+}
+
+impl SnapEntry {
+    fn display(&self) -> &'static str {
+        match *self {
+            SnapEntry::Generating => "Generating",
+            SnapEntry::Generated => "Generated",
+            SnapEnry::Sending(_) => "Sending",
+            SnapEnry::Receiving => "Receiving",
+            SnapEnry::Received => "Received",
+            SnapEnry::Applying => "Applying",
+        }
+    }
 }
 
 struct SnapManagerCore {
@@ -505,6 +561,27 @@ impl SnapManagerCore {
             _ => unreachable!(),
         }
     }
+
+    fn before_receiving(&self, key: SnapKey) -> ::std::result::Result<Option<()>, Error> {
+        match self.registry.lock().unwrap().entry(key) {
+            Entry::Occupied(e) => {
+                let e = e.get();
+                match e {
+                    SnapEntry::Received => return Ok(None),
+                    e => return Error::Config(e.display(), "Receiving"),
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(SnapEntry::Receiving);
+                return Ok(Some(()));
+            }
+        }
+    }
+
+    fn post_receiving(&self, key: SnapKey) {
+        // TODO: finish this.
+        // have too much redundant code.
+    }
 }
 
 #[derive(Clone)]
@@ -553,8 +630,11 @@ impl SnapManager {
         if need_build {
             let limiter = self.core.limiter.as_ref();
             let core = Arc::clone(&self.core);
-            match snap.build(region, db_snap, limiter, &core) {
-                Ok(_) => snap.deregister = Some(box move || core.post_build_success(key)),
+            match snap.build(region, db_snap, limiter) {
+                Ok(_) => {
+                    core.snap_size.fetch_add(total_size, Ordering::SeqCst);
+                    snap.deregister = Some(box move || core.post_build_success(key));
+                }
                 Err(e) => {
                     snap.deregister = Some(box move || core.post_build_fail(key));
                     return Err(e);
@@ -571,19 +651,35 @@ impl SnapManager {
         Ok(Some(snapshot_data))
     }
 
+    /// Get a snapshot so that we can read bytes from it.
     pub fn get_snapshot_for_sending(&self, key: SnapKey) -> RaftStoreResult<Snap> {
-        // TODO: finish this.
         let mut snap = Snap::new(PathBuf::from(&self.core.base), key, true);
-        snap.load_for_read()?;
+        snap.init_for_sending()?;
+
+        self.core.before_send(key);
         let core = Arc::clone(&self.core);
         snap.deregister = Some(box move || core.post_send(key));
+
         Ok(snap)
     }
 
-    pub fn get_snapshot_for_receiving(&self, key: SnapKey) -> RaftStoreResult<Snap> {
-        // TODO: finish this.
+    pub fn get_snapshot_for_receiving(
+        &self,
+        key: SnapKey,
+        data: &[u8],
+    ) -> RaftStoreResult<Option<Snap>> {
         let mut snap = Snap::new(PathBuf::from(&self.core.base), key, false);
-        Ok(snap)
+        snap.meta_file.meta.merge_from_bytes(data)?;
+        snap.init_for_receiving()?;
+
+        match self.core.before_receiving(key)? {
+            Ok(Some(_)) => {
+                let core = Arc::clone(&self.core);
+                snap.deregister = Some(box move || core.post_receiving(key));
+                Ok(Some(snap))
+            }
+            err_or_none => return err_or_none,
+        }
     }
 
     pub fn get_snapshot_for_applying(&self, key: SnapKey) -> RaftStoreResult<Snap> {

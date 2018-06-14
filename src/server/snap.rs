@@ -13,6 +13,7 @@
 
 use std::boxed::FnBox;
 use std::fmt::{self, Display, Formatter};
+use std::io::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -117,7 +118,6 @@ fn send_snap(
     addr: &str,
     msg: RaftMessage,
 ) -> Result<impl Future<Item = SendStat, Error = Error>> {
-    /*********************************************************
     assert!(msg.get_message().has_snapshot());
     let timer = Instant::now();
 
@@ -128,17 +128,8 @@ fn send_snap(
         SnapKey::from_snap(snap)?
     };
 
-    mgr.register(key.clone(), SnapEntry::Sending);
-    let deregister = {
-        let (mgr, key) = (mgr.clone(), key.clone());
-        DeferContext::new(move || mgr.deregister(&key, &SnapEntry::Sending))
-    };
-
-    let s = box_try!(mgr.get_snapshot_for_sending(&key));
-    if !s.exists() {
-        return Err(box_err!("missing snap file: {:?}", s.path()));
-    }
-    let total_size = s.total_size()?;
+    let s = box_try!(mgr.get_snapshot_for_sending(key));
+    let total_size = s.total_size();
 
     let chunks = {
         let mut first_chunk = SnapshotChunk::new();
@@ -162,14 +153,11 @@ fn send_snap(
     let (sink, receiver) = client.snapshot()?;
 
     let send = chunks.forward(sink).map_err(Error::from);
-    let send = send.and_then(|(s, _)| receiver.map_err(Error::from).map(|_| s))
+    let future = send.and_then(|_| receiver.map_err(Error::from))
         .then(move |result| {
             send_timer.observe_duration();
-            drop(deregister);
             drop(client);
-            result.map(|s| {
-                fail_point!("snapshot_delete_after_send");
-                s.snap.delete();
+            result.map(|_| {
                 // TODO: improve it after rustc resolves the bug.
                 // Call `info` in the closure directly will cause rustc
                 // panic with `Cannot create local mono-item for DefId`.
@@ -180,9 +168,7 @@ fn send_snap(
                 }
             })
         });
-    Ok(send)
-    *********************************************************/
-    unimplemented!();
+    Ok(future)
 }
 
 struct RecvSnapContext {
@@ -209,16 +195,9 @@ impl RecvSnapContext {
             let data = meta.get_message().get_snapshot().get_data();
             let s = match snap_mgr.get_snapshot_for_receiving(&key, data) {
                 Ok(s) => s,
-                Err(e) => return Err(box_err!("{} failed to create snapshot file: {:?}", key, e)),
+                Err(e) => return Err(box_err!("{} get_snapshot_for_receiving: {:?}", key, e)),
             };
-
-            if s.exists() {
-                let p = s.path();
-                info!("{} snapshot file {} already exists, skip receiving", key, p);
-                None
-            } else {
-                Some(s)
-            }
+            Some(s)
         };
 
         Ok(RecvSnapContext {
