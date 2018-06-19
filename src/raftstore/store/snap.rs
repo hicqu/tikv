@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
-use std::{error, result, str, thread, time, u64};
+use std::{cmp, error, str, thread, time, u64};
 
 use crc::crc32::{self, Digest, Hasher32};
 use protobuf::stream::CodedInputStream;
@@ -36,7 +36,7 @@ use raftstore::store::Msg;
 use raftstore::store::engine::{Iterable, Snapshot as DbSnapshot};
 use raftstore::store::keys::{self, enc_end_key, enc_start_key};
 use raftstore::store::metrics::*;
-use raftstore::store::peer_storage::JOB_STATUS_CANCELLING;
+use raftstore::store::peer_storage::{JOB_STATUS_CANCELLED, JOB_STATUS_CANCELLING};
 use raftstore::store::util::check_key_in_region;
 use raftstore::{Error as RaftStoreError, Result as RaftStoreResult};
 use storage::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
@@ -44,8 +44,8 @@ use util::codec::bytes::{BytesEncoder, CompactBytesFromFileDecoder};
 use util::collections::{HashMap, HashMapEntry as Entry};
 use util::file::{delete_file_if_exist, file_exists, get_file_size, calc_crc32};
 use util::io_limiter::{IOLimiter, LimitWriter};
-use util::rocksdb::{get_fastest_supported_compression_type, prepare_sst_for_ingestion,
-                    validate_sst_for_ingestion};
+use util::rocksdb::{get_cf_handle, get_fastest_supported_compression_type,
+                    prepare_sst_for_ingestion, validate_sst_for_ingestion};
 use util::time::duration_to_sec;
 use util::transport::SendCh;
 
@@ -63,22 +63,14 @@ const CLONE_FILE_SUFFIX: &str = ".clone";
 quick_error! {
     #[derive(Debug)]
     pub enum Error {
-        Abort {
-            description("abort")
-            display("abort")
-        }
         Conflict(registered: &'static str, new: &'static str) {
-            description("want to register {}, but {} exists", new, registered)
-            display("Register Conflict")
-        }
-        Other(err: Box<error::Error + Sync + Send>) {
-            from()
-            cause(err.as_ref())
-            description(err.description())
-            display("snap failed {:?}", err)
+            description("Register Conflict")
+            display("want to register {}, but {} exists", new, registered)
         }
     }
 }
+
+type SnapResult<T> = ::std::result::Result<T, Error>;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct SnapKey {
@@ -128,7 +120,10 @@ struct CfFile {
     path: PathBuf,
     sst_writer: Option<SstFileWriter>,
     file: Option<File>,
+
+    // Internal status for implement Write.
     write_digest: Option<Digest>,
+    write_bytes: usize,
 }
 
 impl CfFile {
@@ -149,9 +144,78 @@ impl CfFile {
     fn tmp_path(&self) -> PathBuf {
         let file_name = self.path.file_name().and_then(|n| n.to_str()).unwrap();
         let file_name = format!("{}{}", file_name, TMP_FILE_SUFFIX);
-        let tmp_path = self.path.clone();
+        let mut tmp_path = self.path.clone();
         tmp_path.set_file_name(file_name);
         tmp_path
+    }
+
+    fn clone_path(&self) -> PathBuf {
+        let file_name = self.path.file_name().and_then(|n| n.to_str()).unwrap();
+        let file_name = format!("{}{}", file_name, CLONE_FILE_SUFFIX);
+        let mut clone_path = self.path.clone();
+        clone_path.set_file_name(file_name);
+        clone_path
+    }
+
+    fn open_sst_writer(&mut self, db_snap: &DbSnapshot) -> RaftStoreResult<()> {
+        let handle = db_snap.cf_handle(self.cf)?;
+        let mut io_options = db_snap.get_db().get_options_cf(handle).clone();
+        io_options.compression(get_fastest_supported_compression_type());
+        // in rocksdb 5.5.1, SstFileWriter will try to use bottommost_compression and
+        // compression_per_level first, so to make sure our specified compression type
+        // being used, we must set them empty or disabled.
+        io_options.compression_per_level(&[]);
+        io_options.bottommost_compression(DBCompressionType::Disable);
+        let mut writer = SstFileWriter::new(EnvOptions::new(), io_options);
+        box_try!(writer.open(self.tmp_path().as_path().to_str().unwrap()));
+        self.sst_writer = Some(writer);
+        Ok(())
+    }
+
+    fn apply(&mut self, options: &ApplyOptions) -> RaftStoreResult<()> {
+        let handle = box_try!(get_cf_handle(&options.db, self.cf));
+        if self.plain_file_used() {
+            let mut buf_reader = BufReader::new(self.file.as_mut().unwrap());
+            let mut wb = WriteBatch::new();
+            let mut batch_size = 0;
+            let mut finished = false;
+            while !finished {
+                if options.check_abort() {
+                    return Ok(());
+                }
+
+                let key = box_try!(buf_reader.decode_compact_bytes());
+                let should_flush = if key.is_empty() {
+                    finished = true;
+                    true
+                } else {
+                    box_try!(check_key_in_region(keys::origin_key(&key), &options.region));
+                    batch_size += key.len();
+                    let value = box_try!(buf_reader.decode_compact_bytes());
+                    batch_size += value.len();
+                    box_try!(wb.put_cf(&handle, &key, &value));
+                    batch_size >= options.write_batch_size
+                };
+                if should_flush {
+                    box_try!(options.db.write(wb));
+                    wb = WriteBatch::new();
+                    batch_size = 0;
+                }
+            }
+        } else {
+            if options.check_abort() {
+                return Ok(());
+            }
+            let mut ingest_opt = IngestExternalFileOptions::new();
+            ingest_opt.move_files(true);
+            let path = self.clone_path().to_str().unwrap().to_owned();
+            box_try!(
+                options
+                    .db
+                    .ingest_external_file_cf(&handle, &ingest_opt, &[&path])
+            );
+        }
+        Ok(())
     }
 }
 
@@ -174,7 +238,7 @@ impl MetaFile {
     fn tmp_path(&self) -> PathBuf {
         let file_name = self.path.file_name().and_then(|n| n.to_str()).unwrap();
         let file_name = format!("{}{}", file_name, TMP_FILE_SUFFIX);
-        let tmp_path = self.path.clone();
+        let mut tmp_path = self.path.clone();
         tmp_path.set_file_name(file_name);
         tmp_path
     }
@@ -188,6 +252,7 @@ pub struct Snap {
     hold_tmp_files: bool,
     // Internal status for implement Read and Write.
     cf_index: usize,
+    io_limiter: Option<Arc<IOLimiter>>,
     // Callback to update status in registry.
     deregister: Option<Box<FnBox() + Send>>,
 }
@@ -225,6 +290,7 @@ impl Snap {
             cf_files,
             hold_tmp_files: false,
             cf_index: 0,
+            io_limiter: None,
             deregister: None,
         }
     }
@@ -237,6 +303,21 @@ impl Snap {
         Ok(())
     }
 
+    fn init_for_generating(&mut self, db_snap: &DbSnapshot) -> RaftStoreResult<()> {
+        let mut open_options = OpenOptions::new();
+        open_options.write(true).create_new(true);
+        self.meta_file.file = Some(open_options.open(&self.meta_file.tmp_path())?);
+        self.hold_tmp_files = true;
+        for cf_file in &mut self.cf_files {
+            if cf_file.plain_file_used() {
+                cf_file.file = Some(open_options.open(&cf_file.tmp_path())?);
+            } else {
+                cf_file.open_sst_writer(db_snap)?;
+            }
+        }
+        Ok(())
+    }
+
     fn init_for_sending(&mut self) -> RaftStoreResult<()> {
         self.meta_file.file = Some(File::open(&self.meta_file.path)?);
         for cf_file in &mut self.cf_files {
@@ -246,7 +327,8 @@ impl Snap {
     }
 
     fn init_for_receiving(&mut self) -> RaftStoreResult<()> {
-        let open_options = OpenOptions::new().write(true).create_new(true);
+        let mut open_options = OpenOptions::new();
+        open_options.write(true).create_new(true);
         self.meta_file.file = Some(open_options.open(&self.meta_file.tmp_path())?);
         self.hold_tmp_files = true;
         for cf_file in &mut self.cf_files {
@@ -256,39 +338,23 @@ impl Snap {
         Ok(())
     }
 
-    fn prepare_tmp_files(&mut self, db_snap: &DbSnapshot) -> RaftStoreResult<()> {
-        let open_options = OpenOptions::new().write(true).create_new(true);
-        self.meta_file.file = Some(open_options.open(&self.meta_file.tmp_path())?);
-        self.hold_tmp_files = true;
-
-        for cf_file in &mut self.cf_files {
-            if cf_file.plain_file_used() {
-                cf_file.file = Some(open_options.open(&cf_file.tmp_path())?);
-            } else {
-                let handle = db_snap.cf_handle(cf_file.cf)?;
-                let mut io_options = db_snap.get_db().get_options_cf(handle).clone();
-                io_options.compression(get_fastest_supported_compression_type());
-                // in rocksdb 5.5.1, SstFileWriter will try to use bottommost_compression and
-                // compression_per_level first, so to make sure our specified compression type
-                // being used, we must set them empty or disabled.
-                io_options.compression_per_level(&[]);
-                io_options.bottommost_compression(DBCompressionType::Disable);
-                let mut writer = SstFileWriter::new(EnvOptions::new(), io_options);
-                box_try!(writer.open(cf_file.tmp_path().as_path().to_str().unwrap()));
-                cf_file.sst_writer = Some(writer);
+    fn init_for_applying(&self) -> RaftStoreResult<()> {
+        for cf_file in &self.cf_files {
+            if !cf_file.plain_file_used() {
+                prepare_sst_for_ingestion(&cf_file.path, &cf_file.clone_path())?;
             }
         }
         Ok(())
     }
 
-    // Rename tmp files to sst files.
-    fn rename_tmp_files(&mut self) -> RaftStoreResult<()> {
+    fn finish_generating(&mut self) -> RaftStoreResult<()> {
         for cf_file in &mut self.cf_files {
             if !cf_file.plain_file_used() {
                 let writer = cf_file.sst_writer.as_mut().unwrap();
                 writer.finish()?;
             }
 
+            // TODO: calculate checksum while generating or sending.
             let tmp_path = cf_file.tmp_path();
             let checksum = calc_crc32(&tmp_path)?;
             let file_size = get_file_size(&tmp_path)?;
@@ -301,6 +367,8 @@ impl Snap {
 
             if file_size > 0 {
                 fs::rename(&tmp_path, &cf_file.path)?;
+            } else {
+                delete_file_if_exist(&tmp_path);
             }
             drop(cf_file.file.take());
             drop(cf_file.sst_writer.take());
@@ -322,7 +390,8 @@ impl Snap {
         let t = Instant::now();
         let (start_key, end_key) = (enc_start_key(region), enc_end_key(region));
         let mut snap_key_count = 0;
-        self.prepare_tmp_files(db_snap)?;
+
+        self.init_for_generating(db_snap)?;
         for cf_file in &mut self.cf_files {
             let (mut cf_key_count, mut cf_size) = (0, 0);
             if cf_file.plain_file_used() {
@@ -375,7 +444,7 @@ impl Snap {
             );
         }
 
-        self.rename_tmp_files()?;
+        self.finish_generating()?;
         let total_size = self.total_size();
 
         SNAPSHOT_BUILD_TIME_HISTOGRAM.observe(duration_to_sec(t.elapsed()) as f64);
@@ -428,6 +497,71 @@ impl Read for Snap {
     }
 }
 
+impl Write for Snap {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut next_buf = buf;
+        while self.cf_index < self.cf_files.len() {
+            let cf_file = &mut self.cf_files[self.cf_index];
+            let cf_meta_file = &self.meta_file.meta.get_cf_files()[self.cf_index];
+
+            let cf_size = cf_meta_file.get_size() as usize;
+            let left = cf_size - cf_file.write_bytes;
+            if left == 0 && cf_size != 0 {
+                let checksum = cf_file.write_digest.take().unwrap().sum32();
+                let expected = cf_meta_file.get_checksum();
+                if checksum != expected {
+                    return Err(io::Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "snapshot file {} for cf {} checksum \
+                             mismatches, real checksum {}, expected \
+                             checksum {}",
+                            cf_file.path.display(),
+                            cf_file.cf,
+                            checksum,
+                            expected,
+                        ),
+                    ));
+                }
+            }
+
+            if cf_size == 0 || left == 0 {
+                self.cf_index += 1;
+                continue;
+            }
+
+            let file = cf_file.file.as_mut().unwrap();
+            let digest = cf_file.write_digest.as_mut().unwrap();
+            let mut limit_writer = LimitWriter::new(self.io_limiter.clone(), file);
+
+            let bytes = cmp::min(next_buf.len(), left);
+            limit_writer.write_all(&next_buf[0..bytes])?;
+            digest.write(&next_buf[0..bytes]);
+            cf_file.write_bytes += bytes;
+
+            if bytes < next_buf.len() {
+                self.cf_index += 1;
+                next_buf = &buf[bytes..];
+            } else {
+                return Ok(buf.len());
+            }
+        }
+        Ok(buf.len() - next_buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(cf_file) = self.cf_files.get_mut(self.cf_index) {
+            let file = cf_file.file.as_mut().unwrap();
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Snap {
     fn drop(&mut self) {
         if !self.hold_tmp_files {
@@ -456,6 +590,23 @@ impl fmt::Debug for Snap {
     }
 }
 
+pub struct ApplyOptions {
+    pub db: Arc<DB>,
+    pub region: Region,
+    pub abort: Arc<AtomicUsize>,
+    pub write_batch_size: usize,
+}
+
+impl ApplyOptions {
+    fn check_abort(&self) -> bool {
+        self.abort.compare_and_swap(
+            JOB_STATUS_CANCELLING,
+            JOB_STATUS_CANCELLED,
+            Ordering::Relaxed,
+        ) == JOB_STATUS_CANCELLING
+    }
+}
+
 /// `SnapStats` is for snapshot statistics.
 #[derive(Default)]
 pub struct SnapStats {
@@ -478,10 +629,10 @@ impl SnapEntry {
         match *self {
             SnapEntry::Generating => "Generating",
             SnapEntry::Generated => "Generated",
-            SnapEnry::Sending(_) => "Sending",
-            SnapEnry::Receiving => "Receiving",
-            SnapEnry::Received => "Received",
-            SnapEnry::Applying => "Applying",
+            SnapEntry::Sending(_) => "Sending",
+            SnapEntry::Receiving => "Receiving",
+            SnapEntry::Received => "Received",
+            SnapEntry::Applying => "Applying",
         }
     }
 }
@@ -562,18 +713,12 @@ impl SnapManagerCore {
         }
     }
 
-    fn before_receiving(&self, key: SnapKey) -> ::std::result::Result<Option<()>, Error> {
+    fn before_receiving(&self, key: SnapKey) -> SnapResult<()> {
         match self.registry.lock().unwrap().entry(key) {
-            Entry::Occupied(e) => {
-                let e = e.get();
-                match e {
-                    SnapEntry::Received => return Ok(None),
-                    e => return Error::Config(e.display(), "Receiving"),
-                }
-            }
+            Entry::Occupied(e) => return Err(Error::Conflict(e.get().display(), "Receiving")),
             Entry::Vacant(e) => {
                 e.insert(SnapEntry::Receiving);
-                return Ok(Some(()));
+                return Ok(());
             }
         }
     }
@@ -632,6 +777,7 @@ impl SnapManager {
             let core = Arc::clone(&self.core);
             match snap.build(region, db_snap, limiter) {
                 Ok(_) => {
+                    let total_size = snap.total_size();
                     core.snap_size.fetch_add(total_size, Ordering::SeqCst);
                     snap.deregister = Some(box move || core.post_build_success(key));
                 }
@@ -647,7 +793,7 @@ impl SnapManager {
         let mut snapshot_data = RaftSnapshotData::new();
         snapshot_data.set_file_size(snap.total_size() as u64);
         snapshot_data.set_version(SNAPSHOT_VERSION);
-        snapshot_data.set_meta(snap.meta_file.meta);
+        snapshot_data.set_meta(snap.meta_file.meta.clone());
         Ok(Some(snapshot_data))
     }
 
@@ -663,29 +809,27 @@ impl SnapManager {
         Ok(snap)
     }
 
-    pub fn get_snapshot_for_receiving(
-        &self,
-        key: SnapKey,
-        data: &[u8],
-    ) -> RaftStoreResult<Option<Snap>> {
+    pub fn get_snapshot_for_receiving(&self, key: SnapKey, data: &[u8]) -> RaftStoreResult<Snap> {
         let mut snap = Snap::new(PathBuf::from(&self.core.base), key, false);
         snap.meta_file.meta.merge_from_bytes(data)?;
         snap.init_for_receiving()?;
 
-        match self.core.before_receiving(key)? {
-            Ok(Some(_)) => {
-                let core = Arc::clone(&self.core);
-                snap.deregister = Some(box move || core.post_receiving(key));
-                Ok(Some(snap))
-            }
-            err_or_none => return err_or_none,
-        }
+        self.core.before_receiving(key)?;
+        let core = Arc::clone(&self.core);
+        snap.deregister = Some(box move || core.post_receiving(key));
+        Ok(snap)
     }
 
-    pub fn get_snapshot_for_applying(&self, key: SnapKey) -> RaftStoreResult<Snap> {
-        // TODO: finish this.
+    pub fn apply_snapshot(&mut self, key: SnapKey, options: ApplyOptions) -> RaftStoreResult<()> {
         let mut snap = Snap::new(PathBuf::from(&self.core.base), key, false);
-        Ok(snap)
+        snap.init_for_applying()?;
+        for (i, cf_file) in snap.cf_files.iter_mut().enumerate() {
+            if snap.meta_file.meta.get_cf_files()[i].get_size() == 0 {
+                continue;
+            }
+            cf_file.apply(&options)?;
+        }
+        Ok(())
     }
 
     pub fn delete_snapshot(&self, key: SnapKey) {}
@@ -700,6 +844,7 @@ impl SnapManager {
             match entry {
                 SnapEntry::Sending(c) => stats.sending_count += *c,
                 SnapEntry::Received => stats.receiving_count += 1,
+                _ => {}
             }
         }
         stats

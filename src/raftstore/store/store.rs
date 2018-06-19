@@ -831,8 +831,6 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             // delete them here. If the snapshot file will be reused when
             // receiving, then it will fail to pass the check again, so
             // missing snapshot files should not be noticed.
-            let s = self.snap_mgr.get_snapshot_for_applying(key)?;
-            self.snap_mgr.delete_snapshot(key);
             return Ok(());
         }
 
@@ -1225,8 +1223,6 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 return Ok(Some(key));
             }
         }
-        // check if snapshot file exists.
-        self.snap_mgr.get_snapshot_for_applying(key)?;
 
         self.pending_snapshot_regions.push(snap_region);
         self.pending_cross_snap.remove(&region_id);

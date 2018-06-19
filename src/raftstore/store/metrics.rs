@@ -77,6 +77,19 @@ lazy_static! {
             &["type"]
         ).unwrap();
 
+    pub static ref SNAPSHOT_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
+        "tikv_raftstore_snapshot_total",
+        "Total number of raftstore snapshot processed.",
+        &["type", "status"]
+    ).unwrap();
+
+    pub static ref SNAPSHOT_HISTOGRAM: HistogramVec = register_histogram_vec!(
+        "tikv_raftstore_snapshot_duration_seconds",
+        "Bucketed histogram of raftstore snapshot process duration",
+        &["type"],
+        exponential_buckets(0.0005, 2.0, 20).unwrap()
+    ).unwrap();
+
     pub static ref STORE_SNAPSHOT_TRAFFIC_GAUGE_VEC: IntGaugeVec =
         register_int_gauge_vec!(
             "tikv_raftstore_snapshot_traffic_total",

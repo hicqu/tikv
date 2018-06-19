@@ -22,11 +22,10 @@ use kvproto::raft_serverpb::{PeerState, RaftApplyState, RegionLocalState};
 use raft::eraftpb::Snapshot as RaftSnapshot;
 use rocksdb::{Writable, WriteBatch, DB};
 
+use raftstore::Result;
 use raftstore::store::engine::{Mutable, Snapshot};
-use raftstore::store::peer_storage::{JOB_STATUS_CANCELLED, JOB_STATUS_CANCELLING,
-                                     JOB_STATUS_FAILED, JOB_STATUS_FINISHED, JOB_STATUS_PENDING,
-                                     JOB_STATUS_RUNNING};
-use raftstore::store::snap::Error;
+use raftstore::store::peer_storage::*;
+use raftstore::store::snap::ApplyOptions;
 use raftstore::store::{self, keys, Peekable, SnapKey, SnapManager};
 use storage::CF_RAFT;
 use util::threadpool::{DefaultContext, ThreadPool, ThreadPoolBuilder};
@@ -210,11 +209,7 @@ struct SnapContext {
 }
 
 impl SnapContext {
-    fn generate_snap(
-        &self,
-        region_id: u64,
-        notifier: SyncSender<RaftSnapshot>,
-    ) -> Result<(), Error> {
+    fn generate_snap(&self, region_id: u64, notifier: SyncSender<RaftSnapshot>) -> Result<()> {
         // do we need to check leader here?
         let raft_db = Arc::clone(&self.raft_db);
         let raw_snap = Snapshot::new(Arc::clone(&self.kv_db));
@@ -256,11 +251,9 @@ impl SnapContext {
         timer.observe_duration();
     }
 
-    fn apply_snap(&mut self, region_id: u64, abort: Arc<AtomicUsize>) -> Result<(), Error> {
-        /*******************************************************
+    fn apply_snap(&mut self, region_id: u64, abort: Arc<AtomicUsize>) -> Result<()> {
         info!("[region {}] begin apply snap data", region_id);
         fail_point!("region_apply_snap");
-        check_abort(&abort)?;
         let region_key = keys::region_state_key(region_id);
         let mut region_state: RegionLocalState =
             match box_try!(self.kv_db.get_msg_cf(CF_RAFT, &region_key)) {
@@ -277,7 +270,6 @@ impl SnapContext {
         let region = region_state.get_region().clone();
         let start_key = keys::enc_start_key(&region);
         let end_key = keys::enc_end_key(&region);
-        check_abort(&abort)?;
         self.cleanup_overlap_ranges(&start_key, &end_key);
         box_try!(util::delete_all_in_range(
             &self.kv_db,
@@ -285,7 +277,6 @@ impl SnapContext {
             &end_key,
             self.use_delete_range
         ));
-        check_abort(&abort)?;
 
         let state_key = keys::apply_state_key(region_id);
         let apply_state: RaftApplyState = match box_try!(self.kv_db.get_msg_cf(CF_RAFT, &state_key))
@@ -301,15 +292,7 @@ impl SnapContext {
         let term = apply_state.get_truncated_state().get_term();
         let idx = apply_state.get_truncated_state().get_index();
         let snap_key = SnapKey::new(region_id, term, idx);
-        self.mgr.register(snap_key.clone(), SnapEntry::Applying);
-        defer!({
-            self.mgr.deregister(&snap_key, &SnapEntry::Applying);
-        });
-        let mut s = box_try!(self.mgr.get_snapshot_for_applying(&snap_key));
-        if !s.exists() {
-            return Err(box_err!("missing snapshot file {}", s.path()));
-        }
-        check_abort(&abort)?;
+
         let timer = Instant::now();
         let options = ApplyOptions {
             db: Arc::clone(&self.kv_db),
@@ -317,7 +300,8 @@ impl SnapContext {
             abort: Arc::clone(&abort),
             write_batch_size: self.batch_size,
         };
-        s.apply(options)?;
+
+        self.mgr.apply_snapshot(snap_key, options)?;
 
         let wb = WriteBatch::new();
         region_state.set_state(PeerState::Normal);
@@ -333,7 +317,6 @@ impl SnapContext {
             timer.elapsed()
         );
         Ok(())
-        *******************************************************/
     }
 
     fn handle_apply(&mut self, region_id: u64, status: Arc<AtomicUsize>) {
@@ -342,29 +325,21 @@ impl SnapContext {
         let apply_histogram = SNAP_HISTOGRAM.with_label_values(&["apply"]);
         let timer = apply_histogram.start_coarse_timer();
 
-        match self.apply_snap(region_id, Arc::clone(&status)) {
-            Ok(()) => {
-                status.swap(JOB_STATUS_FINISHED, Ordering::SeqCst);
-                SNAP_COUNTER_VEC
-                    .with_label_values(&["apply", "success"])
-                    .inc();
-            }
-            Err(Error::Abort) => {
+        let counter = match self.apply_snap(region_id, Arc::clone(&status)) {
+            Ok(()) => if status.load(Ordering::Relaxed) == JOB_STATUS_CANCELLED {
                 warn!("applying snapshot for region {} is aborted.", region_id);
-                assert_eq!(
-                    status.swap(JOB_STATUS_CANCELLED, Ordering::SeqCst),
-                    JOB_STATUS_CANCELLING
-                );
-                SNAP_COUNTER_VEC
-                    .with_label_values(&["apply", "abort"])
-                    .inc();
-            }
+                SNAP_COUNTER_VEC.with_label_values(&["apply", "abort"])
+            } else {
+                status.swap(JOB_STATUS_FINISHED, Ordering::SeqCst);
+                SNAP_COUNTER_VEC.with_label_values(&["apply", "success"])
+            },
             Err(e) => {
                 error!("failed to apply snap: {:?}!!!", e);
                 status.swap(JOB_STATUS_FAILED, Ordering::SeqCst);
-                SNAP_COUNTER_VEC.with_label_values(&["apply", "fail"]).inc();
+                SNAP_COUNTER_VEC.with_label_values(&["apply", "fail"])
             }
-        }
+        };
+        counter.inc();
 
         timer.observe_duration();
     }
