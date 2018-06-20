@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
-use std::{cmp, error, str, thread, time, u64};
+use std::{cmp, error, result, str, thread, time, u64};
 
 use crc::crc32::{self, Digest, Hasher32};
 use protobuf::stream::CodedInputStream;
@@ -69,8 +69,6 @@ quick_error! {
         }
     }
 }
-
-type SnapResult<T> = ::std::result::Result<T, Error>;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct SnapKey {
@@ -254,7 +252,7 @@ pub struct Snap {
     cf_index: usize,
     io_limiter: Option<Arc<IOLimiter>>,
     // Callback to update status in registry.
-    deregister: Option<Box<FnBox() + Send>>,
+    deregister: Option<Box<FnBox(Snap) + Send>>,
 }
 
 impl Snap {
@@ -576,7 +574,7 @@ impl Drop for Snap {
             delete_file_if_exist(&self.meta_file.tmp_path());
         }
         if let Some(deregister) = self.deregister.take() {
-            deregister();
+            deregister(*self);
         }
     }
 }
@@ -646,58 +644,61 @@ struct SnapManagerCore {
 
 impl SnapManagerCore {
     // Return a tuple indicates (redundant, need_build).
-    fn before_build(&self, key: SnapKey) -> (bool, bool) {
+    fn before_build(&self, key: SnapKey) -> result::Result<(bool, bool), Error> {
         match self.registry.lock().unwrap().entry(key) {
             Entry::Occupied(e) => match e.get() {
-                SnapEntry::Generating => (true, false),
-                SnapEntry::Generated | SnapEntry::Sending(_) => (false, false),
-                _ => unreachable!(),
+                SnapEntry::Generating => Ok((true, false)),
+                SnapEntry::Generated | SnapEntry::Sending(_) => Ok((false, false)),
+                e => Err(Error::Conflict(e.display(), "Generating")),
             },
             Entry::Vacant(e) => {
                 e.insert(SnapEntry::Generating);
-                (true, true)
+                Ok((true, true))
             }
         }
     }
 
     fn post_build_success(&self, key: SnapKey) {
         match self.registry.lock().unwrap().entry(key) {
-            Entry::Occupied(e) => {
+            Entry::Occupied(mut e) => {
                 let e_mut = e.get_mut();
-                assert_eq!(e_mut, &SnapEntry::Generating);
-                *e_mut = SnapEntry::Generated;
+                match e_mut {
+                    SnapEntry::Generating => *e_mut = SnapEntry::Generated,
+                    e => panic!("{}", Error::Conflict(e_mut.display(), "Generated")),
+                }
             }
-            _ => unreachable!(),
+            _ => panic!("{}", Error::Conflict("None", "Generated")),
         }
     }
 
     fn post_build_fail(&self, key: SnapKey) {
         match self.registry.lock().unwrap().entry(key) {
-            Entry::Occupied(e) => {
-                assert_eq!(e.get(), &SnapEntry::Generating);
-                e.remove();
-            }
-            _ => unreachable!(),
-        }
+            Entry::Occupied(e) => match e.get() {
+                SnapEntry::Generating => e.remove(),
+                e => panic!("{}", Error::Conflict(e.display(), "None")),
+            },
+            _ => panic!("{}", Error::Conflict("None", "None")),
+        };
     }
 
-    fn before_send(&self, key: SnapKey) {
+    fn before_send(&self, key: SnapKey) -> result::Result<(), Error> {
         match self.registry.lock().unwrap().entry(key) {
-            Entry::Occupied(e) => {
+            Entry::Occupied(mut e) => {
                 let e_mut = e.get_mut();
                 match e_mut {
                     SnapEntry::Generated => *e_mut = SnapEntry::Sending(1),
                     SnapEntry::Sending(c) => *c += 1,
-                    _ => unreachable!(),
+                    e => return Err(Error::Conflict(e.display(), "Sending")),
                 };
             }
-            _ => unreachable!(),
+            _ => return Err(Error::Conflict("None", "Sending")),
         }
+        Ok(())
     }
 
     fn post_send(&self, key: SnapKey) {
         match self.registry.lock().unwrap().entry(key) {
-            Entry::Occupied(e) => {
+            Entry::Occupied(mut e) => {
                 let e_mut = e.get_mut();
                 match e_mut {
                     SnapEntry::Sending(c) => {
@@ -706,14 +707,14 @@ impl SnapManagerCore {
                             *e_mut = SnapEntry::Generated;
                         }
                     }
-                    _ => unreachable!(),
+                    e => panic!("{}", Error::Conflict(e.display(), "Generated")),
                 }
             }
-            _ => unreachable!(),
+            _ => panic!("{}", Error::Conflict("None", "Generated")),
         }
     }
 
-    fn before_receiving(&self, key: SnapKey) -> SnapResult<()> {
+    fn before_receiving(&self, key: SnapKey) -> result::Result<(), Error> {
         match self.registry.lock().unwrap().entry(key) {
             Entry::Occupied(e) => return Err(Error::Conflict(e.get().display(), "Receiving")),
             Entry::Vacant(e) => {
@@ -723,9 +724,27 @@ impl SnapManagerCore {
         }
     }
 
-    fn post_receiving(&self, key: SnapKey) {
-        // TODO: finish this.
-        // have too much redundant code.
+    fn post_receiving_success(&self, key: SnapKey) {
+        match self.registry.lock().unwrap().entry(key) {
+            Entry::Occupied(mut e) => {
+                let e_mut = e.get_mut();
+                match e_mut {
+                    SnapEntry::Receiving => *e_mut = SnapEntry::Received,
+                    e => panic!("{}", Error::Conflict(e_mut.display(), "Received")),
+                }
+            }
+            _ => panic!("{}", Error::Conflict("None", "Received")),
+        }
+    }
+
+    fn post_receiving_fail(&self, key: SnapKey) {
+        match self.registry.lock().unwrap().entry(key) {
+            Entry::Occupied(e) => match e.get() {
+                SnapEntry::Receiving => e.remove(),
+                e => panic!("{}", Error::Conflict(e.display(), "None")),
+            },
+            _ => panic!("{}", Error::Conflict("None", "None")),
+        };
     }
 }
 
@@ -766,7 +785,7 @@ impl SnapManager {
         region: &Region,
         db_snap: &DbSnapshot,
     ) -> RaftStoreResult<Option<RaftSnapshotData>> {
-        let (redundant, need_build) = self.core.before_build(key);
+        let (redundant, need_build) = self.core.before_build(key)?;
         if redundant {
             return Ok(None);
         }
@@ -779,10 +798,10 @@ impl SnapManager {
                 Ok(_) => {
                     let total_size = snap.total_size();
                     core.snap_size.fetch_add(total_size, Ordering::SeqCst);
-                    snap.deregister = Some(box move || core.post_build_success(key));
+                    snap.deregister = Some(box move |_| core.post_build_success(key));
                 }
                 Err(e) => {
-                    snap.deregister = Some(box move || core.post_build_fail(key));
+                    snap.deregister = Some(box move |_| core.post_build_fail(key));
                     return Err(e);
                 }
             };
@@ -804,7 +823,7 @@ impl SnapManager {
 
         self.core.before_send(key);
         let core = Arc::clone(&self.core);
-        snap.deregister = Some(box move || core.post_send(key));
+        snap.deregister = Some(box move |_| core.post_send(key));
 
         Ok(snap)
     }
@@ -816,7 +835,7 @@ impl SnapManager {
 
         self.core.before_receiving(key)?;
         let core = Arc::clone(&self.core);
-        snap.deregister = Some(box move || core.post_receiving(key));
+        snap.deregister = Some(box move |_| core.post_receiving(key));
         Ok(snap)
     }
 
@@ -829,6 +848,7 @@ impl SnapManager {
             }
             cf_file.apply(&options)?;
         }
+        // TODO: update region local state here.
         Ok(())
     }
 
