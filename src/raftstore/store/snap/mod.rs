@@ -19,8 +19,9 @@ pub use self::builder::SnapshotReceiver;
 use self::migration::*;
 use self::reader::SnapshotApplyer;
 pub use self::reader::SnapshotSender;
+use self::util::Result;
 use self::util::*;
-pub use self::util::{ApplyOptions, Error as SnapError, SnapKey, SnapStaleNotifier};
+pub use self::util::{ApplyOptions, Error, SnapKey, SnapStaleNotifier};
 
 use std::fs::{self, File};
 use std::io;
@@ -38,7 +39,6 @@ use kvproto::raft_serverpb::{RaftSnapshotData, SnapshotMeta};
 
 use raftstore::store::engine::Snapshot as DbSnapshot;
 use raftstore::store::Msg;
-use raftstore::{Error, Result};
 use util::collections::HashMap;
 use util::file::{create_dir_if_not_exist, delete_dir_if_exist};
 use util::io_limiter::IOLimiter;
@@ -125,7 +125,7 @@ impl SnapManager {
             }
             Err(e) => {
                 error!("{} build_snapshot fail when generate: {}", key, e);
-                Err(Error::Snapshot(e))
+                Err(e)
             }
         }
     }
@@ -144,7 +144,7 @@ impl SnapManager {
             }
         }
         error!("{} get_snapshot_sender without avaliable snapshot", key);
-        Err(Error::Snapshot(SnapError::Unavaliable))
+        Err(Error::Unavaliable)
     }
 
     pub fn get_snapshot_receiver(
@@ -162,7 +162,7 @@ impl SnapManager {
 
         if !self.register(false, key, None, true)? {
             error!("{} get_snapshot_receiver conflicts when receiving", key);
-            return Err(Error::Snapshot(SnapError::Conflict));
+            return Err(Error::Conflict);
         }
 
         info!("{} get_snapshot_receiver success, meta: {:?}", key, meta);
@@ -190,11 +190,10 @@ impl SnapManager {
             };
 
             return SnapshotApplyer::new(dir, key, meta, notifier, ref_count, used_times)
-                .and_then(|applyer| applyer.apply(options))
-                .map_err(|e| Error::Snapshot(e));
+                .and_then(|applyer| applyer.apply(options));
         }
         error!("{} apply_snapshot without avaliable snapshot", key);
-        Err(Error::Snapshot(SnapError::Unavaliable))
+        Err(Error::Unavaliable)
     }
 
     // Migrate old snapshot files to subdir, which is a new layout.
@@ -374,7 +373,7 @@ impl SnapManager {
             let size = self.snap_size.load(Ordering::SeqCst);
             let limit = self.max_total_size;
             if size > limit {
-                return Err(Error::Snapshot(SnapError::NoSpace(size, limit)));
+                return Err(Error::NoSpace(size, limit));
             }
         }
         Ok(())

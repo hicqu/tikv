@@ -23,10 +23,10 @@ use raft::eraftpb::Snapshot as RaftSnapshot;
 
 use raftstore::store::engine::Snapshot;
 use raftstore::store::peer_storage::*;
-use raftstore::store::snap::{ApplyOptions, SnapError, SnapStaleNotifier};
+use raftstore::store::snap::{ApplyOptions, Error as SnapError, SnapStaleNotifier};
 use raftstore::store::util::Engines;
 use raftstore::store::{self, keys, Peekable, SnapKey, SnapManager};
-use raftstore::{Error as RaftStoreError, Result};
+use raftstore::{Error, Result};
 use storage::CF_RAFT;
 use util::threadpool::{DefaultContext, ThreadPool, ThreadPoolBuilder};
 use util::timer::Timer;
@@ -356,7 +356,7 @@ impl SnapContext {
                     .with_label_values(&["apply", "success"])
                     .inc();
             }
-            Err(RaftStoreError::Snapshot(SnapError::Abort)) => {
+            Err(Error::Snapshot(SnapError::Abort)) => {
                 // Abort normally is caused by raftstore canceled the apply.
                 warn!("applying snapshot for region {} is aborted.", region_id);
                 SNAP_COUNTER_VEC

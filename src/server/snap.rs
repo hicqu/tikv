@@ -196,7 +196,9 @@ impl RecvSnapContext {
 
         let snap = {
             let data = meta.get_message().get_snapshot().get_data();
-            snap_mgr.get_snapshot_receiver(key, data)?
+            snap_mgr
+                .get_snapshot_receiver(key, data)
+                .map_err(RaftError::Snapshot)?
         };
 
         Ok(RecvSnapContext {

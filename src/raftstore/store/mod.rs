@@ -48,7 +48,7 @@ pub use self::peer_storage::{
     RAFT_INIT_LOG_TERM,
 };
 pub use self::region_snapshot::{RegionIterator, RegionSnapshot};
-pub use self::snap::*;
+pub use self::snap::{Error as SnapError, *};
 pub use self::store::{create_event_loop, new_compaction_listener, Store, StoreChannel, StoreStat};
 pub use self::transport::Transport;
 pub use self::util::Engines;
