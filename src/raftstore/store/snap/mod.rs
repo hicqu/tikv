@@ -13,117 +13,45 @@
 mod builder;
 mod migration;
 mod reader;
+mod util;
 use self::builder::SnapshotGenerator;
 pub use self::builder::SnapshotReceiver;
 use self::migration::*;
 use self::reader::SnapshotApplyer;
 pub use self::reader::SnapshotSender;
+use self::util::*;
+pub use self::util::{ApplyOptions, Error as SnapError, SnapKey, SnapStaleNotifier};
 
 use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
-use std::{fmt, io};
 
 use protobuf::stream::CodedInputStream;
 use protobuf::Message;
 use regex::Regex;
 
 use kvproto::metapb::Region;
-use kvproto::raft_serverpb::{RaftSnapshotData, RegionLocalState, SnapshotCFFile, SnapshotMeta};
-use raft::eraftpb::Snapshot as RaftSnapshot;
-use rocksdb::DB;
+use kvproto::raft_serverpb::{RaftSnapshotData, SnapshotMeta};
 
 use raftstore::store::engine::Snapshot as DbSnapshot;
-use raftstore::store::peer_storage::SnapStaleNotifier;
 use raftstore::store::Msg;
 use raftstore::{Error, Result};
-use storage::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use util::collections::HashMap;
 use util::file::{create_dir_if_not_exist, delete_dir_if_exist};
-use util::io_limiter::{IOLimiter, LimitWriter};
+use util::io_limiter::IOLimiter;
 use util::time::Instant;
 use util::transport::SendCh;
 
-const SNAPSHOT_VERSION: u64 = 2;
-const SNAPSHOT_CFS: &[CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE];
-
-const SNAP_GEN_PREFIX: &str = "gen";
-const SNAP_REV_PREFIX: &str = "rev";
-
-const META_FILE_NAME: &str = "meta";
-const SST_FILE_SUFFIX: &str = ".sst";
-const TMP_FILE_SUFFIX: &str = ".tmp";
-const CLONE_FILE_SUFFIX: &str = ".clone";
-
-quick_error! {
-    #[derive(Debug, Clone)]
-    pub enum SnapError {
-        Abort {
-            description("abort")
-            display("abort")
-        }
-        Stale {
-            description("stale snapshot")
-            description("stale snapshot")
-        }
-        Unavaliable {
-            description("snapshot unavaliable")
-            description("snapshot unavaliable")
-        }
-        Conflict {
-            description("snapshot conflict")
-            description("snapshot conflict")
-        }
-        NoSpace(size: u64, limit: u64) {
-            description("disk space exceed")
-            display("NoSpace, size: {}, limit: {}", size, limit)
-        }
-    }
+/// `SnapStats` is for snapshot statistics.
+#[derive(Default)]
+pub struct SnapStats {
+    pub sending_count: usize,
+    pub receiving_count: usize,
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct SnapKey {
-    pub region_id: u64,
-    pub term: u64,
-    pub idx: u64,
-}
-
-impl fmt::Display for SnapKey {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}_{}_{}", self.region_id, self.term, self.idx)
-    }
-}
-
-impl SnapKey {
-    #[inline]
-    pub fn new(region_id: u64, term: u64, idx: u64) -> SnapKey {
-        SnapKey {
-            region_id,
-            term,
-            idx,
-        }
-    }
-
-    pub fn from_region_snap(region_id: u64, snap: &RaftSnapshot) -> SnapKey {
-        let index = snap.get_metadata().get_index();
-        let term = snap.get_metadata().get_term();
-        SnapKey::new(region_id, term, index)
-    }
-
-    pub fn from_snap(snap: &RaftSnapshot) -> io::Result<SnapKey> {
-        let mut snap_data = RaftSnapshotData::new();
-        if let Err(e) = snap_data.merge_from_bytes(snap.get_data()) {
-            return Err(io::Error::new(io::ErrorKind::Other, e));
-        }
-
-        Ok(SnapKey::from_region_snap(
-            snap_data.get_region().get_id(),
-            snap,
-        ))
-    }
-}
 #[derive(Clone)]
 pub struct SnapManager {
     core: Arc<SnapManagerCore>,
@@ -197,7 +125,7 @@ impl SnapManager {
             }
             Err(e) => {
                 error!("{} build_snapshot fail when generate: {}", key, e);
-                Err(e)
+                Err(Error::Snapshot(e))
             }
         }
     }
@@ -262,7 +190,8 @@ impl SnapManager {
             };
 
             return SnapshotApplyer::new(dir, key, meta, notifier, ref_count, used_times)
-                .and_then(|applyer| applyer.apply(options));
+                .and_then(|applyer| applyer.apply(options))
+                .map_err(|e| Error::Snapshot(e));
         }
         error!("{} apply_snapshot without avaliable snapshot", key);
         Err(Error::Snapshot(SnapError::Unavaliable))
@@ -526,19 +455,6 @@ impl SnapManagerBuilder {
     }
 }
 
-/// `SnapStats` is for snapshot statistics.
-#[derive(Default)]
-pub struct SnapStats {
-    pub sending_count: usize,
-    pub receiving_count: usize,
-}
-
-pub struct ApplyOptions {
-    pub db: Arc<DB>,
-    pub region_state: RegionLocalState,
-    pub write_batch_size: usize,
-}
-
 #[derive(Clone)]
 struct SnapUsage {
     snap_stale_notifier: Option<Arc<SnapStaleNotifier>>,
@@ -621,64 +537,6 @@ fn gen_snap_dir(dir: &str, for_send: bool, key: SnapKey) -> PathBuf {
     dir_path.join(&snap_dir_name)
 }
 
-fn gen_tmp_snap_dir(dir: &str, for_send: bool, key: SnapKey) -> PathBuf {
-    let dir_path = PathBuf::from(dir);
-    let snap_dir_name = if for_send {
-        format!("{}_{}{}", SNAP_GEN_PREFIX, key, TMP_FILE_SUFFIX)
-    } else {
-        format!("{}_{}{}", SNAP_REV_PREFIX, key, TMP_FILE_SUFFIX)
-    };
-    dir_path.join(&snap_dir_name)
-}
-
-fn gen_meta_file_path(dir: &str, for_send: bool, key: SnapKey) -> PathBuf {
-    let snap_dir = gen_snap_dir(dir, for_send, key);
-    snap_dir.join(META_FILE_NAME)
-}
-
-fn gen_cf_file_path(dir: &str, for_send: bool, key: SnapKey, cf: &str) -> PathBuf {
-    let snap_dir = gen_snap_dir(dir, for_send, key);
-    let file_name = format!("{}{}", cf, SST_FILE_SUFFIX);
-    snap_dir.join(&file_name)
-}
-
-fn plain_file_used(cf: &str) -> bool {
-    cf == CF_LOCK
-}
-
-fn snapshot_size_corrupt(expected: u64, got: u64) -> Error {
-    Error::from(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "snapshot size corrupted, expected: {}, got: {}",
-            expected, got
-        ),
-    ))
-}
-
-fn snapshot_checksum_corrupt(expected: u32, got: u32) -> Error {
-    Error::from(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "snapshot checksum corrupted, expected: {}, got: {}",
-            expected, got
-        ),
-    ))
-}
-
-fn stale_for_generate(key: SnapKey, snap_stale_notifier: &SnapStaleNotifier) -> bool {
-    let compacted_term = snap_stale_notifier.compacted_term.load(Ordering::SeqCst);
-    let compacted_idx = snap_stale_notifier.compacted_idx.load(Ordering::SeqCst);
-    key.term < compacted_term || key.idx < compacted_idx
-}
-
-fn stale_for_apply(key: SnapKey, snap_stale_notifier: &SnapStaleNotifier) -> bool {
-    let compacted_term = snap_stale_notifier.compacted_term.load(Ordering::SeqCst);
-    let compacted_idx = snap_stale_notifier.compacted_idx.load(Ordering::SeqCst);
-    let apply_canceled = snap_stale_notifier.apply_canceled.load(Ordering::SeqCst);
-    key.term < compacted_term || key.idx < compacted_idx || apply_canceled
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
@@ -700,20 +558,6 @@ mod tests {
     const TEST_STORE_ID: u64 = 1;
     const TEST_WRITE_BATCH_SIZE: usize = 10 * 1024 * 1024;
 
-    pub fn get_test_region(region_id: u64, store_id: u64, peer_id: u64) -> Region {
-        let mut peer = Peer::new();
-        peer.set_store_id(store_id);
-        peer.set_id(peer_id);
-        let mut region = Region::new();
-        region.set_id(region_id);
-        region.set_start_key(b"a".to_vec());
-        region.set_end_key(b"z".to_vec());
-        region.mut_region_epoch().set_version(1);
-        region.mut_region_epoch().set_conf_ver(1);
-        region.mut_peers().push(peer.clone());
-        region
-    }
-
     fn assert_eq_db(expected_db: &DB, db: &DB) {
         let key = keys::data_key(TEST_KEY);
         for cf in SNAPSHOT_CFS {
@@ -731,12 +575,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    pub fn get_test_empty_db(path: &TempDir) -> Result<Arc<DB>> {
-        let p = path.path().to_str().unwrap();
-        let db = rocksdb::new_engine(p, ALL_CFS, None)?;
-        Ok(Arc::new(db))
     }
 
     pub fn get_test_db(path: &TempDir) -> Result<Arc<DB>> {
@@ -779,48 +617,12 @@ mod tests {
         assert_eq!(snap_size, total_size);
     }
 
-    pub fn new_snap_stale_notifier() -> Arc<SnapStaleNotifier> {
-        Arc::new(SnapStaleNotifier {
-            compacted_term: AtomicU64::new(0),
-            compacted_idx: AtomicU64::new(0),
-            apply_canceled: AtomicBool::new(false),
-        })
-    }
-
     #[test]
     fn test_get_snap_key_from_snap_dir() {
         for name in &["gen_1_2_3", "rev_1_2_3"] {
             let (for_send, key) = get_snap_key_from_snap_dir(name).unwrap();
             assert_eq!(for_send, name.starts_with("gen"));
             assert_eq!(key, SnapKey::new(1, 2, 3));
-        }
-    }
-
-    #[test]
-    fn test_gen_meta_file_path() {
-        let key = SnapKey::new(1, 2, 3);
-        for &(dir, for_send, key, expected) in &[
-            ("abc", true, key, "abc/gen_1_2_3/meta"),
-            ("abc/", false, key, "abc/rev_1_2_3/meta"),
-            ("ab/c", false, key, "ab/c/rev_1_2_3/meta"),
-            ("", false, key, "rev_1_2_3/meta"),
-        ] {
-            let path = gen_meta_file_path(dir, for_send, key);
-            assert_eq!(path.to_str().unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn test_gen_cf_file_path() {
-        let key = SnapKey::new(1, 2, 3);
-        for &(dir, for_send, key, cf, expected) in &[
-            ("abc", true, key, CF_LOCK, "abc/gen_1_2_3/lock.sst"),
-            ("abc/", false, key, CF_WRITE, "abc/rev_1_2_3/write.sst"),
-            ("ab/c", false, key, CF_DEFAULT, "ab/c/rev_1_2_3/default.sst"),
-            ("", false, key, CF_LOCK, "rev_1_2_3/lock.sst"),
-        ] {
-            let path = gen_cf_file_path(dir, for_send, key, cf);
-            assert_eq!(path.to_str().unwrap(), expected);
         }
     }
 
@@ -996,27 +798,5 @@ mod tests {
         snap_mgr.gc_timeout = Duration::default();
         assert!(snap_mgr.get_snapshot_receiver(key, &data).is_ok());
         assert!(File::open(&meta_path).is_err());
-    }
-
-    #[bench]
-    fn bench_stale_for_generate(b: &mut Bencher) {
-        let notifier = SnapStaleNotifier {
-            compacted_term: AtomicU64::new(0),
-            compacted_idx: AtomicU64::new(0),
-            apply_canceled: AtomicBool::new(false),
-        };
-        let key = SnapKey::new(10, 10, 10);
-        b.iter(|| stale_for_generate(key, &notifier));
-    }
-
-    #[bench]
-    fn bench_stale_for_apply(b: &mut Bencher) {
-        let notifier = Arc::new(SnapStaleNotifier {
-            compacted_term: AtomicU64::new(0),
-            compacted_idx: AtomicU64::new(0),
-            apply_canceled: AtomicBool::new(false),
-        });
-        let key = SnapKey::new(10, 10, 10);
-        b.iter(|| stale_for_apply(key, notifier.as_ref()));
     }
 }

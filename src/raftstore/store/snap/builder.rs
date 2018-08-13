@@ -1,21 +1,38 @@
+// Copyright 2018 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#![allow(dead_code)] // TODO: remove this.
 use std::cmp;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, prelude::*};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crc::crc32::{self, Digest, Hasher32};
 use kvproto::metapb::Region;
+use kvproto::raft_serverpb::{SnapshotCFFile, SnapshotMeta};
+use protobuf::Message;
 use rocksdb::{DBCompressionType, EnvOptions, SstFileWriter};
 
 use raftstore::store::engine::{Iterable, Snapshot as DbSnapshot};
 use raftstore::store::keys::{enc_end_key, enc_start_key};
 use raftstore::store::metrics::*;
-use raftstore::store::snap::*;
-use raftstore::Result as RaftStoreResult;
+use raftstore::store::snap::util::*;
 use storage::CfName;
 use util::codec::bytes::BytesEncoder;
 use util::file::{calc_crc32, delete_dir_if_exist, get_file_size};
+use util::io_limiter::{IOLimiter, LimitWriter};
 use util::rocksdb::get_fastest_supported_compression_type;
 use util::time::duration_to_sec;
 use util::Either;
@@ -48,18 +65,21 @@ impl CfFile {
         io_limiter: Option<&IOLimiter>,
         snap_key: SnapKey,
         snap_stale_notifier: &SnapStaleNotifier,
-    ) -> RaftStoreResult<usize> {
-        let (mut cf_key_count, mut cf_size, mut stale) = (0, 0, false);
+    ) -> Result<usize> {
+        let (mut cf_key_count, mut cf_size) = (0, 0);
+        let mut stale = stale_for_generate(snap_key, snap_stale_notifier);
         match self.tmp_cf_file {
             Either::Left(ref mut file) => {
-                db_snap.scan_cf(self.cf, start_key, end_key, false, |key, value| {
-                    cf_key_count += 1;
-                    cf_size += key.len() + value.len();
-                    file.encode_compact_bytes(key)?;
-                    file.encode_compact_bytes(value)?;
-                    stale = stale_for_generate(snap_key, snap_stale_notifier);
-                    Ok(!stale)
-                })?;
+                box_try!(
+                    db_snap.scan_cf(self.cf, start_key, end_key, false, |key, value| {
+                        cf_key_count += 1;
+                        cf_size += key.len() + value.len();
+                        file.encode_compact_bytes(key)?;
+                        file.encode_compact_bytes(value)?;
+                        stale = stale_for_generate(snap_key, snap_stale_notifier);
+                        Ok(!stale)
+                    })
+                );
                 // use an empty byte array to indicate that cf reaches an end.
                 file.encode_compact_bytes(b"")?;
                 file.flush()?;
@@ -67,30 +87,32 @@ impl CfFile {
             Either::Right(ref mut writer) => {
                 let mut bytes = 0;
                 let base = io_limiter.map_or(0, |l| l.get_max_bytes_per_time());
-                db_snap.scan_cf(self.cf, &start_key, &end_key, false, |key, value| {
-                    let l = key.len() + value.len();
-                    cf_key_count += 1;
-                    cf_size += l;
-                    if let Some(ref limiter) = io_limiter {
-                        if bytes >= base {
-                            bytes = 0;
-                            limiter.request(base);
+                box_try!(
+                    db_snap.scan_cf(self.cf, &start_key, &end_key, false, |key, value| {
+                        let l = key.len() + value.len();
+                        cf_key_count += 1;
+                        cf_size += l;
+                        if let Some(ref limiter) = io_limiter {
+                            if bytes >= base {
+                                bytes = 0;
+                                limiter.request(base);
+                            }
+                            bytes += l as i64;
                         }
-                        bytes += l as i64;
-                    }
-                    writer.put(key, value)?;
-                    stale = stale_for_generate(snap_key, snap_stale_notifier);
-                    Ok(!stale)
-                })?;
+                        writer.put(key, value)?;
+                        stale = stale_for_generate(snap_key, snap_stale_notifier);
+                        Ok(!stale)
+                    })
+                );
                 if cf_key_count > 0 {
-                    writer.finish()?;
+                    box_try!(writer.finish());
                 }
             }
         }
 
         if stale {
             error!("{} build_snapshot meets stale db snap", snap_key);
-            return Err(Error::Snapshot(SnapError::Stale));
+            return Err(Error::Stale);
         }
 
         // TODO: calculate written bytes and crc32 while scaning.
@@ -151,7 +173,7 @@ impl SnapshotBase {
         }
         let tmp_meta_path = gen_meta_tmp_file_path(&self.dir, self.for_send, self.key);
         let mut tmp_meta_file = create_new_file_at(&tmp_meta_path)?;
-        snapshot_meta.write_to_writer(&mut tmp_meta_file)?;
+        box_try!(snapshot_meta.write_to_writer(&mut tmp_meta_file));
         tmp_meta_file.flush()?;
         tmp_meta_file.sync_all()?;
 
@@ -389,8 +411,8 @@ fn gen_sst_file_writer(
     db_snap: &DbSnapshot,
     cf: &str,
     tmp_cf_path: &PathBuf,
-) -> RaftStoreResult<SstFileWriter> {
-    let handle = db_snap.cf_handle(cf)?;
+) -> Result<SstFileWriter> {
+    let handle = box_try!(db_snap.cf_handle(cf));
     let mut io_options = db_snap.get_db().get_options_cf(handle).clone();
     io_options.compression(get_fastest_supported_compression_type());
     // in rocksdb 5.5.1, SstFileWriter will try to use bottommost_compression and
@@ -405,7 +427,12 @@ fn gen_sst_file_writer(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use raftstore::store::snap::builder::*;
+    use raftstore::store::snap::util::tests::*;
+    use storage::{CF_DEFAULT, CF_LOCK, CF_WRITE};
+    use util::file::create_dir_if_not_exist;
+
+    use tempdir::TempDir;
 
     #[test]
     fn test_gen_meta_tmp_file_path() {
@@ -439,5 +466,93 @@ mod tests {
             let path = gen_cf_tmp_file_path(dir, for_send, key, cf);
             assert_eq!(path.to_str().unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn test_generator_and_receiver() {
+        let base_dir = TempDir::new("test_generator_and_receiver_snap").unwrap();
+        let db_dir = TempDir::new("test_generator_and_receiver_db").unwrap();
+
+        let db = get_test_empty_db(&db_dir);
+        let region = get_test_region(1, 1, 1);
+
+        let base = base_dir.path().to_str().unwrap();
+        let key = SnapKey::new(1, 1, 1);
+        let io_limiter = None;
+        let stale_notifier = Arc::new(get_test_stale_notifier());
+        let size_tracker = Arc::new(AtomicU64::new(0));
+
+        let get_generator = || {
+            SnapshotGenerator::new(
+                base.to_owned(),
+                key,
+                io_limiter.clone(),
+                Arc::clone(&stale_notifier),
+                Arc::clone(&size_tracker),
+            )
+        };
+
+        let get_receiver = |meta: SnapshotMeta| {
+            SnapshotReceiver::new(
+                base.to_owned(),
+                key,
+                io_limiter.clone(),
+                meta,
+                Arc::clone(&size_tracker),
+            )
+        };
+
+        let tmp_dir = gen_tmp_snap_dir(base, true, key);
+        let snap_dir = gen_snap_dir(base, true, key);
+
+        // Build the snapshot should success.
+        create_dir_if_not_exist(&tmp_dir).unwrap();
+        let meta = get_generator()
+            .build(&region, DbSnapshot::new(Arc::clone(&db)))
+            .unwrap();
+        assert_eq!(size_tracker.load(Ordering::SeqCst), 1);
+        let content = fs::read(&gen_cf_file_path(base, true, key, CF_LOCK)).unwrap();
+        assert!(delete_dir_if_exist(&snap_dir).unwrap());
+        assert!(!delete_dir_if_exist(&tmp_dir).unwrap());
+
+        // Build the snapshot with stale db_snap should fail.
+        stale_notifier.compacted_idx.store(2, Ordering::SeqCst);
+        create_dir_if_not_exist(&tmp_dir).unwrap();
+        let err = get_generator()
+            .build(&region, DbSnapshot::new(Arc::clone(&db)))
+            .unwrap_err();
+        assert!(format!("{:?}", err).contains("Stale"));
+        assert!(!delete_dir_if_exist(&snap_dir).unwrap());
+        // The tmp dir will be always deleted after the generator is droped.
+        assert!(!delete_dir_if_exist(&tmp_dir).unwrap());
+
+        let recv_tmp_dir = gen_tmp_snap_dir(base, false, key);
+        let recv_snap_dir = gen_snap_dir(base, false, key);
+
+        // Receive the snapshot should success.
+        create_dir_if_not_exist(&recv_tmp_dir).unwrap();
+        let mut receiver = get_receiver(meta.clone());
+        receiver.write_all(&content).unwrap();
+        assert!(receiver.save().is_ok());
+        assert_eq!(size_tracker.load(Ordering::SeqCst), 2);
+        assert!(delete_dir_if_exist(&recv_snap_dir).unwrap());
+        drop(receiver);
+
+        // Receive with extra bytes should fail.
+        create_dir_if_not_exist(&recv_tmp_dir).unwrap();
+        let mut receiver = get_receiver(meta.clone());
+        let err = receiver.write_all(&[1, 2]).unwrap_err();
+        assert!(format!("{:?}", err).contains("extra"));
+        drop(receiver);
+        // The tmp dir will be always deleted after the receiver is droped.
+        assert!(!delete_dir_if_exist(&recv_tmp_dir).unwrap());
+
+        // Receive with wrong bytes should fail.
+        create_dir_if_not_exist(&recv_tmp_dir).unwrap();
+        let mut receiver = get_receiver(meta.clone());
+        receiver.write_all(&[1]).unwrap();
+        let err = receiver.save().unwrap_err();
+        assert!(format!("{:?}", err).contains("checksum"));
+        drop(receiver);
     }
 }

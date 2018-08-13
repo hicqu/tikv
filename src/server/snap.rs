@@ -28,6 +28,7 @@ use kvproto::raft_serverpb::RaftMessage;
 use kvproto::raft_serverpb::{Done, SnapshotChunk};
 use kvproto::tikvpb_grpc::TikvClient;
 
+use raftstore::errors::Error as RaftError;
 use raftstore::store::{SnapKey, SnapManager, SnapshotReceiver, SnapshotSender};
 use util::security::SecurityManager;
 use util::worker::Runnable;
@@ -211,7 +212,7 @@ impl RecvSnapContext {
             info!("{} saving received snapshot file", key);
             if let Err(e) = file.save() {
                 error!("{} saveing received snapshot fail: {}", key, e);
-                return Err(Error::from(e));
+                return Err(Error::from(RaftError::Snapshot(e)));
             }
         }
         info!("{} sending raft snapshot to raftstore", key);

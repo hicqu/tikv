@@ -29,7 +29,7 @@ use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{self, Error as RaftError, RaftState, Ready, Storage, StorageError};
 use rocksdb::{Writable, WriteBatch, DB};
 
-use raftstore::store::snap::SnapError;
+use raftstore::store::snap::{SnapError, SnapStaleNotifier};
 use raftstore::store::util::{conf_state_from_region, Engines};
 use raftstore::store::ProposalContext;
 use raftstore::{Error, Result};
@@ -226,13 +226,6 @@ impl CacheQueryStats {
         self.hit = 0;
         self.miss = 0;
     }
-}
-
-#[derive(Debug)]
-pub struct SnapStaleNotifier {
-    pub compacted_term: AtomicU64,
-    pub compacted_idx: AtomicU64,
-    pub apply_canceled: AtomicBool,
 }
 
 #[derive(Debug, Default)]

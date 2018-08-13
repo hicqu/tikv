@@ -23,7 +23,7 @@ use raft::eraftpb::Snapshot as RaftSnapshot;
 
 use raftstore::store::engine::Snapshot;
 use raftstore::store::peer_storage::*;
-use raftstore::store::snap::{ApplyOptions, SnapError};
+use raftstore::store::snap::{ApplyOptions, SnapError, SnapStaleNotifier};
 use raftstore::store::util::Engines;
 use raftstore::store::{self, keys, Peekable, SnapKey, SnapManager};
 use raftstore::{Error as RaftStoreError, Result};

@@ -1,15 +1,30 @@
+// Copyright 2018 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#![allow(dead_code)] // TODO: remove this.
 use std::fs::File;
 use std::io::{self, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use kvproto::raft_serverpb::PeerState;
+use kvproto::raft_serverpb::{PeerState, SnapshotMeta};
 use rocksdb::rocksdb_options::WriteOptions;
 use rocksdb::{IngestExternalFileOptions, Writable, WriteBatch};
 
 use raftstore::store::engine::Mutable;
 use raftstore::store::keys;
 use raftstore::store::metrics::*;
-use raftstore::store::snap::*;
+use raftstore::store::snap::util::*;
 use raftstore::store::util::check_key_in_region;
 use storage::CF_RAFT;
 use util::codec::bytes::CompactBytesFromFileDecoder;
@@ -128,7 +143,7 @@ impl SnapshotApplyer {
         let base = SnapshotBase::new(dir, false, key, snapshot_meta);
         if ref_count.compare_and_swap(0, 1, Ordering::SeqCst) != 0 {
             error!("{} apply_snapshot conflicts", key);
-            return Err(Error::Snapshot(SnapError::Conflict));
+            return Err(Error::Conflict);
         }
         Ok(SnapshotApplyer {
             base,
@@ -152,17 +167,17 @@ impl SnapshotApplyer {
             } else {
                 let (dir, key) = (&self.base.dir, self.base.key);
                 let cf_path = gen_cf_file_path(dir, false, key, cf);
-                let clone_path = gen_cf_clone_file_path(dir, false, key, cf);
+                let path = gen_cf_clone_file_path(dir, false, key, cf);
                 let db = options.db.as_ref();
 
-                prepare_sst_for_ingestion(&cf_path, &clone_path)?;
-                validate_sst_for_ingestion(db, cf, &clone_path, size, checksum)?;
+                box_try!(prepare_sst_for_ingestion(&cf_path, &path));
+                box_try!(validate_sst_for_ingestion(db, cf, &path, size, checksum));
 
                 let mut options = IngestExternalFileOptions::new();
                 options.move_files(true);
                 let handle = box_try!(get_cf_handle(db, cf));
                 let _timer = INGEST_SST_DURATION_SECONDS.start_coarse_timer();
-                db.ingest_external_file_cf(handle, &options, &[clone_path.to_str().unwrap()])?;
+                box_try!(db.ingest_external_file_cf(handle, &options, &[path.to_str().unwrap()]));
             }
         }
 
@@ -193,7 +208,7 @@ impl SnapshotApplyer {
         let mut finished = false;
         while !finished {
             if stale_for_apply(self.base.key, self.snap_stale_notifier.as_ref()) {
-                return Err(Error::Snapshot(SnapError::Abort));
+                return Err(Error::Abort);
             }
 
             let key = reader.decode_compact_bytes()?;
@@ -262,6 +277,7 @@ fn check_file_size_and_checksum<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 
     #[test]
     fn test_gen_cf_clone_file_path() {
