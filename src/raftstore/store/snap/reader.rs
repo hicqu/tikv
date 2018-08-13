@@ -226,7 +226,7 @@ impl Drop for SnapshotApplyer {
 
             let (dir, key) = (&self.base.dir, self.base.key);
             let clone_path = gen_cf_clone_file_path(dir, false, key, cf.get_cf());
-            delete_file_if_exist(&clone_path);
+            delete_file_if_exist(&clone_path).unwrap();
         }
     }
 }

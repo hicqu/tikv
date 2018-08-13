@@ -170,7 +170,7 @@ impl Drop for SnapshotBase {
             return;
         }
         let tmp_snap_dir = gen_tmp_snap_dir(&self.dir, self.for_send, self.key);
-        delete_dir_if_exist(&tmp_snap_dir);
+        delete_dir_if_exist(&tmp_snap_dir).unwrap();
     }
 }
 

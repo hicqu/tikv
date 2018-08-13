@@ -41,7 +41,7 @@ use raftstore::store::Msg;
 use raftstore::{Error, Result};
 use storage::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use util::collections::HashMap;
-use util::file::{create_dir_if_not_exists, delete_dir_if_exist};
+use util::file::{create_dir_if_not_exist, delete_dir_if_exist};
 use util::io_limiter::{IOLimiter, LimitWriter};
 use util::time::Instant;
 use util::transport::SendCh;
@@ -282,7 +282,7 @@ impl SnapManager {
             };
 
             if let Some((for_send, key)) = snap_key {
-                create_dir_if_not_exists(&gen_snap_dir(dir, for_send, key))?;
+                create_dir_if_not_exist(&gen_snap_dir(dir, for_send, key))?;
                 let new_meta_path = gen_meta_file_path(dir, for_send, key);
                 fs::rename(&p.path(), &new_meta_path)?;
                 for cf in SNAPSHOT_CFS {
@@ -302,7 +302,7 @@ impl SnapManager {
         {
             if let Some(s) = p.file_name().to_str() {
                 if s.ends_with(TMP_FILE_SUFFIX) {
-                    delete_dir_if_exist(&p.path());
+                    delete_dir_if_exist(&p.path())?;
                     continue;
                 }
                 if let Some((for_send, key)) = get_snap_key_from_snap_dir(s) {
@@ -311,7 +311,7 @@ impl SnapManager {
                         let size = get_size_from_snapshot_meta(&snap_meta);
                         self.snap_size.fetch_add(size, Ordering::SeqCst);
                     } else {
-                        delete_dir_if_exist(&p.path());
+                        delete_dir_if_exist(&p.path())?;
                     }
                 }
             }
@@ -464,7 +464,7 @@ impl SnapManager {
         let meta_path = gen_meta_file_path(&self.core.dir, for_send, key);
         if let Ok(meta) = read_snapshot_meta(&meta_path) {
             let snap_dir = gen_snap_dir(&self.core.dir, for_send, key);
-            if delete_dir_if_exist(&snap_dir) {
+            if delete_dir_if_exist(&snap_dir).unwrap() {
                 let size = get_size_from_snapshot_meta(&meta);
                 self.snap_size.fetch_sub(size, Ordering::SeqCst);
             }
