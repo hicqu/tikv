@@ -61,6 +61,7 @@ pub struct TopNExecutor {
     src: Box<Executor + Send>,
     limit: usize,
     first_collect: bool,
+    src_datum_buffer: Vec<Datum>,
 }
 
 impl TopNExecutor {
@@ -77,6 +78,7 @@ impl TopNExecutor {
         }
         let mut eval_ctx = EvalContext::new(Arc::clone(&eval_cfg));
         let order_by = OrderBy::new(&mut eval_ctx, order_by)?;
+        let src_datum_len = src.get_len_of_columns();
         Ok(TopNExecutor {
             order_by,
             related_cols_offset: visitor.column_offsets(),
@@ -86,6 +88,7 @@ impl TopNExecutor {
             src,
             limit: meta.get_limit() as usize,
             first_collect: true,
+            src_datum_buffer: Vec::with_capacity(src_datum_len),
         })
     }
 
@@ -103,9 +106,15 @@ impl TopNExecutor {
         let mut heap = TopNHeap::new(self.limit, Arc::clone(&ctx))?;
         while let Some(row) = self.src.next()? {
             let row = row.take_origin();
-            let cols =
-                row.inflate_cols_with_offsets(&mut ctx.borrow_mut(), &self.related_cols_offset)?;
-            let ob_values = self.order_by.eval(&mut ctx.borrow_mut(), &cols)?;
+            row.inflate_cols_with_offsets(
+                &mut ctx.borrow_mut(),
+                &mut self.src_datum_buffer,
+                &self.related_cols_offset,
+            )?;
+
+            let ob_values = self
+                .order_by
+                .eval(&mut ctx.borrow_mut(), &self.src_datum_buffer)?;
             heap.try_add_row(row, ob_values, Arc::clone(&self.order_by.items))?;
         }
         let sort_rows = heap.into_sorted_vec()?;

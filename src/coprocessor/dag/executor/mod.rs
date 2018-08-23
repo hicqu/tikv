@@ -90,7 +90,9 @@ impl ExprColumnRefVisitor {
     }
 
     pub fn column_offsets(self) -> Vec<usize> {
-        self.cols_offset.into_iter().collect()
+        let mut v: Vec<usize> = self.cols_offset.into_iter().collect();
+        v.sort();
+        v
     }
 }
 
@@ -210,38 +212,43 @@ impl OriginCols {
     // inflate with Datum::Null for those cols not in offsets.
     // It's used in expression since column is marked with offset
     // in expression.
+    // NOTE: the given `offsets` must be sorted.
     pub fn inflate_cols_with_offsets(
         &self,
         ctx: &mut EvalContext,
-        offsets: &[usize],
-    ) -> Result<Vec<Datum>> {
-        let mut res = vec![Datum::Null; self.cols.len()];
-        for offset in offsets {
-            let col = &self.cols[*offset];
-            if col.get_pk_handle() {
-                let v = util::get_pk(col, self.handle);
-                res[*offset] = v;
+        buffer: &mut Vec<Datum>,
+        mut offsets: &[usize],
+    ) -> Result<()> {
+        buffer.clear();
+        for i in 0..self.cols.len() {
+            if offsets.is_empty() || offsets[0] != i {
+                buffer.push(Datum::Null);
+                continue;
+            }
+            let offset = offsets[0];
+            offsets = &offsets[1..];
+
+            let col = &self.cols[offset];
+            let value = if col.get_pk_handle() {
+                util::get_pk(col, self.handle)
             } else {
                 let col_id = col.get_column_id();
-                let value = match self.data.get(col_id) {
+                match self.data.get(col_id) {
                     None if col.has_default_val() => {
                         // TODO: optimize it to decode default value only once.
-                        box_try!(table::decode_col_value(
-                            &mut col.get_default_val(),
-                            ctx,
-                            col
-                        ))
+                        let mut def_v = col.get_default_val();
+                        box_try!(table::decode_col_value(&mut def_v, ctx, col))
                     }
                     None if mysql::has_not_null_flag(col.get_flag() as u64) => {
                         return Err(box_err!("column {} of {} is missing", col_id, self.handle));
                     }
                     None => Datum::Null,
                     Some(mut bs) => box_try!(table::decode_col_value(&mut bs, ctx, col)),
-                };
-                res[*offset] = value;
-            }
+                }
+            };
+            buffer.push(value);
         }
-        Ok(res)
+        Ok(())
     }
 }
 

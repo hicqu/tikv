@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use tipb::executor::Selection;
 
+use coprocessor::codec::Datum;
 use coprocessor::dag::expr::{EvalConfig, EvalContext, EvalWarnings, Expression};
 use coprocessor::Result;
 
@@ -26,6 +27,7 @@ pub struct SelectionExecutor {
     ctx: EvalContext,
     src: Box<Executor + Send>,
     first_collect: bool,
+    src_datum_buffer: Vec<Datum>,
 }
 
 impl SelectionExecutor {
@@ -38,12 +40,14 @@ impl SelectionExecutor {
         let mut visitor = ExprColumnRefVisitor::new(src.get_len_of_columns());
         visitor.batch_visit(&conditions)?;
         let mut ctx = EvalContext::new(eval_cfg);
+        let src_datum_len = src.get_len_of_columns();
         Ok(SelectionExecutor {
             conditions: Expression::batch_build(&mut ctx, conditions)?,
             related_cols_offset: visitor.column_offsets(),
             ctx,
             src,
             first_collect: true,
+            src_datum_buffer: Vec::with_capacity(src_datum_len),
         })
     }
 }
@@ -53,9 +57,14 @@ impl Executor for SelectionExecutor {
     fn next(&mut self) -> Result<Option<Row>> {
         'next: while let Some(row) = self.src.next()? {
             let row = row.take_origin();
-            let cols = row.inflate_cols_with_offsets(&mut self.ctx, &self.related_cols_offset)?;
+            row.inflate_cols_with_offsets(
+                &mut self.ctx,
+                &mut self.src_datum_buffer,
+                &self.related_cols_offset,
+            )?;
+
             for filter in &self.conditions {
-                let val = filter.eval(&mut self.ctx, &cols)?;
+                let val = filter.eval(&mut self.ctx, &self.src_datum_buffer)?;
                 if !val.into_bool(&mut self.ctx)?.unwrap_or(false) {
                     continue 'next;
                 }

@@ -82,6 +82,9 @@ struct AggExecutor {
     related_cols_offset: Vec<usize>, // offset of related columns
     src: Box<Executor + Send>,
     first_collect: bool,
+
+    group_by_buffer: Vec<Datum>, // buffer for calculated group_by expressions.
+    src_datum_buffer: Vec<Datum>, // buffer for inflated datums from source.next().
 }
 
 impl AggExecutor {
@@ -95,7 +98,11 @@ impl AggExecutor {
         let mut visitor = ExprColumnRefVisitor::new(src.get_len_of_columns());
         visitor.batch_visit(&group_by)?;
         visitor.batch_visit(&aggr_func)?;
+
         let mut ctx = EvalContext::new(eval_config);
+        let group_by_len = group_by.len();
+        let src_cols_len = src.get_len_of_columns();
+
         Ok(AggExecutor {
             group_by: Expression::batch_build(&mut ctx, group_by)?,
             aggr_func: AggFuncExpr::batch_build(&mut ctx, aggr_func)?,
@@ -104,29 +111,36 @@ impl AggExecutor {
             related_cols_offset: visitor.column_offsets(),
             src,
             first_collect: true,
+
+            group_by_buffer: Vec::with_capacity(group_by_len),
+            src_datum_buffer: Vec::with_capacity(src_cols_len),
         })
     }
 
-    fn next(&mut self) -> Result<Option<Vec<Datum>>> {
+    fn next(&mut self) -> Result<bool> {
         if let Some(row) = self.src.next()? {
-            let row = row.take_origin();
-            row.inflate_cols_with_offsets(&mut self.ctx, &self.related_cols_offset)
-                .map(Some)
-        } else {
-            Ok(None)
+            row.take_origin().inflate_cols_with_offsets(
+                &mut self.ctx,
+                &mut self.src_datum_buffer,
+                &self.related_cols_offset,
+            )?;
+            self.group_by_buffer.clear();
+            for expr in &self.group_by {
+                let d = expr.eval(&mut self.ctx, &self.src_datum_buffer)?;
+                self.group_by_buffer.push(d);
+            }
+            return Ok(true);
         }
+        Ok(false)
     }
 
-    fn get_group_by_cols(&mut self, row: &[Datum]) -> Result<Vec<Datum>> {
+    fn get_group_key(&self) -> Result<Vec<u8>> {
         if self.group_by.is_empty() {
-            return Ok(Vec::default());
+            let single_group = Datum::Bytes(SINGLE_GROUP.to_vec());
+            return Ok(box_try!(datum::encode_value(&[single_group])));
         }
-        let mut vals = Vec::with_capacity(self.group_by.len());
-        for expr in &self.group_by {
-            let v = expr.eval(&mut self.ctx, row)?;
-            vals.push(v);
-        }
-        Ok(vals)
+        let res = box_try!(datum::encode_value(&self.group_by_buffer));
+        Ok(res)
     }
 
     fn collect_output_counts(&mut self, counts: &mut Vec<i64>) {
@@ -179,19 +193,10 @@ impl HashAggExecutor {
         })
     }
 
-    fn get_group_key(&mut self, row: &[Datum]) -> Result<Vec<u8>> {
-        let group_by_cols = self.inner.get_group_by_cols(row)?;
-        if group_by_cols.is_empty() {
-            let single_group = Datum::Bytes(SINGLE_GROUP.to_vec());
-            return Ok(box_try!(datum::encode_value(&[single_group])));
-        }
-        let res = box_try!(datum::encode_value(&group_by_cols));
-        Ok(res)
-    }
-
     fn aggregate(&mut self) -> Result<()> {
-        while let Some(cols) = self.inner.next()? {
-            let group_key = self.get_group_key(&cols)?;
+        while self.inner.next()? {
+            let group_key = self.inner.get_group_key()?;
+            let cols = &self.inner.src_datum_buffer;
             match self.group_key_aggrs.entry(group_key) {
                 OrderMapEntry::Vacant(e) => {
                     let mut aggrs = Vec::with_capacity(self.inner.aggr_func.len());
@@ -267,19 +272,19 @@ impl Executor for StreamAggExecutor {
             return Ok(None);
         }
 
-        while let Some(cols) = self.inner.next()? {
+        while self.inner.next()? {
             self.has_data = true;
-            let new_group = self.meet_new_group(&cols)?;
-            let mut ret = if new_group {
+            let new_group = if self.meet_new_group()? {
                 Some(self.get_partial_result()?)
             } else {
                 None
             };
+            let cols = &self.inner.src_datum_buffer;
             for (expr, func) in self.inner.aggr_func.iter_mut().zip(&mut self.agg_funcs) {
                 func.update_with_expr(&mut self.inner.ctx, expr, &cols)?;
             }
-            if new_group {
-                return Ok(ret);
+            if new_group.is_some() {
+                return Ok(new_group);
             }
         }
         self.inner.executed = true;
@@ -349,26 +354,22 @@ impl StreamAggExecutor {
         })
     }
 
-    fn meet_new_group(&mut self, row: &[Datum]) -> Result<bool> {
-        let mut cur_group_by_cols = self.inner.get_group_by_cols(row)?;
-        if cur_group_by_cols.is_empty() {
+    fn meet_new_group(&mut self) -> Result<bool> {
+        // first group
+        if self.cur_group_row.is_empty() {
+            mem::swap(&mut self.cur_group_row, &mut self.inner.group_by_buffer);
             return Ok(false);
         }
 
-        // first group
-        if self.cur_group_row.is_empty() {
-            mem::swap(&mut self.cur_group_row, &mut cur_group_by_cols);
-            return Ok(false);
-        }
         let mut meet_new_group = false;
-        for (prev, cur) in self.cur_group_row.iter().zip(cur_group_by_cols.iter()) {
+        for (prev, cur) in self.cur_group_row.iter().zip(&self.inner.group_by_buffer) {
             if prev.cmp(&mut self.inner.ctx, cur)? != Ordering::Equal {
                 meet_new_group = true;
                 break;
             }
         }
         if meet_new_group {
-            mem::swap(&mut self.next_group_row, &mut cur_group_by_cols);
+            mem::swap(&mut self.next_group_row, &mut self.inner.group_by_buffer);
         }
         Ok(meet_new_group)
     }
