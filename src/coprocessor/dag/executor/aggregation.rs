@@ -355,6 +355,10 @@ impl StreamAggExecutor {
     }
 
     fn meet_new_group(&mut self) -> Result<bool> {
+        if self.inner.group_by.is_empty() {
+            return Ok(false);
+        }
+
         // first group
         if self.cur_group_row.is_empty() {
             mem::swap(&mut self.cur_group_row, &mut self.inner.group_by_buffer);

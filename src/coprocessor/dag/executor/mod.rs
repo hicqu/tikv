@@ -217,18 +217,14 @@ impl OriginCols {
         &self,
         ctx: &mut EvalContext,
         buffer: &mut Vec<Datum>,
-        mut offsets: &[usize],
+        offsets: &[usize],
     ) -> Result<()> {
-        buffer.clear();
-        for i in 0..self.cols.len() {
-            if offsets.is_empty() || offsets[0] != i {
-                buffer.push(Datum::Null);
-                continue;
-            }
-            let offset = offsets[0];
-            offsets = &offsets[1..];
-
-            let col = &self.cols[offset];
+        let reserve_len = self.cols.len() - buffer.len();
+        if reserve_len > 0 {
+            buffer.extend((0..reserve_len).map(|_| Datum::Null));
+        }
+        for offset in offsets {
+            let col = &self.cols[*offset];
             let value = if col.get_pk_handle() {
                 util::get_pk(col, self.handle)
             } else {
@@ -246,7 +242,7 @@ impl OriginCols {
                     Some(mut bs) => box_try!(table::decode_col_value(&mut bs, ctx, col)),
                 }
             };
-            buffer.push(value);
+            buffer[*offset] = value;
         }
         Ok(())
     }
