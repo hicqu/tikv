@@ -115,6 +115,7 @@ pub const ENGINE_HIST_TYPES: &[HistType] = &[
     HistType::BytesDecompressed,
     HistType::CompressionTimesNanos,
     HistType::DecompressionTimesNanos,
+    HistType::IngestionJobRunMicros,
 ];
 
 pub fn flush_engine_ticker_metrics(t: TickerType, value: u64, name: &str) {
@@ -891,6 +892,12 @@ pub fn flush_engine_histogram_metrics(t: HistType, value: HistogramData, name: &
                 .with_label_values(&[name, "decompression_time_nanos_max"])
                 .set(value.max);
         }
+        HistType::IngestionJobRunMicros => {
+            info!("TEST ingest duration max: {}", value.max);
+            STORE_INGEST_SST_DURATION
+                .with_label_values(&[name, "ingest_duration_max"])
+                .set(value.max);
+        }
         _ => {}
     }
 }
@@ -1234,6 +1241,12 @@ lazy_static! {
         "tikv_engine_num_files_at_level",
         "Number of files at each level",
         &["db", "cf", "level"]
+    ).unwrap();
+    
+    pub static ref STORE_INGEST_SST_DURATION: GaugeVec= register_gauge_vec!(
+        "tikv_engine_ingest_sst_duration",
+        "Duration of ingest sst files",
+        &["db", "type"]
     ).unwrap();
 }
 

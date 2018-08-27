@@ -12,6 +12,7 @@
 // limitations under the License.
 
 use raftstore::store::Engines;
+use rocksdb::DBStatisticsHistogramType as HistType;
 use rocksdb::DB;
 use std::io;
 use std::sync::mpsc::{self, Sender};
@@ -80,6 +81,7 @@ impl MetricsFlusher {
 }
 
 fn flush_metrics(db: &DB, name: &str) {
+    info!("TEST flush rocksdb metrics");
     for t in ENGINE_TICKER_TYPES {
         let v = db.get_and_reset_statistics_ticker_count(*t);
         flush_engine_ticker_metrics(*t, v, name);
@@ -87,6 +89,11 @@ fn flush_metrics(db: &DB, name: &str) {
     for t in ENGINE_HIST_TYPES {
         if let Some(v) = db.get_statistics_histogram(*t) {
             flush_engine_histogram_metrics(*t, v, name);
+            if *t == HistType::IngestionJobRunMicros {
+                info!("TEST flush metrics for {:?}", t);
+            }
+        } else {
+            error!("TEST can't get statistics histogram for {:?}", t);
         }
     }
     flush_engine_properties(db, name);
