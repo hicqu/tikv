@@ -181,6 +181,9 @@ pub fn delete_all_in_range_cf(
         }
     }
 
+    // flush the DB after delete all data in the range.
+    db.flush_cf(handle, true)?;
+
     if wb.count() > 0 {
         db.write(wb)?;
     }
