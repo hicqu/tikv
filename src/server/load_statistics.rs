@@ -60,7 +60,7 @@ impl GrpcThreadLoadStatistics {
 
         let millis = (current_instant - earlist_instant).as_millis();
         let cpu_usage = (current_cpu_usage - earlist_cpu_usage) / millis as f64 * 1000f64;
-        let in_heavy_load = cpu_usage >= self.tids.len() as f64 * 0.7;
+        let in_heavy_load = cpu_usage >= self.tids.len() as f64 * 0.8;
         self.in_heavy_load.store(in_heavy_load, Ordering::SeqCst);
 
         self.cur_pos = next_pos;
