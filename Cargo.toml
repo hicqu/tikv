@@ -94,7 +94,7 @@ git = "https://github.com/pingcap/rust-rocksdb.git"
 
 [dependencies.kvproto]
 git = "https://github.com/pingcap/kvproto.git"
-branch = "super-batch-streaming"
+branch = "super-batch-streaming-bp"
 
 [dependencies.tipb]
 git = "https://github.com/pingcap/tipb.git"
