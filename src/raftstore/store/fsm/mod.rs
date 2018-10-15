@@ -26,7 +26,7 @@ pub use self::store::{
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver as StdReceiver;
+use std::sync::mpsc::{Receiver as StdReceiver, Sender as StdSender};
 use std::sync::Arc;
 use std::u64;
 use time::Timespec;
@@ -53,6 +53,16 @@ use super::{Engines, Msg, SignificantMsg, SnapManager};
 use import::SSTImporter;
 
 type Key = Vec<u8>;
+type EntryGcKey = Vec<Vec<u8>>;
+
+struct EntryCacheGcHandler {
+    pub entry_gc_sender: Option<StdSender<EntryGcKey>>,
+
+    // In order to reduce the times of memory allocations while putting element into `gc_vec`.
+    // In stress test, the numbers of entry cache needed to be reclaimed are similar. So, just
+    // record this info.
+    pub last_gc_vec_len: usize,
+}
 
 pub struct Store<T, C: 'static> {
     cfg: Rc<Config>,
@@ -108,4 +118,6 @@ pub struct Store<T, C: 'static> {
     pending_votes: RingQueue<RaftMessage>,
 
     store_stat: StoreStat,
+
+    entry_cache_gc_handler: EntryCacheGcHandler,
 }
