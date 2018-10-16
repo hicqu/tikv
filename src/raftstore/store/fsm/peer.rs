@@ -40,7 +40,8 @@ use util::escape;
 use util::time::{duration_to_sec, SlowTimer};
 use util::worker::{FutureWorker, Stopped};
 
-use super::{store::register_timer, Key};
+use super::{store::register_timer, EntryCacheGcHandler, EntryGcKey, Key};
+use raft::eraftpb::Entry;
 use raftstore::coprocessor::RegionChangeEvent;
 use raftstore::store::cmd_resp::{bind_term, new_error};
 use raftstore::store::engine::{Peekable, Snapshot as EngineSnapshot};
@@ -117,6 +118,32 @@ impl<T, C> Store<T, C> {
                 region_id, to_peer, status
             );
             peer.raft_group.report_snapshot(to_peer_id, status)
+        }
+    }
+}
+
+impl Default for EntryCacheGcHandler {
+    fn default() -> Self {
+        EntryCacheGcHandler {
+            entry_gc_sender: None,
+            last_gc_vec_len: 1024,
+        }
+    }
+}
+
+impl EntryCacheGcHandler {
+    // For now, we just need to reclaim data and context
+    #[inline]
+    fn handle_entry_cache_gc(e: Entry, gc_vec: &mut EntryGcKey) {
+        gc_vec.push(e.data);
+        gc_vec.push(e.context);
+    }
+
+    #[inline]
+    fn reclaim(&self, gc_vec: EntryGcKey) {
+        if let Some(ref sender) = self.entry_gc_sender {
+            // Even though fail to send, cache will be dropped by local thread.
+            sender.send(gc_vec).is_ok();
         }
     }
 }
@@ -947,7 +974,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             end_idx: state.get_index() + 1,
         };
         peer.last_compacted_idx = task.end_idx;
-        peer.mut_store().compact_to(task.end_idx);
+        peer.mut_store().compact_to(task.end_idx, |_| {});
         if let Err(e) = self.raftlog_gc_worker.schedule(task) {
             error!(
                 "[region {}] failed to schedule compact task: {}",
@@ -1601,10 +1628,17 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         let mut total_gc_logs = 0;
 
+        let last_gc_vec_len = self.entry_cache_gc_handler.last_gc_vec_len;
+
+        // Use magic number to calculate new capacity, which is last_gc_vec_len * 1.1
+        let mut gc_vec = Vec::with_capacity(last_gc_vec_len * 11 / 10);
+
         for (&region_id, peer) in &mut self.region_peers {
             let applied_idx = peer.get_store().applied_index();
             if !peer.is_leader() {
-                peer.mut_store().compact_to(applied_idx + 1);
+                peer.mut_store().compact_to(applied_idx + 1, |e| {
+                    EntryCacheGcHandler::handle_entry_cache_gc(e, &mut gc_vec)
+                });
                 continue;
             }
 
@@ -1649,7 +1683,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 REGION_MAX_LOG_LAG.observe((last_idx - replicated_idx) as f64);
             }
             peer.mut_store()
-                .maybe_gc_cache(alive_cache_idx, applied_idx);
+                .maybe_gc_cache(alive_cache_idx, applied_idx, |e| {
+                    EntryCacheGcHandler::handle_entry_cache_gc(e, &mut gc_vec)
+                });
             let first_idx = peer.get_store().first_index();
             let mut compact_idx;
             if applied_idx > first_idx
@@ -1688,6 +1724,11 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 error!("{} send compact log {} err {:?}", peer.tag, compact_idx, e);
             }
         }
+
+        // Update last_gc_vec_len
+        self.entry_cache_gc_handler.last_gc_vec_len = gc_vec.len();
+
+        self.entry_cache_gc_handler.reclaim(gc_vec);
 
         PEER_GC_RAFT_LOG_COUNTER.inc_by(total_gc_logs as i64);
         self.register_raft_gc_log_tick(event_loop);

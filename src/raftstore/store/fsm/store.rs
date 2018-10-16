@@ -178,6 +178,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             start_time: time::get_time(),
             is_busy: false,
             store_stat: StoreStat::default(),
+            entry_cache_gc_handler: Default::default(),
         };
         s.init()?;
         Ok(s)
@@ -465,6 +466,22 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         if let Err(e) = util_sys::thread::set_priority(util_sys::HIGH_PRI) {
             warn!("set thread priority for raftstore failed, error: {:?}", e);
+        }
+
+        {
+            // entry cache gc thread
+            // During stress test, on_raft_gc_log_tick may costs tens of seconds. This thread is
+            // used to reclaim memory of entry cache.
+            let (tx, rx) = mpsc::channel();
+            self.entry_cache_gc_handler.entry_gc_sender = Some(tx);
+            thread::Builder::new()
+                .name("entry-cache-gc-thread".into())
+                .spawn(move || loop {
+                    if rx.recv().is_err() {
+                        break;
+                    }
+                })
+                .unwrap();
         }
 
         event_loop.run(self)?;
