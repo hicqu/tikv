@@ -542,6 +542,30 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         );
     }
 
+    fn batch_raft(
+        &mut self,
+        ctx: RpcContext,
+        stream: RequestStream<BatchRaftMessage>,
+        _: ClientStreamingSink<Done>,
+    ) {
+        let ch = self.ch.clone();
+        ctx.spawn(
+            stream
+                .map_err(Error::from)
+                .for_each(move |mut msgs| {
+                    RAFT_MESSAGE_RECV_COUNTER.inc_by(msgs.get_msgs().len() as i64);
+                    for msg in msgs.take_msgs().into_iter() {
+                        if let Err(e) = ch.send_raft_msg(msg) {
+                            return Err(Error::from(e));
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(|e| error!("send raft msg to raft store fail: {}", e))
+                .then(|_| future::ok::<_, ()>(())),
+        )
+    }
+
     fn snapshot(
         &mut self,
         ctx: RpcContext,
