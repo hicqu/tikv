@@ -527,7 +527,7 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         &mut self,
         ctx: RpcContext,
         stream: RequestStream<RaftMessage>,
-        _: ClientStreamingSink<Done>,
+        sink: ClientStreamingSink<Done>,
     ) {
         let ch = self.ch.clone();
         ctx.spawn(
@@ -535,10 +535,22 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
                 .map_err(Error::from)
                 .for_each(move |msg| {
                     RAFT_MESSAGE_RECV_COUNTER.inc();
-                    future::result(ch.send_raft_msg(msg)).map_err(Error::from)
+                    ch.send_raft_msg(msg).map_err(Error::from)
                 })
-                .map_err(|e| error!("send raft msg to raft store fail: {}", e))
-                .then(|_| future::ok::<_, ()>(())),
+                .then(|res| {
+                    let status = match res {
+                        Err(e) => {
+                            let msg = format!("{:?}", e);
+                            error!("send raft msg to raft store fail: {}", msg);
+                            RpcStatus::new(RpcStatusCode::Unknown, Some(msg))
+                        }
+                        Ok(_) => RpcStatus::new(RpcStatusCode::Unknown, None),
+                    };
+                    sink.fail(status)
+                })
+                .map_err(|e| {
+                    error!("send response fail: {:?}", e);
+                }),
         );
     }
 
@@ -546,7 +558,7 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         &mut self,
         ctx: RpcContext,
         stream: RequestStream<BatchRaftMessage>,
-        _: ClientStreamingSink<Done>,
+        sink: ClientStreamingSink<Done>,
     ) {
         let ch = self.ch.clone();
         ctx.spawn(
@@ -561,8 +573,20 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
                     }
                     Ok(())
                 })
-                .map_err(|e| error!("send raft msg to raft store fail: {}", e))
-                .then(|_| future::ok::<_, ()>(())),
+                .then(|res| {
+                    let status = match res {
+                        Err(e) => {
+                            let msg = format!("{:?}", e);
+                            error!("send raft msg to raft store fail: {}", msg);
+                            RpcStatus::new(RpcStatusCode::Unknown, Some(msg))
+                        }
+                        Ok(_) => RpcStatus::new(RpcStatusCode::Unknown, None),
+                    };
+                    sink.fail(status)
+                })
+                .map_err(|e| {
+                    error!("send response fail: {:?}", e);
+                }),
         )
     }
 

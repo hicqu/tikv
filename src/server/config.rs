@@ -83,7 +83,7 @@ pub struct Config {
     pub snap_max_write_bytes_per_sec: ReadableSize,
     pub snap_max_total_size: ReadableSize,
     pub enable_load_statistics: bool,
-    pub heavay_load_threshold: f64,
+    pub heavy_load_threshold: f64,
 
     // Server labels to specify some attributes about this server.
     pub labels: HashMap<String, String>,
@@ -102,8 +102,6 @@ pub struct Config {
     #[doc(hidden)]
     #[serde(skip_serializing)]
     pub end_point_max_tasks: Option<usize>,
-
-    pub heavay_load_threshold: f64,
 }
 
 impl Default for Config {
@@ -137,7 +135,7 @@ impl Default for Config {
             snap_max_write_bytes_per_sec: ReadableSize(DEFAULT_SNAP_MAX_BYTES_PER_SEC),
             snap_max_total_size: ReadableSize(0),
             enable_load_statistics: true,
-            heavay_load_threshold: 0.6,
+            heavy_load_threshold: 0.6,
         }
     }
 }

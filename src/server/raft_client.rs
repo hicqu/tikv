@@ -92,6 +92,7 @@ impl Conn {
                         if status == RpcStatusCode::Unimplemented =>
                     {
                         // fallback batch_raft to raft call.
+                        warn!("batch_raft RPC failed, fallback to raft RPC");
                         let msgs = ReusableReceiver::new(rx_for_raft)
                             .map(|mut batch| {
                                 let len = batch.get_msgs().len();
