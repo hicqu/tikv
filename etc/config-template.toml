@@ -90,6 +90,12 @@
 # set attributes about this server, e.g. { zone = "us-west-1", disk = "ssd" }.
 # labels = {}
 
+# enable load statistics or not.
+# enable-load-statistics = true
+
+# heavy load threshold.
+# heavy-load-threshold = 0.6
+
 [storage]
 # set the path to rocksdb directory.
 # data-dir = "/tmp/tikv/store"
