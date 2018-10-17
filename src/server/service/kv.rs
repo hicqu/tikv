@@ -546,10 +546,7 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
                         }
                         Ok(_) => RpcStatus::new(RpcStatusCode::Unknown, None),
                     };
-                    sink.fail(status)
-                })
-                .map_err(|e| {
-                    error!("send response fail: {:?}", e);
+                    sink.fail(status).map_err(|_| ())
                 }),
         );
     }
@@ -582,10 +579,7 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
                         }
                         Ok(_) => RpcStatus::new(RpcStatusCode::Unknown, None),
                     };
-                    sink.fail(status)
-                })
-                .map_err(|e| {
-                    error!("send response fail: {:?}", e);
+                    sink.fail(status).map_err(|_| ())
                 }),
         )
     }
