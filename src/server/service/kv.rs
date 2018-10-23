@@ -43,7 +43,7 @@ use storage::txn::Error as TxnError;
 use storage::{self, Engine, Key, Mutation, Options, Storage, Value};
 use util::collections::HashMap;
 use util::future::{paired_future_callback, AndThenWith};
-use util::mpsc::{unbounded, Receiver, Sender};
+use util::mpsc1::{unbounded, Receiver, Sender};
 use util::worker::Scheduler;
 
 const SCHEDULER_IS_BUSY: &str = "scheduler is busy";
