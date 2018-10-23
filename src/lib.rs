@@ -105,6 +105,7 @@ extern crate tempdir;
 extern crate test;
 extern crate time;
 extern crate tipb;
+extern crate tokio;
 extern crate tokio_core;
 extern crate tokio_timer;
 #[cfg(test)]
@@ -116,6 +117,8 @@ extern crate uuid;
 extern crate zipf;
 #[macro_use]
 extern crate derive_more;
+
+extern crate panic_hook;
 
 #[macro_use]
 pub mod util;
