@@ -26,6 +26,14 @@ use futures::{Async, Poll, Stream};
 const NOTIFY_BATCH_SIZE: usize = 8;
 const MAX_BATCH_SIZE: usize = 32;
 
+use prometheus::IntGauge;
+lazy_static! {
+    static ref RAFT_CLIENT_PENDING_MESSAGES: IntGauge = register_int_gauge!(
+        "tikv_raft_client_pending_messages",
+        "Total number of pending messages of raft client"
+    ).unwrap();
+}
+
 pub struct State {
     sender_cnt: AtomicIsize,
     receiver_cnt: AtomicIsize,
@@ -125,6 +133,7 @@ impl<T> Sender<T> {
         if !self.state.is_receiver_closed() {
             self.sender.send(t);
             self.state.inc_send_and_maybe_notify();
+            RAFT_CLIENT_PENDING_MESSAGES.set(self.sender.len() as i64);
             return Ok(());
         }
         Err(SendError(t))
@@ -138,6 +147,7 @@ impl<T> Sender<T> {
                 default => return Err(TrySendError::Full(t)),
             }
             self.state.inc_send_and_maybe_notify();
+            RAFT_CLIENT_PENDING_MESSAGES.set(self.sender.len() as i64);
             Ok(())
         } else {
             Err(TrySendError::Disconnected(t))

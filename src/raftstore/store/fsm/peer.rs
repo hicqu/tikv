@@ -275,10 +275,16 @@ impl<'a, T: Transport, C: PdClient> Peer<'a, T, C> {
             let tx = match self.scheduler.router().peer_notifier(self.region_id()) {
                 Some(tx) => tx,
                 // TODO: verify if it's really shutting down.
-                None => return,
+                None => {
+                    warn!("{:?} can't get peer_notifier", self.peer.peer);
+                    return;
+                }
             };
+            let peer = self.peer.peer.clone();
             let f = self.ctx.timer.delay(Instant::now() + dur).map(move |_| {
-                let _ = tx.force_send(PeerMsg::Tick(tick));
+                if tx.force_send(PeerMsg::Tick(tick)).is_err() {
+                    error!("{:?} schedule {:?} to peer fail", peer, tick);
+                }
             });
             self.ctx.poller.spawn(f).forget()
         }
