@@ -284,6 +284,8 @@ impl<'a, T: Transport, C: PdClient> Peer<'a, T, C> {
             let f = self.ctx.timer.delay(Instant::now() + dur).map(move |_| {
                 if tx.force_send(PeerMsg::Tick(tick)).is_err() {
                     error!("{:?} schedule {:?} to peer fail", peer, tick);
+                } else {
+                    info!("{:?} schedule {:?} to peer success", peer, tick);
                 }
             });
             self.ctx.poller.spawn(f).forget()

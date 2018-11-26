@@ -15,7 +15,7 @@ use std::ffi::CString;
 use std::i64;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::{future, stream, Future, Poll, Sink, Stream};
 use grpc::{ChannelBuilder, Environment, Error as GrpcError, RpcStatus, RpcStatusCode, WriteFlags};
@@ -148,6 +148,7 @@ pub struct RaftClient {
     security_mgr: Arc<SecurityManager>,
     in_heavy_load: Arc<(AtomicUsize, AtomicUsize)>,
     helper_runtime: Arc<Runtime>,
+    last_print_time: Arc<Mutex<Instant>>,
 }
 
 impl RaftClient {
@@ -166,6 +167,7 @@ impl RaftClient {
             security_mgr,
             in_heavy_load,
             helper_runtime,
+            last_print_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3))),
         }
     }
 
@@ -187,6 +189,7 @@ impl RaftClient {
     }
 
     pub fn send(&mut self, store_id: u64, addr: &str, msg: RaftMessage) -> Result<()> {
+        info!("sending raft msg: {:?}", msg.get_message());
         if let Err(SendError(msg)) = self
             .get_conn(addr, msg.region_id, store_id)
             .stream
