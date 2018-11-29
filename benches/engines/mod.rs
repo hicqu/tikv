@@ -16,17 +16,17 @@ extern crate kvproto;
 extern crate test_util;
 extern crate tikv;
 
+use std::fmt;
 use criterion::{black_box, Bencher, Criterion};
 use kvproto::kvrpcpb::Context;
-use std::fmt;
-use test_util::generate_deliberate_kvs;
 use tikv::storage::engine::{
     BTreeEngine, Engine, Modify, RocksEngine, Snapshot, TestEngineBuilder,
 };
 use tikv::storage::{Key, Value, CF_DEFAULT};
+use test_util::generate_deliberate_kvs;
 
 const DEFAULT_KEY_LENGTH: usize = 64;
-const DEFAULT_GET_KEYS_COUNT: usize = 1;
+const DEFAULT_GET_KEYS_COUNT: usize = 1000;
 const DEFAULT_PUT_KVS_COUNT: usize = 1;
 
 trait EngineFactory<E: Engine>: Clone + Copy + fmt::Debug + 'static {
@@ -153,7 +153,7 @@ fn bench_engine_get<E: Engine, F: EngineFactory<E>>(bencher: &mut Bencher, confi
 
 fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) {
     let value_lengths = vec![64];
-    let engine_entries_counts = vec![0];
+    let engine_entries_counts = vec![0,0];
     let engine_put_kv_counts = vec![DEFAULT_PUT_KVS_COUNT];
     let engine_get_key_counts = vec![DEFAULT_GET_KEYS_COUNT];
 
@@ -188,12 +188,12 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
     }
 
     c.bench_function_over_inputs("bench_engine_get", bench_engine_get, get_configs);
-    c.bench_function_over_inputs("bench_engine_put", bench_engine_put, put_configs);
-    c.bench_function_over_inputs(
-        "bench_engine_snapshot",
-        bench_engine_snapshot,
-        snapshot_configs,
-    );
+//    c.bench_function_over_inputs("bench_engine_put", bench_engine_put, put_configs);
+//    c.bench_function_over_inputs(
+//        "bench_engine_snapshot",
+//        bench_engine_snapshot,
+//        snapshot_configs,
+//    );
 }
 
 fn main() {

@@ -47,8 +47,18 @@ harness = false
 path = "benches/engines/mod.rs"
 
 [[bench]]
+name = "mvcc"
+harness = false
+path = "benches/mvcc/mod.rs"
+
+[[bench]]
 name = "misc"
 path = "benches/misc/mod.rs"
+
+
+[[bench]]
+name = "t"
+path = "benches/t/mod.rs"
 
 [dependencies]
 log = { version = "0.3", features = ["release_max_level_debug"] }

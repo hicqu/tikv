@@ -182,29 +182,52 @@ impl<S: Snapshot> MvccTxn<S> {
             }
         }
 
-        let lock_type = LockType::from_mutation(&mutation);
+                let lock_type = LockType::from_mutation(&mutation);
 
-        let (key, value) = match mutation {
-            Mutation::Put((key, value)) => (key, Some(value)),
-            Mutation::Delete(key) => (key, None),
-            Mutation::Lock(key) => (key, None),
-        };
+                let (key, value) = match mutation {
+                    Mutation::Put((key, value)) => (key, Some(value)),
+                    Mutation::Delete(key) => (key, None),
+                    Mutation::Lock(key) => (key, None),
+                };
 
-        if value.is_some() && is_short_value(value.as_ref().unwrap()) {
-            self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, value);
-        } else {
-            self.lock_key(
-                key.clone(),
-                lock_type,
-                primary.to_vec(),
-                options.lock_ttl,
-                None,
-            );
-            if value.is_some() {
-                let ts = self.start_ts;
-                self.put_value(key, ts, value.unwrap());
-            }
-        }
+                if value.is_some() && is_short_value(value.as_ref().unwrap()) {
+                    self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, value);
+                } else {
+                    if value.is_some() {
+                        let ts = self.start_ts;
+                        self.put_value(key.clone(), ts, value.unwrap());
+                    }
+                    self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, None);
+                }
+
+        //        if value.is_none() {
+        //            self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, None);
+        //        } else {
+        //            if is_short_value(value.as_ref().unwrap()) {
+        //                self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, value);
+        //            } else {
+        //                self.lock_key(key.clone(), lock_type, primary.to_vec(), options.lock_ttl, None);
+        //                let ts = self.start_ts;
+        //                self.put_value(key, ts, value.unwrap());
+        //            }
+        //        }
+
+        //        match mutation {
+        //            Mutation::Put((key, value)) => {
+        //                if is_short_value(value.as_ref()) {
+        //                    self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, Some(value));
+        //                } else {
+        //                    self.lock_key(key.clone(), lock_type, primary.to_vec(), options.lock_ttl, None);
+        //                    let ts = self.start_ts;
+        //                    self.put_value(key, ts, value);
+        //                }
+        //            },
+        //            Mutation::Delete(key) | Mutation::Lock(key) =>{
+        //                self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, None);
+        //
+        //            }
+        //        }
+
         Ok(())
     }
 
