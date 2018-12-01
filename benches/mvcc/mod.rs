@@ -32,7 +32,6 @@ fn mvcc_prewrite(b: &mut Bencher, config: &KvConfig) {
     let engine = make_engine();
     let ctx = Context::new();
     let option = Options::default();
-    let snapshot = engine.snapshot(&ctx).unwrap();
     b.iter_with_setup(
         || {
             let mutations: Vec<(Mutation, Vec<u8>)> =
@@ -40,12 +39,15 @@ fn mvcc_prewrite(b: &mut Bencher, config: &KvConfig) {
                     .iter()
                     .map(|(k, v)| (Mutation::Put((Key::from_raw(&k), v.clone())), k.clone()))
                     .collect();
-            let txn = MvccTxn::new(snapshot.clone(), 1, false).unwrap();
-            (mutations, txn, &option)
+            (mutations, &option)
         },
-        |(mutations, mut txn, option)| {
+        |(mutations, option)| {
             for (mutation, primary) in mutations {
-                black_box(txn.prewrite(mutation, &primary, option).unwrap());
+                let snapshot = engine.snapshot(&ctx).unwrap();
+                let mut txn = MvccTxn::new(snapshot.clone(), 1, false).unwrap();
+                txn.prewrite(mutation, &primary, option);
+                let modifies = txn.into_modifies();
+                let _ = engine.write(&ctx, modifies);
             }
         },
     )
@@ -70,16 +72,17 @@ fn mvcc_commit(b: &mut Bencher, config: &KvConfig) {
                 );
             }
             let modifies = txn.into_modifies();
-
-            let _ = engine.async_write(&ctx, modifies, Box::new(move |(_, _)| {}));
-
+            let _ = engine.write(&ctx, modifies);
             let keys: Vec<Key> = kvs.iter().map(|(k, v)| Key::from_raw(&k)).collect();
-            let mut txn = MvccTxn::new(snapshot.clone(), 1, false).unwrap();
-            (txn, keys)
+            keys
         },
-        |(mut txn, keys)| {
+        |keys| {
+            let snapshot = engine.snapshot(&ctx).unwrap();
             for key in keys {
+                let mut txn = MvccTxn::new(snapshot.clone(), 1, false).unwrap();
                 txn.commit(key, 1);
+                let modifies = txn.into_modifies();
+                let _ = engine.write(&ctx, modifies);
             }
         },
     );

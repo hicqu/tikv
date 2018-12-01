@@ -118,6 +118,30 @@ fn bench_engine_put<E: Engine, F: EngineFactory<E>>(bencher: &mut Bencher, confi
     );
 }
 
+fn bench_engine_write<E: Engine, F: EngineFactory<E>>(
+    bencher: &mut Bencher,
+    config: &PutConfig<F>,
+) {
+    let engine = config.factory.build();
+    let ctx = Context::new();
+
+    bencher.iter_with_setup(
+        || {
+            let modifies: Vec<Modify> =
+                generate_deliberate_kvs(config.put_count, DEFAULT_KEY_LENGTH, config.value_length)
+                    .iter()
+                    .map(|(key, value)| Modify::Put(CF_DEFAULT, Key::from_raw(&key), value.clone()))
+                    .collect();
+            (modifies, &ctx)
+        },
+        |(modifies, ctx)| {
+            for modify in modifies {
+                black_box(engine.write(ctx, vec![modify]).is_ok());
+            }
+        },
+    );
+}
+
 #[derive(Debug)]
 struct SnapshotConfig<F> {
     factory: F,
@@ -184,6 +208,7 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
 
     let mut get_configs = vec![];
     let mut put_configs = vec![];
+    let mut write_configs = vec![];
     let mut snapshot_configs = vec![];
 
     for &value_length in &value_lengths {
@@ -211,6 +236,13 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
                 key_length: DEFAULT_KEY_LENGTH,
                 value_length,
             });
+
+            write_configs.push(PutConfig {
+                factory,
+                put_count,
+                key_length: DEFAULT_KEY_LENGTH,
+                value_length,
+            });
         }
     }
 
@@ -223,6 +255,12 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
         &get_full_method_name(Level::Engine, "put"),
         bench_engine_put,
         put_configs,
+    );
+
+    c.bench_function_over_inputs(
+        &get_full_method_name(Level::Engine, "write"),
+        bench_engine_write,
+        write_configs,
     );
 
     //    c.bench_function_over_inputs(
@@ -242,6 +280,7 @@ fn bench_RocksDB(c: &mut Criterion) {
 
     let mut get_configs = vec![];
     let mut put_configs = vec![];
+    let mut write_configs = vec![];
     let mut snapshot_configs = vec![];
 
     for &value_length in &value_lengths {
@@ -269,6 +308,13 @@ fn bench_RocksDB(c: &mut Criterion) {
                 key_length: DEFAULT_KEY_LENGTH,
                 value_length,
             });
+
+            write_configs.push(PutConfig {
+                factory,
+                put_count,
+                key_length: DEFAULT_KEY_LENGTH,
+                value_length,
+            });
         }
     }
 
@@ -283,17 +329,22 @@ fn bench_RocksDB(c: &mut Criterion) {
         put_configs,
     );
 
-    //    c.bench_function_over_inputs(
-    //        "bench_engine_snapshot",
-    //        bench_engine_snapshot,
-    //        snapshot_configs,
-    //    );
+    c.bench_function_over_inputs(
+        &get_full_method_name(Level::Engine, "write"),
+        bench_engine_write,
+        write_configs,
+    );
+
+    c.bench_function_over_inputs(
+        &get_full_method_name(Level::Engine, "snapshot"),
+        bench_engine_snapshot,
+        snapshot_configs,
+    );
 }
 
 criterion_group!(benches, bench_RocksDB);
 
 criterion_main!(benches);
-
 
 //fn main() {
 //    let mut criterion = Criterion::default();
