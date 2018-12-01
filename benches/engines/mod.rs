@@ -13,6 +13,10 @@
 
 extern crate criterion;
 extern crate kvproto;
+extern crate serde;
+extern crate serde_json;
+#[macro_use]
+extern crate serde_derive;
 extern crate test_util;
 extern crate tikv;
 
@@ -27,7 +31,7 @@ use tikv::storage::{Key, Value, CF_DEFAULT};
 
 const DEFAULT_KEY_LENGTH: usize = 64;
 const DEFAULT_GET_KEYS_COUNT: usize = 1000;
-const DEFAULT_PUT_KVS_COUNT: usize = 1;
+const DEFAULT_PUT_KVS_COUNT: usize = 1000;
 
 #[derive(Copy, Clone)]
 enum Level {
@@ -100,11 +104,20 @@ fn fill_engine_with<E: Engine>(engine: &E, expect_engine_keys_count: usize, valu
     }
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize)]
 struct PutConfig<F> {
+    #[serde(skip_serializing)]
     factory: F,
+
     put_count: usize,
+    key_length: usize,
     value_length: usize,
+}
+
+impl<F> fmt::Debug for PutConfig<F> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", serde_json::to_string(self).unwrap())
+    }
 }
 
 fn bench_engine_put<E: Engine, F: EngineFactory<E>>(bencher: &mut Bencher, config: &PutConfig<F>) {
@@ -144,12 +157,21 @@ fn bench_engine_snapshot<E: Engine, F: EngineFactory<E>>(
     bencher.iter(|| black_box(&engine).snapshot(black_box(&ctx)).unwrap());
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize)]
 struct GetConfig<F> {
+    #[serde(skip_serializing)]
     factory: F,
+
     get_count: usize,
+    key_length: usize,
     value_length: usize,
     engine_keys_count: usize,
+}
+
+impl<F> fmt::Debug for GetConfig<F> {
+    fn fmt(&self, f: &mut ::fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", serde_json::to_string(self).unwrap())
+    }
 }
 
 fn bench_engine_get<E: Engine, F: EngineFactory<E>>(bencher: &mut Bencher, config: &GetConfig<F>) {
@@ -191,6 +213,7 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
                 get_configs.push(GetConfig {
                     factory,
                     get_count,
+                    key_length: DEFAULT_KEY_LENGTH,
                     value_length,
                     engine_keys_count,
                 });
@@ -206,13 +229,23 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
             put_configs.push(PutConfig {
                 factory,
                 put_count,
+                key_length: DEFAULT_KEY_LENGTH,
                 value_length,
             });
         }
     }
 
-    c.bench_function_over_inputs("bench_engine_get", bench_engine_get, get_configs);
-    //    c.bench_function_over_inputs("bench_engine_put", bench_engine_put, put_configs);
+    c.bench_function_over_inputs(
+        &get_full_method_name(Level::Engine, "get"),
+        bench_engine_get,
+        get_configs,
+    );
+    c.bench_function_over_inputs(
+        &get_full_method_name(Level::Engine, "put"),
+        bench_engine_put,
+        put_configs,
+    );
+
     //    c.bench_function_over_inputs(
     //        "bench_engine_snapshot",
     //        bench_engine_snapshot,
