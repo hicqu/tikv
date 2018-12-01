@@ -51,6 +51,12 @@ name = "mvcc"
 harness = false
 path = "benches/mvcc/mod.rs"
 
+
+[[bench]]
+name = "txn"
+harness = false
+path = "benches/txn/mod.rs"
+
 [[bench]]
 name = "misc"
 path = "benches/misc/mod.rs"
@@ -181,6 +187,6 @@ codegen-units = 1
 # The benchmark profile is identical to release, except that lto = false
 [profile.bench]
 lto = false
-opt-level = 3
+opt-level = 0
 debug = true
-codegen-units = 1
+codegen-units = 4

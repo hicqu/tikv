@@ -23,39 +23,15 @@ extern crate tikv;
 use criterion::{black_box, Bencher, Criterion};
 use kvproto::kvrpcpb::Context;
 use std::fmt;
-use test_util::generate_deliberate_kvs;
+use test_util::*;
 use tikv::storage::engine::{
     BTreeEngine, Engine, Modify, RocksEngine, Snapshot, TestEngineBuilder,
 };
 use tikv::storage::{Key, Value, CF_DEFAULT};
 
 const DEFAULT_KEY_LENGTH: usize = 64;
-const DEFAULT_GET_KEYS_COUNT: usize = 1000;
-const DEFAULT_PUT_KVS_COUNT: usize = 1000;
-
-#[derive(Copy, Clone)]
-enum Level {
-    Storage,
-    Txn,
-    Mvcc,
-    Engine,
-}
-
-impl fmt::Display for Level {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Level::Storage => write!(f, "storage"),
-            Level::Txn => write!(f, "txn"),
-            Level::Mvcc => write!(f, "mvcc"),
-            Level::Engine => write!(f, "engine"),
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn get_full_method_name(level: Level, name: &str) -> String {
-    format!("{}::{}", level, name)
-}
+const DEFAULT_GET_KEYS_COUNT: usize = 1;
+const DEFAULT_PUT_KVS_COUNT: usize = 1;
 
 trait EngineFactory<E: Engine>: Clone + Copy + fmt::Debug + 'static {
     fn build(&self) -> E;
@@ -200,7 +176,7 @@ fn bench_engine_get<E: Engine, F: EngineFactory<E>>(bencher: &mut Bencher, confi
 }
 
 fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) {
-    let value_lengths = vec![64];
+    let value_lengths = vec![64, 65, 1024, 16 * 1024];
     let engine_entries_counts = vec![0, 0];
     let engine_put_kv_counts = vec![DEFAULT_PUT_KVS_COUNT];
     let engine_get_key_counts = vec![DEFAULT_GET_KEYS_COUNT];
@@ -258,6 +234,6 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
 fn main() {
     let mut criterion = Criterion::default();
     bench_engines(&mut criterion, RocksEngineFactory {});
-    bench_engines(&mut criterion, BTreeEngineFactory {});
+    //    bench_engines(&mut criterion, BTreeEngineFactory {});
     criterion.final_summary();
 }
