@@ -186,6 +186,6 @@ codegen-units = 1
 # The benchmark profile is identical to release, except that lto = false
 [profile.bench]
 lto = false
-opt-level = 0
+opt-level = 3
 debug = true
 codegen-units = 4

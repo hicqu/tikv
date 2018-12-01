@@ -35,7 +35,7 @@ fn mvcc_prewrite(b: &mut Bencher, config: &KvConfig) {
     b.iter_with_setup(
         || {
             let mutations: Vec<(Mutation, Vec<u8>)> =
-                generate_deliberate_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length)
+                generate_random_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length)
                     .iter()
                     .map(|(k, v)| (Mutation::Put((Key::from_raw(&k), v.clone())), k.clone()))
                     .collect();
@@ -47,7 +47,7 @@ fn mvcc_prewrite(b: &mut Bencher, config: &KvConfig) {
                 let mut txn = MvccTxn::new(snapshot.clone(), 1, false).unwrap();
                 txn.prewrite(mutation, &primary, option);
                 let modifies = txn.into_modifies();
-                let _ = engine.write(&ctx, modifies);
+                black_box( engine.write(&ctx, modifies));
             }
         },
     )
@@ -56,14 +56,13 @@ fn mvcc_prewrite(b: &mut Bencher, config: &KvConfig) {
 fn mvcc_commit(b: &mut Bencher, config: &KvConfig) {
     let engine = make_engine();
     let ctx = Context::new();
-    let snapshot = engine.snapshot(&ctx).unwrap();
     let option = Options::default();
     b.iter_with_setup(
         || {
-            let mut txn = MvccTxn::new(snapshot.clone(), 1, false).unwrap();
-
+            let snapshot = engine.snapshot(&ctx).unwrap();
+            let mut txn = MvccTxn::new(snapshot, 1, false).unwrap();
             let kvs =
-                generate_deliberate_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length);
+                generate_random_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length);
             for (k, v) in &kvs {
                 txn.prewrite(
                     Mutation::Put((Key::from_raw(&k), v.clone())),
@@ -80,9 +79,9 @@ fn mvcc_commit(b: &mut Bencher, config: &KvConfig) {
             let snapshot = engine.snapshot(&ctx).unwrap();
             for key in keys {
                 let mut txn = MvccTxn::new(snapshot.clone(), 1, false).unwrap();
-                txn.commit(key, 1);
+                txn.commit(key, 2);
                 let modifies = txn.into_modifies();
-                let _ = engine.write(&ctx, modifies);
+                black_box(engine.write(&ctx, modifies).unwrap())
             }
         },
     );

@@ -72,7 +72,7 @@ fn fill_engine_with<E: Engine>(engine: &E, expect_engine_keys_count: usize, valu
     if expect_engine_keys_count > 0 {
         let mut modifies: Vec<Modify> = vec![];
         let kvs =
-            generate_deliberate_kvs(expect_engine_keys_count, DEFAULT_KEY_LENGTH, value_length);
+            generate_random_kvs(expect_engine_keys_count, DEFAULT_KEY_LENGTH, value_length);
         for (key, value) in kvs {
             modifies.push(Modify::Put(CF_DEFAULT, Key::from_raw(&key), value))
         }
@@ -104,7 +104,7 @@ fn bench_engine_put<E: Engine, F: EngineFactory<E>>(bencher: &mut Bencher, confi
     bencher.iter_with_setup(
         || {
             let test_kvs: Vec<(Key, Value)> =
-                generate_deliberate_kvs(config.put_count, DEFAULT_KEY_LENGTH, config.value_length)
+                generate_random_kvs(config.put_count, DEFAULT_KEY_LENGTH, config.value_length)
                     .iter()
                     .map(|(key, value)| (Key::from_raw(&key), value.clone()))
                     .collect();
@@ -128,7 +128,7 @@ fn bench_engine_write<E: Engine, F: EngineFactory<E>>(
     bencher.iter_with_setup(
         || {
             let modifies: Vec<Modify> =
-                generate_deliberate_kvs(config.put_count, DEFAULT_KEY_LENGTH, config.value_length)
+                generate_random_kvs(config.put_count, DEFAULT_KEY_LENGTH, config.value_length)
                     .iter()
                     .map(|(key, value)| Modify::Put(CF_DEFAULT, Key::from_raw(&key), value.clone()))
                     .collect();
@@ -182,7 +182,7 @@ fn bench_engine_get<E: Engine, F: EngineFactory<E>>(bencher: &mut Bencher, confi
     let ctx = Context::new();
     fill_engine_with(&engine, config.engine_keys_count, config.value_length);
     let test_kvs: Vec<Key> =
-        generate_deliberate_kvs(config.get_count, DEFAULT_KEY_LENGTH, config.value_length)
+        generate_random_kvs(config.get_count, DEFAULT_KEY_LENGTH, config.value_length)
             .iter()
             .map(|(key, _)| Key::from_raw(&key))
             .collect();

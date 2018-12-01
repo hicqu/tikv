@@ -29,7 +29,7 @@ fn storage_prewrite(b: &mut Bencher, config: &KvConfig) {
     b.iter_with_setup(
         || {
             let kvs =
-                generate_deliberate_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length);
+                generate_random_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length);
 
             let data: Vec<(Context, Vec<Mutation>, Vec<u8>)> = kvs.iter().map(|(k, v)|
                 (Context::new(), vec![Mutation::Put((Key::from_raw(&k), v.clone()))], k.clone())).collect();
@@ -37,13 +37,13 @@ fn storage_prewrite(b: &mut Bencher, config: &KvConfig) {
         },
         |(data, store)| {
             for (context, mutations, primary) in data {
-                store
+                black_box(store
                     .prewrite(
                         context,
                         mutations,
                         primary,
                         1,
-                    ).unwrap();
+                    ).unwrap());
             }
         },
     );
@@ -64,17 +64,15 @@ fn storage_commit(b: &mut Bencher, config: &KvConfig) {
                         vec![Mutation::Put((Key::from_raw(&k), v.clone()))],
                         k.clone(),
                         1,
-                    )
-                    .expect("");
+                    ).unwrap();
             }
 
             (kvs, &store)
         },
         |(kvs, store)| {
-            for (k, v) in &kvs {
-                store
-                    .commit(Context::new(), vec![Key::from_raw(k)], 1, 2)
-                    .expect("");
+            for (k, _) in &kvs {
+                black_box(store
+                    .commit(Context::new(), vec![Key::from_raw(k)], 1, 2).unwrap());
             }
         },
     );

@@ -35,8 +35,8 @@ pub use logging::*;
 pub use security::*;
 
 pub const DEFAULT_ITERATIONS: usize = 1;
-pub const DEFAULT_KEY_LENGTHS: [usize; 1] = [64];
-pub const DEFAULT_VALUE_LENGTHS: [usize; 2] = [64, 65];
+pub const DEFAULT_KEY_LENGTHS: [usize; 2] = [64, 128];
+pub const DEFAULT_VALUE_LENGTHS: [usize; 3] = [64, 65, 1024];
 
 pub fn setup_for_ci() {
     let guard = if env::var("CI").is_ok() && env::var("LOG_FILE").is_ok() {
