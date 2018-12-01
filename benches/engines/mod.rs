@@ -235,7 +235,7 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
 fn bench_RocksDB(c: &mut Criterion) {
     let factory = RocksEngineFactory {};
 
-    let value_lengths = vec![64, 65, 1024, 16 * 1024];
+    let value_lengths = DEFAULT_VALUE_LENGTHS;
     let engine_entries_counts = vec![0, 0];
     let engine_put_kv_counts = vec![DEFAULT_PUT_KVS_COUNT];
     let engine_get_key_counts = vec![DEFAULT_GET_KEYS_COUNT];
