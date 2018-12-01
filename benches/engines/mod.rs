@@ -71,8 +71,7 @@ impl fmt::Debug for RocksEngineFactory {
 fn fill_engine_with<E: Engine>(engine: &E, expect_engine_keys_count: usize, value_length: usize) {
     if expect_engine_keys_count > 0 {
         let mut modifies: Vec<Modify> = vec![];
-        let kvs =
-            generate_random_kvs(expect_engine_keys_count, DEFAULT_KEY_LENGTH, value_length);
+        let kvs = generate_random_kvs(expect_engine_keys_count, DEFAULT_KEY_LENGTH, value_length);
         for (key, value) in kvs {
             modifies.push(Modify::Put(CF_DEFAULT, Key::from_raw(&key), value))
         }
@@ -152,7 +151,7 @@ struct SnapshotConfig<F> {
     value_length: usize,
 }
 
-impl<F> fmt::Debug for GetConfig<F> {
+impl<F> fmt::Debug for SnapshotConfig<F> {
     fn fmt(&self, f: &mut ::fmt::Formatter) -> fmt::Result {
         let s = serde_json::to_string(self).unwrap();
         write!(f, "{}", s.replace("\"", "+"))
