@@ -24,12 +24,12 @@ use test_storage::SyncTestStorageBuilder;
 use test_util::*;
 use tikv::storage::{Key, Mutation};
 
-fn txn_prewrite(b: &mut Bencher, config: &KvConfig) {
+fn storage_prewrite(b: &mut Bencher, config: &KvConfig) {
     let store = SyncTestStorageBuilder::new().build().unwrap();
     b.iter_with_setup(
         || {
             let kvs =
-                generate_random_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length);
+                generate_deliberate_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length);
 
             let data: Vec<(Context, Vec<Mutation>, Vec<u8>)> = kvs.iter().map(|(k, v)|
                 (Context::new(), vec![Mutation::Put((Key::from_raw(&k), v.clone()))], k.clone())).collect();
@@ -43,14 +43,13 @@ fn txn_prewrite(b: &mut Bencher, config: &KvConfig) {
                         mutations,
                         primary,
                         1,
-                    )
-                    .expect("");
+                    ).unwrap();
             }
         },
     );
 }
 
-fn txn_commit(b: &mut Bencher, config: &KvConfig) {
+fn storage_commit(b: &mut Bencher, config: &KvConfig) {
     let store = SyncTestStorageBuilder::new().build().unwrap();
 
     b.iter_with_setup(
@@ -81,18 +80,18 @@ fn txn_commit(b: &mut Bencher, config: &KvConfig) {
     );
 }
 
-fn bench_txn(c: &mut Criterion) {
+fn bench_storage(c: &mut Criterion) {
     c.bench_function_over_inputs(
-        &get_full_method_name(Level::Storage, "prewrite"),
-        txn_prewrite,
+        &get_full_method_name(Level::Storage, "async_prewrite"),
+        storage_prewrite,
         generate_kv_configs(),
     );
     c.bench_function_over_inputs(
-        &get_full_method_name(Level::Storage, "commit"),
-        txn_commit,
+        &get_full_method_name(Level::Storage, "async_commit"),
+        storage_commit,
         generate_kv_configs(),
     );
 }
 
-criterion_group!(benches, bench_txn,);
+criterion_group!(benches, bench_storage,);
 criterion_main!(benches);
