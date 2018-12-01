@@ -55,11 +55,6 @@ path = "benches/mvcc/mod.rs"
 name = "misc"
 path = "benches/misc/mod.rs"
 
-
-[[bench]]
-name = "t"
-path = "benches/t/mod.rs"
-
 [dependencies]
 log = { version = "0.3", features = ["release_max_level_debug"] }
 slog = "2.3"
