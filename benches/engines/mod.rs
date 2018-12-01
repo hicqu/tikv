@@ -116,7 +116,8 @@ struct PutConfig<F> {
 
 impl<F> fmt::Debug for PutConfig<F> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", serde_json::to_string(self).unwrap())
+        let s = serde_json::to_string(self).unwrap();
+        write!(f, "{}", s.replace("\"", "+"))
     }
 }
 
@@ -170,7 +171,8 @@ struct GetConfig<F> {
 
 impl<F> fmt::Debug for GetConfig<F> {
     fn fmt(&self, f: &mut ::fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", serde_json::to_string(self).unwrap())
+        let s = serde_json::to_string(self).unwrap();
+        write!(f, "{}", s.replace("\"", "+"))
     }
 }
 
