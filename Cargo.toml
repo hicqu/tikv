@@ -187,5 +187,5 @@ codegen-units = 1
 [profile.bench]
 lto = false
 opt-level = 3
-debug = true
+debug = false
 codegen-units = 4
