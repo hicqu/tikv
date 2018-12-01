@@ -28,3 +28,6 @@ tmp
 # Cargo-fuzz
 corpus
 artifacts
+
+bench.sh
+post-criterion
