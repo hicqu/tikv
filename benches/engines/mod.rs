@@ -142,11 +142,21 @@ fn bench_engine_write<E: Engine, F: EngineFactory<E>>(
     );
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize)]
 struct SnapshotConfig<F> {
+    #[serde(skip_serializing)]
     factory: F,
+
     engine_keys_count: usize,
+    key_length: usize,
     value_length: usize,
+}
+
+impl<F> fmt::Debug for GetConfig<F> {
+    fn fmt(&self, f: &mut ::fmt::Formatter) -> fmt::Result {
+        let s = serde_json::to_string(self).unwrap();
+        write!(f, "{}", s.replace("\"", "+"))
+    }
 }
 
 fn bench_engine_snapshot<E: Engine, F: EngineFactory<E>>(
@@ -296,6 +306,7 @@ fn bench_RocksDB(c: &mut Criterion) {
             }
             snapshot_configs.push(SnapshotConfig {
                 factory,
+                key_length,
                 value_length,
                 engine_keys_count,
             });
