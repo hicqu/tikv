@@ -51,11 +51,10 @@ name = "mvcc"
 harness = false
 path = "benches/mvcc/mod.rs"
 
-
 [[bench]]
-name = "txn"
+name = "storage"
 harness = false
-path = "benches/txn/mod.rs"
+path = "benches/storage/mod.rs"
 
 [[bench]]
 name = "misc"

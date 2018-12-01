@@ -30,15 +30,18 @@ fn txn_prewrite(b: &mut Bencher, config: &KvConfig) {
         || {
             let kvs =
                 generate_random_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length);
-            (kvs, &store)
+
+            let data: Vec<(Context, Vec<Mutation>, Vec<u8>)> = kvs.iter().map(|(k, v)|
+                (Context::new(), vec![Mutation::Put((Key::from_raw(&k), v.clone()))], k.clone())).collect();
+            (data, &store)
         },
-        |(kvs, store)| {
-            for (k, v) in &kvs {
+        |(data, store)| {
+            for (context, mutations, primary) in data {
                 store
                     .prewrite(
-                        Context::new(),
-                        vec![Mutation::Put((Key::from_raw(&k), v.clone()))],
-                        k.clone(),
+                        context,
+                        mutations,
+                        primary,
                         1,
                     )
                     .expect("");

@@ -11,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[macro_use]
 extern crate criterion;
 extern crate kvproto;
 extern crate serde;
@@ -231,9 +232,72 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
     //    );
 }
 
-fn main() {
-    let mut criterion = Criterion::default();
-    bench_engines(&mut criterion, RocksEngineFactory {});
-    //    bench_engines(&mut criterion, BTreeEngineFactory {});
-    criterion.final_summary();
+fn bench_RocksDB(c: &mut Criterion) {
+    let factory = RocksEngineFactory {};
+
+    let value_lengths = vec![64, 65, 1024, 16 * 1024];
+    let engine_entries_counts = vec![0, 0];
+    let engine_put_kv_counts = vec![DEFAULT_PUT_KVS_COUNT];
+    let engine_get_key_counts = vec![DEFAULT_GET_KEYS_COUNT];
+
+    let mut get_configs = vec![];
+    let mut put_configs = vec![];
+    let mut snapshot_configs = vec![];
+
+    for &value_length in &value_lengths {
+        for &engine_keys_count in &engine_entries_counts {
+            for &get_count in &engine_get_key_counts {
+                get_configs.push(GetConfig {
+                    factory,
+                    get_count,
+                    key_length: DEFAULT_KEY_LENGTH,
+                    value_length,
+                    engine_keys_count,
+                });
+            }
+            snapshot_configs.push(SnapshotConfig {
+                factory,
+                value_length,
+                engine_keys_count,
+            });
+        }
+
+        for &put_count in &engine_put_kv_counts {
+            put_configs.push(PutConfig {
+                factory,
+                put_count,
+                key_length: DEFAULT_KEY_LENGTH,
+                value_length,
+            });
+        }
+    }
+
+    c.bench_function_over_inputs(
+        &get_full_method_name(Level::Engine, "get"),
+        bench_engine_get,
+        get_configs,
+    );
+    c.bench_function_over_inputs(
+        &get_full_method_name(Level::Engine, "put"),
+        bench_engine_put,
+        put_configs,
+    );
+
+    //    c.bench_function_over_inputs(
+    //        "bench_engine_snapshot",
+    //        bench_engine_snapshot,
+    //        snapshot_configs,
+    //    );
 }
+
+criterion_group!(benches, bench_RocksDB);
+
+criterion_main!(benches);
+
+
+//fn main() {
+//    let mut criterion = Criterion::default();
+//    bench_engines(&mut criterion, RocksEngineFactory {});
+//    //    bench_engines(&mut criterion, BTreeEngineFactory {});
+//    criterion.final_summary();
+//}
