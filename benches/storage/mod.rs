@@ -22,7 +22,33 @@ use criterion::{black_box, Bencher, Criterion};
 use kvproto::kvrpcpb::Context;
 use test_storage::SyncTestStorageBuilder;
 use test_util::*;
-use tikv::storage::{Key, Mutation};
+use tikv::storage::{Key, Mutation, CF_DEFAULT};
+
+
+fn storage_raw_get(b: &mut Bencher, config: &KvConfig) {
+    let store = SyncTestStorageBuilder::new().build().unwrap();
+    b.iter_with_setup(
+        || {
+            let kvs =
+                generate_random_kvs(DEFAULT_ITERATIONS, config.key_length, config.value_length);
+
+            let data: Vec<(Context, Vec<u8>)> = kvs.iter().map(|(k,_)|
+                (Context::new(), k.clone())).collect();
+            (data, &store)
+        },
+        |(data, store)| {
+            for (context, key) in data {
+                black_box(store
+                    .raw_get(
+                        context,
+                        CF_DEFAULT.clone().to_string(),
+                        key,
+                    ).unwrap());
+            }
+        },
+    );
+}
+
 
 fn storage_prewrite(b: &mut Bencher, config: &KvConfig) {
     let store = SyncTestStorageBuilder::new().build().unwrap();
@@ -51,7 +77,6 @@ fn storage_prewrite(b: &mut Bencher, config: &KvConfig) {
 
 fn storage_commit(b: &mut Bencher, config: &KvConfig) {
     let store = SyncTestStorageBuilder::new().build().unwrap();
-
     b.iter_with_setup(
         || {
             let kvs =
@@ -87,6 +112,11 @@ fn bench_storage(c: &mut Criterion) {
     c.bench_function_over_inputs(
         &get_full_method_name(Level::Storage, "async_commit"),
         storage_commit,
+        generate_kv_configs(),
+    );
+    c.bench_function_over_inputs(
+        &get_full_method_name(Level::Storage, "async_raw_get"),
+        storage_raw_get,
         generate_kv_configs(),
     );
 }
