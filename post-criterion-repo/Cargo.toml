@@ -1,0 +1,11 @@
+[package]
+name = "post-criterion"
+version = "0.1.0"
+authors = ["qupeng <qupeng@pingcap.com>"]
+
+[dependencies]
+serde_json = "1.0"
+chrono = "0.4"
+hyper = "0.12"
+tokio = "0.1"
+futures = "0.1"
