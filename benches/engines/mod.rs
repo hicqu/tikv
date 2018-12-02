@@ -233,6 +233,7 @@ fn bench_engines<E: Engine, F: EngineFactory<E>>(c: &mut Criterion, factory: F) 
             }
             snapshot_configs.push(SnapshotConfig {
                 factory,
+                key_length: DEFAULT_KEY_LENGTH,
                 value_length,
                 engine_keys_count,
             });
@@ -305,7 +306,7 @@ fn bench_RocksDB(c: &mut Criterion) {
             }
             snapshot_configs.push(SnapshotConfig {
                 factory,
-                key_length,
+                key_length: DEFAULT_KEY_LENGTH,
                 value_length,
                 engine_keys_count,
             });
