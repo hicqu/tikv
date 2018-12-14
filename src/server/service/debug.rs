@@ -243,6 +243,22 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
         self.handle_response(ctx, sink, f, "debug_compact");
     }
 
+    fn count(&mut self, ctx: RpcContext, req: CountRequest, sink: UnarySink<CountResponse>) {
+        let debugger = self.debugger.clone();
+        let f = self.pool.spawn_fn(move || {
+            debugger
+                .count(req.get_db(), req.get_cf())
+                .map(|(count, key_size, value_size)| {
+                    let mut resp = CountResponse::new();
+                    resp.set_count(count as u64);
+                    resp.set_keys_size(key_size as u64);
+                    resp.set_values_size(value_size as u64);
+                    resp
+                })
+        });
+        self.handle_response(ctx, sink, f, "debug_count");
+    }
+
     fn inject_fail_point(
         &mut self,
         ctx: RpcContext,

@@ -103,7 +103,7 @@ features = ["secure"]
 
 [dependencies.kvproto]
 git = "https://github.com/pingcap/kvproto.git"
-branch = "super-batch-streaming-old-grpc"
+branch = "super-batch-streaming-old-grpc-1"
 
 [dependencies.tipb]
 git = "https://github.com/pingcap/tipb.git"

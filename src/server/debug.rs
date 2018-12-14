@@ -272,6 +272,21 @@ impl Debugger {
         MvccInfoIterator::new(&self.engines.kv, start, end, limit)
     }
 
+    pub fn count(&self, db: DBType, cf: &str) -> Result<(usize, usize, usize)> {
+        validate_db_and_cf(db, cf)?;
+        let db = self.get_db_from_type(db)?;
+        let start_key = &keys::data_key(b"");
+        let end_key = &keys::data_end_key(b"");
+        let (mut count, mut key_size, mut value_size) = (0, 0, 0);
+        box_try!(db.scan_cf(cf, start_key, end_key, false, |k, v| {
+            count += 1;
+            key_size += k.len();
+            value_size += v.len();
+            Ok(true)
+        }));
+        return Ok((count, key_size, value_size));
+    }
+
     /// Compact the cf[start..end) in the db.
     pub fn compact(
         &self,

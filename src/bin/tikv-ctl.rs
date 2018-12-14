@@ -46,6 +46,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::iter::FromIterator;
+use std::sync::atomic::{self, AtomicUsize};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -421,6 +422,8 @@ trait DebugExecutor {
         );
     }
 
+    fn count_cluster(&self, db: DBType, cf: &str) -> (usize, usize, usize);
+
     fn compact_region(
         &self,
         address: Option<&str>,
@@ -721,6 +724,20 @@ impl DebugExecutor for DebugClient {
             println!("{}: {}", prop.get_name(), prop.get_value());
         }
     }
+
+    fn count_cluster(&self, db: DBType, cf: &str) -> (usize, usize, usize) {
+        let mut req = CountRequest::new();
+        req.set_db(db);
+        req.set_cf(cf.to_owned());
+        let resp = self
+            .count(&req)
+            .unwrap_or_else(|e| perror_and_exit("DebugClient::count", e));
+        return (
+            resp.get_count() as usize,
+            resp.get_keys_size() as usize,
+            resp.get_values_size() as usize,
+        );
+    }
 }
 
 impl DebugExecutor for Debugger {
@@ -889,6 +906,11 @@ impl DebugExecutor for Debugger {
         for (name, value) in props {
             println!("{}: {}", name, value);
         }
+    }
+
+    fn count_cluster(&self, _db: DBType, _cf: &str) -> (usize, usize, usize) {
+        eprintln!("only support remote mode");
+        process::exit(-1);
     }
 }
 
@@ -1418,6 +1440,30 @@ fn main() {
                         .help("meta file path"),
                 ),
         )
+	.subcommand(
+            SubCommand::with_name("count-cluster")
+                .about("compact the whole cluster in a specified range in one or more column families")
+                .arg(
+                    Arg::with_name("db")
+                        .short("d")
+                        .takes_value(true)
+                        .default_value("kv")
+                        .possible_values(&["kv", "raft"])
+                        .help("kv or raft"),
+                )
+                .arg(
+                    Arg::with_name("cf")
+                        .short("c")
+                        .takes_value(true)
+                        .multiple(true)
+                        .use_delimiter(true)
+                        .require_delimiter(true)
+                        .value_delimiter(",")
+                        .default_value(CF_DEFAULT)
+                        .possible_values(&["default", "lock", "write"])
+                        .help("column family names, for kv db, combine from default/lock/write; for raft db, can only be default"),
+                )
+	)
         .subcommand(
             SubCommand::with_name("compact-cluster")
                 .about("compact the whole cluster in a specified range in one or more column families")
@@ -1596,6 +1642,13 @@ fn main() {
             return compact_whole_cluster(
                 pd, mgr, db_type, cfs, from_key, to_key, threads, bottommost,
             );
+        }
+        if let Some(matches) = matches.subcommand_matches("count-cluster") {
+            let db = matches.value_of("db").unwrap();
+            let db_type = if db == "kv" { DBType::KV } else { DBType::RAFT };
+            let cfs = Vec::from_iter(matches.values_of("cf").unwrap());
+            count_cluster(pd, mgr, db_type, cfs);
+            return;
         }
         if let Some(matches) = matches.subcommand_matches("split-region") {
             let region_id = value_t_or_exit!(matches.value_of("region"), u64);
@@ -1942,6 +1995,58 @@ fn split_region(pd: &str, region_id: u64, key: Vec<u8>, mgr: Arc<SecurityManager
         region_id,
         resp.get_left().get_id(),
         resp.get_right().get_id(),
+    );
+}
+
+fn count_cluster(pd: &str, mgr: Arc<SecurityManager>, db_type: DBType, cfs: Vec<&str>) {
+    let mut cfg = PdConfig::default();
+    cfg.endpoints.push(pd.to_owned());
+    if let Err(e) = cfg.validate() {
+        panic!("invalid pd configuration: {:?}", e);
+    }
+
+    let pd_client = RpcClient::new(&cfg, Arc::clone(&mgr))
+        .unwrap_or_else(|e| perror_and_exit("RpcClient::new", e));
+
+    let stores = pd_client
+        .get_all_stores()
+        .unwrap_or_else(|e| perror_and_exit("Get all cluster stores from PD failed", e));
+
+    let mut handles = Vec::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    let keys_size = Arc::new(AtomicUsize::new(0));
+    let values_size = Arc::new(AtomicUsize::new(0));
+    for s in stores {
+        let mgr = Arc::clone(&mgr);
+        let addr = s.address.clone();
+        let c = Arc::clone(&count);
+        let k = Arc::clone(&keys_size);
+        let v = Arc::clone(&values_size);
+        let cfss: Vec<String> = cfs.iter().map(|&c| c.to_owned()).collect();
+
+        let h = thread::spawn(move || {
+            let debug_executor = new_debug_executor(None, None, Some(&addr), None, mgr);
+            for cf in &cfss {
+                let (count, keys_size, values_size) = debug_executor.count_cluster(db_type, cf);
+                println!(
+                    "{} cf {} key count: {}, keys_size: {}, values_size: {}",
+                    addr, cf, count, keys_size, values_size
+                );
+                c.fetch_add(count, atomic::Ordering::SeqCst);
+                k.fetch_add(keys_size, atomic::Ordering::SeqCst);
+                v.fetch_add(values_size, atomic::Ordering::SeqCst);
+            }
+        });
+        handles.push(h);
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    println!(
+        "total key count: {}, keys_size: {}, values_size: {}",
+        count.load(atomic::Ordering::SeqCst),
+        keys_size.load(atomic::Ordering::SeqCst),
+        values_size.load(atomic::Ordering::SeqCst)
     );
 }
 
