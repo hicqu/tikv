@@ -60,14 +60,14 @@ use tikv::config::{check_and_persist_critical_config, TiKvConfig};
 use tikv::coprocessor;
 use tikv::import::{ImportSSTService, SSTImporter};
 use tikv::pd::{PdClient, RpcClient};
-use tikv::raftstore::coprocessor::CoprocessorHost;
+use tikv::raftstore::coprocessor::{CoprocessorHost, RegionInfoAccessor};
 use tikv::raftstore::store::fsm::transport::create_router;
 use tikv::raftstore::store::{new_compaction_listener, Engines, SnapManagerBuilder};
 use tikv::server::readpool::ReadPool;
 use tikv::server::resolve;
 use tikv::server::transport::ServerRaftStoreRouter;
 use tikv::server::{create_raft_storage, Node, Server, DEFAULT_CLUSTER_ID};
-use tikv::storage::{self, DEFAULT_ROCKSDB_SUB_DIR};
+use tikv::storage::{self, AutoGCConfig, DEFAULT_ROCKSDB_SUB_DIR};
 use tikv::util::rocksdb::metrics_flusher::{MetricsFlusher, DEFAULT_FLUSHER_INTERVAL};
 use tikv::util::security::SecurityManager;
 use tikv::util::time::Monitor;
@@ -212,10 +212,19 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig, security_mgr: Arc<Sec
     let trans = server.transport();
 
     // Create node.
-    let mut node = Node::new(router.clone(), &server_cfg, &cfg.raft_store, pd_client);
+    let mut node = Node::new(
+        router.clone(),
+        &server_cfg,
+        &cfg.raft_store,
+        Arc::clone(&pd_client),
+    );
 
     // Create CoprocessorHost.
-    let coprocessor_host = CoprocessorHost::new(cfg.coprocessor.clone(), node.router());
+    let mut coprocessor_host = CoprocessorHost::new(cfg.coprocessor.clone(), node.router());
+
+    // Create region collection
+    let region_info_accessor = RegionInfoAccessor::new(&mut coprocessor_host);
+    region_info_accessor.start();
 
     node.start(
         engines.clone(),
@@ -228,6 +237,12 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig, security_mgr: Arc<Sec
         importer,
     ).unwrap_or_else(|e| fatal!("failed to start node: {:?}", e));
     initial_metric(&cfg.metric, Some(node.id()));
+
+    // Start auto gc
+    let auto_gc_cfg = AutoGCConfig::new(pd_client, region_info_accessor.clone(), node.id());
+    if let Err(e) = storage.start_auto_gc(auto_gc_cfg) {
+        fatal!("failed to start auto_gc on storage, error: {:?}", e);
+    }
 
     let mut metrics_flusher = MetricsFlusher::new(
         engines.clone(),
@@ -254,6 +269,9 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig, security_mgr: Arc<Sec
 
     node.stop()
         .unwrap_or_else(|e| fatal!("failed to stop node: {:?}", e));
+
+    region_info_accessor.stop();
+
     if let Some(Err(e)) = worker.stop().map(|j| j.join()) {
         info!("ignore failure when stopping resolver: {:?}", e);
     }

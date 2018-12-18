@@ -50,8 +50,10 @@ pub use self::config::{Config, DEFAULT_DATA_DIR, DEFAULT_ROCKSDB_SUB_DIR};
 pub use self::engine::raftkv::RaftKv;
 pub use self::engine::{
     CFStatistics, Cursor, CursorBuilder, Engine, Error as EngineError, FlowStatistics, Iterator,
-    Modify, RocksEngine, ScanMode, Snapshot, Statistics, StatisticsSummary, TestEngineBuilder,
+    Modify, RegionInfoProvider, RocksEngine, ScanMode, Snapshot, Statistics, StatisticsSummary,
+    TestEngineBuilder,
 };
+pub use self::gc_worker::{AutoGCConfig, GCSafePointProvider};
 pub use self::readpool_context::Context as ReadPoolContext;
 pub use self::txn::{FixtureStore, FixtureStoreScanner};
 pub use self::txn::{Msg, Scanner, Scheduler, SnapshotStore, Store, StoreScanner};
@@ -605,6 +607,13 @@ impl<E: Engine> Storage<E> {
             refs: Arc::new(atomic::AtomicUsize::new(1)),
             max_key_size: config.max_key_size,
         })
+    }
+
+    pub fn start_auto_gc<S: GCSafePointProvider, R: RegionInfoProvider>(
+        &self,
+        cfg: AutoGCConfig<S, R>,
+    ) -> Result<()> {
+        self.gc_worker.start_auto_gc(cfg)
     }
 
     pub fn get_engine(&self) -> E {

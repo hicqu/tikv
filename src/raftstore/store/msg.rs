@@ -23,13 +23,13 @@ use kvproto::pdpb::CheckPolicy;
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse};
 use kvproto::raft_serverpb::{RaftMessage, RegionLocalState};
 
-use raft::SnapshotStatus;
+use raft::{SnapshotStatus, StateRole};
 use raftstore::store::util::KeysInfoFormatter;
 use raftstore::store::Config;
 use util::escape;
 use util::rocksdb::CompactedEvent;
 
-use super::{peer::Peer, RegionSnapshot, SnapKey};
+use super::{RegionSnapshot, SnapKey};
 use raftstore::store::fsm::apply::TaskRes as ApplyTaskRes;
 
 #[derive(Debug, Clone)]
@@ -45,13 +45,8 @@ pub struct WriteResponse {
 
 #[derive(Debug)]
 pub enum SeekRegionResult {
-    Found {
-        local_peer: metapb::Peer,
-        region: metapb::Region,
-    },
-    LimitExceeded {
-        next_key: Vec<u8>,
-    },
+    Found(metapb::Region),
+    LimitExceeded { next_key: Vec<u8> },
     Ended,
 }
 
@@ -59,7 +54,7 @@ pub type ReadCallback = Box<FnBox(ReadResponse) + Send>;
 pub type WriteCallback = Box<FnBox(WriteResponse) + Send>;
 
 pub type SeekRegionCallback = Box<FnBox(SeekRegionResult) + Send>;
-pub type SeekRegionFilter = Box<Fn(&Peer) -> bool + Send>;
+pub type SeekRegionFilter = Box<Fn(&metapb::Region, StateRole) -> bool + Send>;
 
 /// Variants of callbacks for `Msg`.
 ///  - `Read`: a callbak for read only requests including `StatusRequest`,
