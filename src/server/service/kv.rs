@@ -15,6 +15,7 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::{future, Async, Future, Poll, Sink, Stream};
 use grpc::{
@@ -31,6 +32,7 @@ use kvproto::tikvpb_grpc;
 use prometheus::HistogramTimer;
 use protobuf::RepeatedField;
 use tokio::runtime::{Runtime, TaskExecutor};
+use tokio::timer::Delay;
 
 use coprocessor::Endpoint;
 use raftstore::store::Callback;
@@ -829,11 +831,12 @@ fn response_batch_commands_request<F>(
     resp: F,
     tx: Sender<(u64, BatchCommandsResponse_Response)>,
     timer: HistogramTimer,
-    _in_heavy_load: Arc<(AtomicUsize, AtomicUsize)>,
-    _heavy_load_threshold: usize,
+    in_heavy_load: Arc<(AtomicUsize, AtomicUsize)>,
+    heavy_load_threshold: usize,
 ) where
     F: Future<Item = BatchCommandsResponse_Response_oneof_cmd, Error = ()> + Send + 'static,
 {
+    let executor1 = executor.clone();
     let f = resp.and_then(move |resp| {
         let mut res = BatchCommandsResponse_Response::new();
         res.cmd = Some(resp);
@@ -843,7 +846,15 @@ fn response_batch_commands_request<F>(
         }
         timer.observe_duration();
         if let Some(notifier) = tx.get_notifier() {
-            notifier.external_notify();
+            if in_heavy_load.1.load(Ordering::SeqCst) > heavy_load_threshold {
+                executor1.spawn(
+                    Delay::new(Instant::now() + Duration::from_millis(2))
+                        .map_err(|_| error!("BatchCommands RPC delay responses error"))
+                        .inspect(move |_| notifier.external_notify()),
+                );
+            } else {
+                notifier.external_notify();
+            }
         }
         Ok(())
     });
