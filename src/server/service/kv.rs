@@ -848,7 +848,7 @@ fn response_batch_commands_request<F>(
         if let Some(notifier) = tx.get_notifier() {
             if in_heavy_load.1.load(Ordering::SeqCst) > heavy_load_threshold {
                 executor1.spawn(
-                    Delay::new(Instant::now() + Duration::from_millis(2))
+                    Delay::new(Instant::now() + Duration::from_millis(1))
                         .map_err(|_| error!("BatchCommands RPC delay responses error"))
                         .inspect(move |_| notifier.external_notify()),
                 );

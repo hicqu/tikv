@@ -23,8 +23,8 @@ use crossbeam_channel;
 use futures::task::{self, Task};
 use futures::{Async, Poll, Stream};
 
-const NOTIFY_BATCH_SIZE: usize = 8;
-const MAX_BATCH_SIZE: usize = 32;
+const NOTIFY_BATCH_SIZE: usize = 16;
+const MAX_BATCH_SIZE: usize = 128;
 
 pub struct State {
     sender_cnt: AtomicIsize,
