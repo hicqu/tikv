@@ -36,6 +36,7 @@ const DEFAULT_SCHED_PENDING_WRITE_MB: u64 = 100;
 pub struct Config {
     pub data_dir: String,
     pub gc_ratio_threshold: f64,
+    pub gc_concurrency: usize,
     pub max_key_size: usize,
     pub scheduler_notify_capacity: usize,
     pub scheduler_concurrency: usize,
@@ -49,6 +50,7 @@ impl Default for Config {
         Config {
             data_dir: DEFAULT_DATA_DIR.to_owned(),
             gc_ratio_threshold: DEFAULT_GC_RATIO_THRESHOLD,
+            gc_concurrency: 1,
             max_key_size: DEFAULT_MAX_KEY_SIZE,
             scheduler_notify_capacity: DEFAULT_SCHED_CAPACITY,
             scheduler_concurrency: DEFAULT_SCHED_CONCURRENCY,

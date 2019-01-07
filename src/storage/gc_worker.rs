@@ -17,7 +17,7 @@ use super::engine::{
 use super::metrics::*;
 use super::mvcc::{MvccReader, MvccTxn};
 use super::{Callback, Error, Key, Result, CF_DEFAULT, CF_LOCK, CF_WRITE};
-use futures::Future;
+use futures::{future, Future};
 use kvproto::kvrpcpb::Context;
 use kvproto::metapb;
 use pd::PdClient;
@@ -30,13 +30,14 @@ use server::transport::ServerRaftStoreRouter;
 use std::cmp::Ordering;
 use std::fmt::{self, Display, Formatter};
 use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, Builder as ThreadBuilder, JoinHandle};
 use std::time::{Duration, Instant};
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 use util::rocksdb::get_cf_handle;
 use util::time::{duration_to_sec, SlowTimer};
-use util::worker::{self, Builder as WorkerBuilder, Runnable, ScheduleError, Worker};
 
 // TODO: make it configurable.
 pub const GC_BATCH_SIZE: usize = 512;
@@ -49,7 +50,6 @@ const GC_LOG_FOUND_VERSION_THRESHOLD: usize = 30;
 /// versions are deleted.
 const GC_LOG_DELETED_VERSION_THRESHOLD: usize = 30;
 
-pub const GC_MAX_PENDING_TASKS: usize = 2;
 const GC_SNAPSHOT_TIMEOUT_SECS: u64 = 10;
 const GC_TASK_SLOW_SECONDS: u64 = 30;
 
@@ -146,13 +146,13 @@ impl Display for GCTask {
 }
 
 /// `GCRunner` is used to perform GC on the engine
+#[derive(Clone)]
 struct GCRunner<E: Engine> {
     engine: E,
     local_storage: Option<Arc<DB>>,
     raft_store_router: Option<ServerRaftStoreRouter>,
 
     ratio_threshold: f64,
-
     stats: StatisticsSummary,
 }
 
@@ -319,7 +319,6 @@ impl<E: Engine> GCRunner<E> {
         );
 
         // TODO: Refine usage of errors
-
         let local_storage = self.local_storage.as_ref().ok_or_else(|| {
             let e: Error = box_err!("unsafe destroy range not supported: local_storage not set");
             warn!("unsafe destroy range failed: {:?}", &e);
@@ -416,24 +415,8 @@ impl<E: Engine> GCRunner<E> {
         }
         (task.take_callback())(result);
     }
-}
 
-impl<E: Engine> Runnable<GCTask> for GCRunner<E> {
-    #[inline]
-    fn run(&mut self, task: GCTask) {
-        self.handle_gc_worker_task(task);
-    }
-
-    // The default implementation of `run_batch` prints a warning to log when it takes over 1 second
-    // to handle a task. It's not proper here, so override it to remove the log.
-    #[inline]
-    fn run_batch(&mut self, tasks: &mut Vec<GCTask>) {
-        for task in tasks.drain(..) {
-            self.run(task);
-        }
-    }
-
-    fn on_tick(&mut self) {
+    fn flush_metrics(&mut self) {
         let stats = mem::replace(&mut self.stats, StatisticsSummary::default());
         for (cf, details) in stats.stat.details() {
             for (tag, count) in details {
@@ -443,34 +426,6 @@ impl<E: Engine> Runnable<GCTask> for GCRunner<E> {
             }
         }
     }
-}
-
-/// Schedule a `GCTask` in a worker
-fn schedule_gc(
-    scheduler: &worker::Scheduler<GCTask>,
-    ctx: Context,
-    safe_point: u64,
-    callback: Callback<()>,
-) -> Result<()> {
-    scheduler
-        .schedule(GCTask::GC {
-            ctx,
-            safe_point,
-            callback,
-        })
-        .or_else(|e| match e {
-            ScheduleError::Full(task) => {
-                GC_TOO_BUSY_COUNTER.inc();
-                (task.take_callback())(Err(Error::GCWorkerTooBusy));
-                Ok(())
-            }
-            _ => Err(box_err!("failed to schedule gc task: {:?}", e)),
-        })
-}
-
-/// Do GC synchronously
-fn gc(scheduler: &worker::Scheduler<GCTask>, ctx: Context, safe_point: u64) -> Result<()> {
-    wait_op!(|callback| schedule_gc(scheduler, ctx, safe_point, callback)).unwrap()
 }
 
 /// The configurations of the Automatic GC
@@ -636,32 +591,41 @@ impl GCManagerHandle {
 }
 
 /// `GCManager` scans regions and does gc automatically.
-struct GCManager<S: GCSafePointProvider, R: RegionInfoProvider> {
+struct GCManager<S: GCSafePointProvider, R: RegionInfoProvider, E: Engine> {
     cfg: AutoGCConfig<S, R>,
-
     safe_point: u64,
-
-    worker_scheduler: worker::Scheduler<GCTask>,
-
     gc_worker_context: GCManagerContext,
+
+    concurrency: usize,
+    running_tasks: Arc<AtomicUsize>,
+    runtime: Arc<Runtime>,
+    gc_runner: GCRunner<E>,
 }
 
-impl<S: GCSafePointProvider, R: RegionInfoProvider> GCManager<S, R> {
+impl<S: GCSafePointProvider, R: RegionInfoProvider, E: Engine> GCManager<S, R, E> {
     pub fn new(
         cfg: AutoGCConfig<S, R>,
-        worker_scheduler: worker::Scheduler<GCTask>,
-    ) -> GCManager<S, R> {
+        concurrency: usize,
+        running_tasks: Arc<AtomicUsize>,
+        runtime: Arc<Runtime>,
+        gc_runner: GCRunner<E>,
+    ) -> GCManager<S, R, E> {
         GCManager {
             cfg,
             safe_point: 0,
-            worker_scheduler,
             gc_worker_context: GCManagerContext::new(),
+
+            concurrency,
+            running_tasks,
+            runtime,
+            gc_runner,
         }
     }
 
     fn start(mut self) -> Result<GCManagerHandle> {
         let (tx, rx) = mpsc::channel();
         self.gc_worker_context.stop_signal_receiver = Some(rx);
+
         let res: Result<_> = ThreadBuilder::new()
             .name(thd_name!("gc-manager"))
             .spawn(move || {
@@ -799,19 +763,24 @@ impl<S: GCSafePointProvider, R: RegionInfoProvider> GCManager<S, R> {
                 None => "None".to_string(),
             }
         );
-        if let Err(e) = gc(&self.worker_scheduler, ctx.clone(), self.safe_point) {
-            error!(
-                "failed gc region {}, epoch {:?}, end_key {}, err: {:?}",
-                ctx.get_region_id(),
-                ctx.region_epoch.as_ref(),
-                match &next_key {
-                    Some(key) => format!("{}", key),
-                    None => "None".to_string(),
-                },
-                e
-            );
-        }
 
+        let mut task = Some(GCTask::GC {
+            ctx: ctx.clone(),
+            safe_point: self.safe_point,
+            callback: box |_| {},
+        });
+
+        while let Some(t) = GCWorker::handle_task(
+            self.concurrency,
+            Arc::clone(&self.running_tasks),
+            Arc::clone(&self.runtime),
+            task.unwrap(),
+            self.gc_runner.clone(),
+        ) {
+            // GC workers are busy, retry after 1 seconds.
+            task = Some(t);
+            thread::sleep(Duration::from_secs(1));
+        }
         Ok(next_key)
     }
 
@@ -921,12 +890,11 @@ pub struct GCWorker<E: Engine> {
     local_storage: Option<Arc<DB>>,
     /// `raft_store_router` is useful to signal raftstore clean region size informations.
     raft_store_router: Option<ServerRaftStoreRouter>,
-
     ratio_threshold: f64,
 
-    worker: Arc<Mutex<Worker<GCTask>>>,
-    worker_scheduler: worker::Scheduler<GCTask>,
-
+    concurrency: usize,
+    running_tasks: Arc<AtomicUsize>,
+    runtime: Option<Arc<Runtime>>,
     gc_manager_handle: Arc<Mutex<Option<GCManagerHandle>>>,
 }
 
@@ -936,47 +904,49 @@ impl<E: Engine> GCWorker<E> {
         local_storage: Option<Arc<DB>>,
         raft_store_router: Option<ServerRaftStoreRouter>,
         ratio_threshold: f64,
+        concurrency: usize,
     ) -> GCWorker<E> {
-        let worker = Arc::new(Mutex::new(
-            WorkerBuilder::new("gc-worker")
-                .pending_capacity(GC_MAX_PENDING_TASKS)
-                .create(),
-        ));
-        let worker_scheduler = worker.lock().unwrap().scheduler();
         GCWorker {
             engine,
             local_storage,
             raft_store_router,
             ratio_threshold,
-            worker,
-            worker_scheduler,
+
+            concurrency,
+            running_tasks: Arc::new(AtomicUsize::new(0)),
+            runtime: None,
             gc_manager_handle: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// Must be called after `GCWorker::start`.
     pub fn start_auto_gc<S: GCSafePointProvider, R: RegionInfoProvider>(
         &self,
         cfg: AutoGCConfig<S, R>,
     ) -> Result<()> {
+        let new_handle = GCManager::new(
+            cfg,
+            self.concurrency,
+            Arc::clone(&self.running_tasks),
+            Arc::clone(self.runtime.as_ref().unwrap()),
+            self.get_gc_runner(),
+        ).start()?;
+
         let mut handle = self.gc_manager_handle.lock().unwrap();
         assert!(handle.is_none());
-        let new_handle = GCManager::new(cfg, self.worker_scheduler.clone()).start()?;
         *handle = Some(new_handle);
         Ok(())
     }
 
     pub fn start(&mut self) -> Result<()> {
-        let runner = GCRunner::new(
-            self.engine.clone(),
-            self.local_storage.take(),
-            self.raft_store_router.take(),
-            self.ratio_threshold,
-        );
-        self.worker
-            .lock()
-            .unwrap()
-            .start(runner)
-            .map_err(|e| box_err!("failed to start gc_worker, err: {:?}", e))
+        self.runtime = Some(Arc::new(
+            RuntimeBuilder::new()
+                .core_threads(self.concurrency)
+                .name_prefix("gc-worker")
+                .build()
+                .unwrap(),
+        ));
+        Ok(())
     }
 
     pub fn stop(&self) -> Result<()> {
@@ -984,34 +954,33 @@ impl<E: Engine> GCWorker<E> {
         if let Some(h) = self.gc_manager_handle.lock().unwrap().take() {
             h.stop()?;
         }
-        // Stop self
-        let h = self.worker.lock().unwrap().stop().unwrap();
-        if let Err(e) = h.join() {
-            Err(box_err!("failed to join gc_worker handle, err: {:?}", e))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn handle_schedule_error(e: ScheduleError<GCTask>) -> Result<()> {
-        match e {
-            ScheduleError::Full(task) => {
-                GC_TOO_BUSY_COUNTER.inc();
-                (task.take_callback())(Err(Error::GCWorkerTooBusy));
-                Ok(())
-            }
-            _ => Err(box_err!("failed to schedule gc task: {:?}", e)),
-        }
+        Ok(())
     }
 
     pub fn async_gc(&self, ctx: Context, safe_point: u64, callback: Callback<()>) -> Result<()> {
-        self.worker_scheduler
-            .schedule(GCTask::GC {
-                ctx,
-                safe_point,
-                callback,
-            })
-            .or_else(Self::handle_schedule_error)
+        let concurrency = self.concurrency;
+        let running_tasks = Arc::clone(&self.running_tasks);
+        let runtime = Arc::clone(&self.runtime.as_ref().unwrap());
+        let task = GCTask::GC {
+            ctx,
+            safe_point,
+            callback,
+        };
+
+        let runner = GCRunner::new(
+            self.engine.clone(),
+            self.local_storage.clone(),
+            self.raft_store_router.clone(),
+            self.ratio_threshold,
+        );
+
+        if let Some(task) = Self::handle_task(concurrency, running_tasks, runtime, task, runner) {
+            GC_TOO_BUSY_COUNTER.inc();
+            let callback = task.take_callback();
+            callback(Err(Error::GCWorkerTooBusy));
+            warn!("gc worker is too busy");
+        }
+        Ok(())
     }
 
     /// Clean up all keys in a range and quickly free the disk space. The range might span over
@@ -1026,14 +995,61 @@ impl<E: Engine> GCWorker<E> {
         end_key: Key,
         callback: Callback<()>,
     ) -> Result<()> {
-        self.worker_scheduler
-            .schedule(GCTask::UnsafeDestroyRange {
-                ctx,
-                start_key,
-                end_key,
-                callback,
-            })
-            .or_else(Self::handle_schedule_error)
+        let concurrency = self.concurrency;
+        let running_tasks = Arc::clone(&self.running_tasks);
+        let runtime = Arc::clone(&self.runtime.as_ref().unwrap());
+        let task = GCTask::UnsafeDestroyRange {
+            ctx,
+            start_key,
+            end_key,
+            callback,
+        };
+
+        let runner = GCRunner::new(
+            self.engine.clone(),
+            self.local_storage.clone(),
+            self.raft_store_router.clone(),
+            self.ratio_threshold,
+        );
+
+        if let Some(task) = Self::handle_task(concurrency, running_tasks, runtime, task, runner) {
+            GC_TOO_BUSY_COUNTER.inc();
+            let callback = task.take_callback();
+            callback(Err(Error::GCWorkerTooBusy));
+            warn!("gc worker is too busy");
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn get_gc_runner(&self) -> GCRunner<E> {
+        GCRunner::new(
+            self.engine.clone(),
+            self.local_storage.clone(),
+            self.raft_store_router.clone(),
+            self.ratio_threshold,
+        )
+    }
+
+    fn handle_task(
+        concurrency: usize,
+        running_tasks: Arc<AtomicUsize>,
+        runtime: Arc<Runtime>,
+        task: GCTask,
+        mut gc_runner: GCRunner<E>,
+    ) -> Option<GCTask> {
+        if running_tasks.fetch_add(1, AtomicOrdering::AcqRel) >= concurrency {
+            running_tasks.fetch_sub(1, AtomicOrdering::Release);
+            return Some(task);
+        }
+
+        runtime.executor().spawn(future::lazy(move || {
+            gc_runner.handle_gc_worker_task(task);
+            gc_runner.flush_metrics();
+            running_tasks.fetch_sub(1, AtomicOrdering::Release);
+            Ok(())
+        }));
+        None
     }
 }
 

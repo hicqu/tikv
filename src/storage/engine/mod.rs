@@ -295,7 +295,7 @@ impl Statistics {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct StatisticsSummary {
     pub stat: Statistics,
     pub count: u64,

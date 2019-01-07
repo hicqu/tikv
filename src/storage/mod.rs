@@ -591,6 +591,7 @@ impl<E: Engine> Storage<E> {
             local_storage,
             raft_store_router,
             config.gc_ratio_threshold,
+            config.gc_concurrency,
         );
 
         worker.lock().unwrap().start(runner)?;

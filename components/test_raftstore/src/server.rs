@@ -19,8 +19,6 @@ use std::time::Duration;
 
 use grpc::{EnvBuilder, Error as GrpcError};
 use tempdir::TempDir;
-#[allow(deprecated)]
-use tokio::executor::thread_pool;
 use tokio::runtime;
 
 use kvproto::raft_cmdpb::*;
@@ -81,19 +79,12 @@ impl ServerCluster {
         );
         let security_mgr = Arc::new(SecurityManager::new(&Default::default()).unwrap());
 
-        let mut tp_builder = thread_pool::Builder::new();
-        tp_builder.pool_size(1);
         let raft_client = RaftClient::new(
             env,
             Arc::new(Config::default()),
             security_mgr,
             Arc::new((AtomicUsize::new(0), AtomicUsize::new(0))),
-            Arc::new(
-                runtime::Builder::new()
-                    .threadpool_builder(tp_builder)
-                    .build()
-                    .unwrap(),
-            ),
+            Arc::new(runtime::Builder::new().core_threads(1).build().unwrap()),
         );
         ServerCluster {
             metas: HashMap::default(),
