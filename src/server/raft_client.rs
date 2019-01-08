@@ -15,7 +15,7 @@ use std::ffi::CString;
 use std::i64;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam::channel::SendError;
 use futures::{future, stream, Future, Poll, Sink, Stream};
@@ -33,6 +33,7 @@ use super::{Config, Result};
 use util::collections::{HashMap, HashMapEntry};
 use util::mpsc::batch::{self, Sender as BatchSender};
 use util::security::SecurityManager;
+use util::time::duration_to_sec;
 
 const MAX_GRPC_RECV_MSG_LEN: i32 = 10 * 1024 * 1024;
 const MAX_GRPC_SEND_MSG_LEN: i32 = 10 * 1024 * 1024;
@@ -146,6 +147,56 @@ impl Conn {
     }
 }
 
+const MESSAGE_SPEED_SLOTS: usize = 10;
+struct MessageCounter {
+    total: usize,
+    slots: Vec<usize>,
+    ts_slots: Vec<Instant>,
+    cur_pos: usize,
+    heavy_load_speed: f64,
+}
+
+impl Default for MessageCounter {
+    fn default() -> Self {
+        MessageCounter {
+            total: 0,
+            slots: vec![0; MESSAGE_SPEED_SLOTS],
+            ts_slots: vec![Instant::now(); MESSAGE_SPEED_SLOTS],
+            cur_pos: 0,
+            heavy_load_speed: 0f64,
+        }
+    }
+}
+
+impl MessageCounter {
+    fn get_message_speed(&self) -> f64 {
+        let last_pos = (self.cur_pos + MESSAGE_SPEED_SLOTS - 1) % MESSAGE_SPEED_SLOTS;
+        let dur = self.ts_slots[self.cur_pos] - self.ts_slots[last_pos];
+        let count = self.slots[self.cur_pos] - self.slots[last_pos];
+        count as f64 / duration_to_sec(dur)
+    }
+
+    fn record_message_speed(&mut self) {
+        let now = Instant::now();
+        if now - self.ts_slots[self.cur_pos] >= Duration::from_millis(100) {
+            self.cur_pos = (self.cur_pos + 1) % MESSAGE_SPEED_SLOTS;
+            self.slots[self.cur_pos] = self.total;
+            self.ts_slots[self.cur_pos] = now;
+        }
+    }
+
+    fn update_heavy_load_speed(&mut self) {
+        let speed = self.get_message_speed();
+        if self.heavy_load_speed == 0f64 || speed < self.heavy_load_speed {
+            self.heavy_load_speed = speed;
+        }
+    }
+
+    fn in_heavy_load_speed(&self) -> bool {
+        self.heavy_load_speed != 0f64 && self.get_message_speed() > self.heavy_load_speed
+    }
+}
+
 /// `RaftClient` is used for sending raft messages to other stores.
 pub struct RaftClient {
     env: Arc<Environment>,
@@ -155,6 +206,8 @@ pub struct RaftClient {
     security_mgr: Arc<SecurityManager>,
     grpc_thread_load: Arc<ThreadLoad>,
     async_runtime: Arc<Runtime>,
+
+    counter: MessageCounter,
 }
 
 impl RaftClient {
@@ -173,6 +226,7 @@ impl RaftClient {
             security_mgr,
             grpc_thread_load,
             async_runtime,
+            counter: MessageCounter::default(),
         }
     }
 
@@ -209,14 +263,21 @@ impl RaftClient {
                 }
             }
         }
+        self.counter.total += 1;
         Ok(())
     }
 
     pub fn flush(&mut self) {
+        let speed_in_heavy_load = self.counter.in_heavy_load_speed();
+        let cpu_in_heavy_load = self.grpc_thread_load.in_heavy_load();
+        if cpu_in_heavy_load {
+            self.counter.update_heavy_load_speed();
+        }
+
         let mut counter = 0;
         for conn in self.conns.values_mut() {
             if let Some(notifier) = conn.stream.get_notifier() {
-                if self.grpc_thread_load.in_heavy_load() {
+                if cpu_in_heavy_load || speed_in_heavy_load {
                     let wait = self.cfg.heavy_load_wait_duration.0;
                     self.async_runtime.executor().spawn(
                         Delay::new(Instant::now() + wait)
@@ -231,6 +292,7 @@ impl RaftClient {
         }
         // Only update the metrics when flush immediately.
         RAFT_MESSAGE_FLUSH_COUNTER.inc_by(i64::from(counter));
+        self.counter.record_message_speed();
     }
 }
 
