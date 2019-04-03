@@ -7,5 +7,6 @@ publish = false
 [dependencies]
 tikv = { path = "../../" }
 test_raftstore = { path = "../test_raftstore" }
-kvproto = { git = "https://github.com/pingcap/kvproto.git" }
+# kvproto = { git = "https://github.com/pingcap/kvproto.git" }
+kvproto = { path = "/home/qupeng/github.com/pingcap/kvproto" }
 futures = "0.1"

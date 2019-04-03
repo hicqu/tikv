@@ -99,7 +99,8 @@ zipf = "0.2.0"
 bitflags = "1.0.1"
 fail = "0.2"
 uuid = { version = "0.6", features = [ "serde", "v4" ] }
-grpcio = { version = "0.4", features = [ "secure" ] }
+# grpcio = { version = "0.4", features = [ "secure" ] }
+grpcio = { path = "/home/qupeng/github.com/pingcap/grpc-rs", features = [ "secure" ] }
 raft = "0.4"
 crossbeam = "0.5"
 derive_more = "0.11.0"
@@ -119,7 +120,8 @@ twoway = "0.2.0"
 cop_datatype = { path = "components/cop_datatype" }
 panic_hook = { path = "components/panic_hook" }
 tipb = { git = "https://github.com/pingcap/tipb.git" }
-kvproto = { git = "https://github.com/pingcap/kvproto.git" }
+# kvproto = { git = "https://github.com/pingcap/kvproto.git" }
+kvproto = { path = "/home/qupeng/github.com/pingcap/kvproto" }
 log_wrappers = { path = "components/log_wrappers" }
 
 [dependencies.murmur3]
@@ -136,9 +138,6 @@ features = ["nightly", "push", "process"]
 
 [dependencies.prometheus-static-metric]
 version = "0.1.4"
-
-[patch.crates-io]
-grpcio = { path = "/home/qupeng/github.com/pingcap/grpc-rs" }
 
 [dev-dependencies]
 test_util = { path = "components/test_util" }
