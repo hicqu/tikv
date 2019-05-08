@@ -2803,6 +2803,11 @@ dependencies = [
  "libc 0.2.45 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
+[[patch.unused]]
+name = "grpcio"
+version = "0.4.4"
+source = "git+https://github.com/hicqu/grpc-rs?branch=v0.4.4-no-kicker#f9450d92eb68637321429b10c25168c5d6eccfed"
+
 [metadata]
 "checksum adler32 1.0.3 (registry+https://github.com/rust-lang/crates.io-index)" = "7e522997b529f05601e05166c07ed17789691f562762c7f3b987263d2dedee5c"
 "checksum afl 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)" = "cbf91d62aed05ac9b289ba6c5412e7ac61404254c20ed040ecf8448902834c3c"
