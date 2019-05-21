@@ -103,6 +103,17 @@ impl FuturePool {
         let future = self.wrap_user_future(future_fn);
         self.pool.spawn_handle(future)
     }
+
+    pub fn spawn_future(&self, f: impl Future<Item = (), Error = ()> + Send + 'static) {
+        let env = self.env.clone();
+        env.metrics_running_task_count.inc();
+        self.pool.spawn(f.then(move |r| {
+            env.metrics_handled_task_count.inc();
+            env.metrics_running_task_count.dec();
+            try_tick_thread(&env);
+            r
+        }))
+    }
 }
 
 /// Tries to trigger a tick in current thread.

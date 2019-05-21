@@ -10,6 +10,8 @@ use engine::CfName;
 use engine::IterOption;
 use engine::Peekable;
 use engine::CF_DEFAULT;
+use futures::sync::oneshot;
+use futures::{future, Future};
 use kvproto::errorpb;
 use kvproto::kvrpcpb::Context;
 use kvproto::raft_cmdpb::{
@@ -356,6 +358,63 @@ impl<S: RaftStoreRouter> Engine for RaftKv<S> {
             ASYNC_REQUESTS_COUNTER_VEC.snapshot.get(status_kind).inc();
             e.into()
         })
+    }
+
+    fn snapshot_future(
+        &self,
+        ctx: &Context,
+    ) -> Box<dyn Future<Item = (CbContext, Self::Snap), Error = kv::Error> + Send + 'static> {
+        fail_point!("raftkv_async_snapshot");
+        let mut req = Request::new();
+        req.set_cmd_type(CmdType::Snap);
+
+        ASYNC_REQUESTS_COUNTER_VEC.snapshot.all.inc();
+        let req_timer = ASYNC_REQUESTS_DURATIONS_VEC.snapshot.start_coarse_timer();
+
+        let (tx, rx) = oneshot::channel();
+        match self.exec_read_requests(
+            ctx,
+            vec![req],
+            Box::new(move |(cb_ctx, res)| match res {
+                Ok(CmdRes::Resp(r)) => {
+                    let e = invalid_resp_type(CmdType::Snap, r[0].get_cmd_type()).into();
+                    tx.send(Err(e)).unwrap();
+                }
+                Ok(CmdRes::Snap(s)) => {
+                    req_timer.observe_duration();
+                    ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
+                    tx.send(Ok((cb_ctx, s))).unwrap();
+                }
+                Err(e) => {
+                    let status_kind = get_status_kind_from_engine_error(&e);
+                    ASYNC_REQUESTS_COUNTER_VEC.snapshot.get(status_kind).inc();
+                    tx.send(Err(e)).unwrap();
+                }
+            }),
+        ) {
+            Ok(_) => {
+                // TODO: handle this error better.
+                let f = rx
+                    .map_err(|_| kv::Error::Timeout(Duration::from_secs(1)))
+                    .flatten();
+                Box::new(f)
+                    as Box<
+                        dyn Future<Item = (CbContext, Self::Snap), Error = kv::Error>
+                            + Send
+                            + 'static,
+                    >
+            }
+            Err(e) => {
+                let status_kind = get_status_kind_from_error(&e);
+                ASYNC_REQUESTS_COUNTER_VEC.snapshot.get(status_kind).inc();
+                Box::new(future::err(e.into()))
+                    as Box<
+                        dyn Future<Item = (CbContext, Self::Snap), Error = kv::Error>
+                            + Send
+                            + 'static,
+                    >
+            }
+        }
     }
 }
 

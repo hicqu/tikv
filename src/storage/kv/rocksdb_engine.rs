@@ -12,6 +12,7 @@ use engine::Engines;
 use engine::Error as EngineError;
 use engine::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use engine::{IterOption, Peekable};
+use futures::Future;
 #[cfg(not(feature = "no-fail"))]
 use kvproto::errorpb::Error as ErrorHeader;
 use kvproto::kvrpcpb::Context;
@@ -257,6 +258,13 @@ impl Engine for RocksEngine {
         });
         box_try!(self.sched.schedule(Task::Snapshot(cb)));
         Ok(())
+    }
+
+    fn snapshot_future(
+        &self,
+        _ctx: &Context,
+    ) -> Box<dyn Future<Item = (CbContext, Self::Snap), Error = Error> + Send + 'static> {
+        unimplemented!();
     }
 }
 

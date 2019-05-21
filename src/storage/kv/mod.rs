@@ -10,6 +10,7 @@ use crate::storage::{Key, Value};
 use engine::rocks::TablePropertiesCollection;
 use engine::IterOption;
 use engine::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use futures::Future;
 use tikv_util::metrics::CRITICAL_ERROR;
 use tikv_util::{panic_when_unexpected_key_or_data, set_panic_mark};
 
@@ -45,7 +46,7 @@ const STAT_OVER_SEEK_BOUND: &str = "over_seek_bound";
 
 pub type Callback<T> = Box<dyn FnOnce((CbContext, Result<T>)) + Send>;
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct CbContext {
     pub term: Option<u64>,
 }
@@ -100,6 +101,11 @@ pub trait Engine: Send + Clone + 'static {
     fn delete_cf(&self, ctx: &Context, cf: CfName, key: Key) -> Result<()> {
         self.write(ctx, vec![Modify::Delete(cf, key)])
     }
+
+    fn snapshot_future(
+        &self,
+        ctx: &Context,
+    ) -> Box<dyn Future<Item = (CbContext, Self::Snap), Error = Error> + Send + 'static>;
 }
 
 pub trait Snapshot: Send + Clone {

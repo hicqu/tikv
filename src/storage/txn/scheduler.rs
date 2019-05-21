@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::u64;
 
-use futures::future;
+use futures::Future;
 use kvproto::kvrpcpb::CommandPri;
 use prometheus::HistogramTimer;
 use tikv_util::collections::HashMap;
@@ -34,7 +34,8 @@ use crate::storage::kv::Result as EngineResult;
 use crate::storage::lock_manager::{self, DetectorScheduler, WaiterMgrScheduler};
 use crate::storage::txn::latch::{Latches, Lock};
 use crate::storage::txn::process::{
-    execute_callback, notify_scheduler, Executor, MsgScheduler, ProcessResult, Task,
+    execute_callback, notify_scheduler, process_task_with_snapshot, Executor, MsgScheduler,
+    ProcessResult, Task,
 };
 use crate::storage::txn::sched_pool::SchedPool;
 use crate::storage::txn::Error;
@@ -290,18 +291,12 @@ impl<E: Engine> Scheduler<E> {
 }
 
 impl<E: Engine> Scheduler<E> {
-    fn fetch_executor(&self, priority: CommandPri, is_sys_cmd: bool) -> Executor<E, Self> {
-        let pool = if priority == CommandPri::High || is_sys_cmd {
+    fn fetch_executor(&self, priority: CommandPri, is_sys_cmd: bool) -> SchedPool<E> {
+        if priority == CommandPri::High || is_sys_cmd {
             self.inner.high_priority_pool.clone()
         } else {
             self.inner.worker_pool.clone()
-        };
-        Executor::new(
-            self.clone(),
-            pool,
-            self.inner.waiter_mgr_scheduler.clone(),
-            self.inner.detector_scheduler.clone(),
-        )
+        }
     }
 
     /// Releases all the latches held by a command.
@@ -361,38 +356,39 @@ impl<E: Engine> Scheduler<E> {
     fn get_snapshot(&self, cid: u64) {
         let task = self.inner.dequeue_task(cid);
         let tag = task.tag;
-        let ctx = task.context().clone();
+        let cid = task.cid;
 
         let engine = self.engine.clone();
-        let executor = self.fetch_executor(task.priority(), task.cmd().is_sys_cmd());
-        let sched_pool = executor.clone_pool();
-        let inner = self.clone();
-        let cb = Box::new(move |(cb_ctx, snapshot)| {
-            executor.execute(cb_ctx, snapshot, task);
-        });
-
-        sched_pool.pool.spawn(move || {
-            if let Err(e) = engine.async_snapshot(&ctx, cb) {
-                SCHED_STAGE_COUNTER_VEC
-                    .with_label_values(&[tag, "async_snapshot_err"])
-                    .inc();
-
-                error!("engine async_snapshot failed, err: {:?}", e);
-                notify_scheduler(
-                    inner,
-                    Msg::FinishedWithErr {
-                        cid,
-                        err: e.into(),
-                        tag,
-                    },
-                );
-            } else {
-                SCHED_STAGE_COUNTER_VEC
-                    .with_label_values(&[tag, "snapshot"])
-                    .inc();
-            }
-            future::ok::<_, ()>(())
-        });
+        let sched_pool = self.fetch_executor(task.priority(), task.cmd().is_sys_cmd());
+        let scheduler = self.clone();
+        let executor = Executor::new(
+            self.clone(),
+            self.inner.waiter_mgr_scheduler.clone(),
+            self.inner.detector_scheduler.clone(),
+        );
+        sched_pool.pool.spawn_future(
+            engine
+                .snapshot_future(task.context())
+                .map(move |(cb_ctx, snapshot)| {
+                    SCHED_STAGE_COUNTER_VEC
+                        .with_label_values(&[tag, "snapshot_ok"])
+                        .inc();
+                    process_task_with_snapshot(executor, engine, cb_ctx, snapshot, task)
+                })
+                .then(move |r| {
+                    let msg = match r {
+                        Ok(None) => return Ok(()),
+                        Ok(Some(msg)) => msg,
+                        Err(e) => Msg::FinishedWithErr {
+                            cid: cid,
+                            err: Error::from(e),
+                            tag: tag,
+                        },
+                    };
+                    notify_scheduler(scheduler, msg);
+                    Ok(())
+                }),
+        );
     }
 
     /// Calls the callback with an error.

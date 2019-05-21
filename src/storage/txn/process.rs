@@ -3,10 +3,9 @@
 use std::time::Duration;
 use std::{mem, thread, u64};
 
-use futures::future;
 use kvproto::kvrpcpb::{CommandPri, Context, LockInfo};
 
-use crate::storage::kv::{CbContext, Modify, Result as EngineResult};
+use crate::storage::kv::{CbContext, Modify};
 use crate::storage::lock_manager::{self, DetectorScheduler, WaiterMgrScheduler};
 use crate::storage::mvcc::{
     Error as MvccError, Lock as MvccLock, MvccReader, MvccTxn, Write, MAX_TXN_WRITE_SIZE,
@@ -104,235 +103,25 @@ pub trait MsgScheduler: Clone + Send + 'static {
     fn on_msg(&self, task: Msg);
 }
 
-pub struct Executor<E: Engine, S: MsgScheduler> {
-    // We put time consuming tasks to the thread pool.
-    sched_pool: Option<SchedPool<E>>,
+pub struct Executor<S: MsgScheduler> {
     // And the tasks completes we post a completion to the `Scheduler`.
-    scheduler: Option<S>,
+    pub scheduler: S,
     // If the task releases some locks, we wake up waiters waiting for them.
-    waiter_mgr_scheduler: Option<WaiterMgrScheduler>,
-    detector_scheduler: Option<DetectorScheduler>,
+    pub waiter_mgr_scheduler: Option<WaiterMgrScheduler>,
+    pub detector_scheduler: Option<DetectorScheduler>,
 }
 
-impl<E: Engine, S: MsgScheduler> Executor<E, S> {
+impl<S: MsgScheduler> Executor<S> {
     pub fn new(
         scheduler: S,
-        pool: SchedPool<E>,
         waiter_mgr_scheduler: Option<WaiterMgrScheduler>,
         detector_scheduler: Option<DetectorScheduler>,
     ) -> Self {
         Executor {
-            sched_pool: Some(pool),
-            scheduler: Some(scheduler),
+            scheduler: scheduler,
             waiter_mgr_scheduler,
             detector_scheduler,
         }
-    }
-
-    fn take_pool(&mut self) -> SchedPool<E> {
-        self.sched_pool.take().unwrap()
-    }
-
-    fn take_scheduler(&mut self) -> S {
-        self.scheduler.take().unwrap()
-    }
-
-    fn take_waiter_mgr_scheduler(&mut self) -> Option<WaiterMgrScheduler> {
-        self.waiter_mgr_scheduler.take()
-    }
-
-    fn take_detector_scheduler(&mut self) -> Option<DetectorScheduler> {
-        self.detector_scheduler.take()
-    }
-
-    pub fn clone_pool(&self) -> SchedPool<E> {
-        self.sched_pool.clone().unwrap()
-    }
-
-    /// Start the execution of the task.
-    pub fn execute(mut self, cb_ctx: CbContext, snapshot: EngineResult<E::Snap>, task: Task) {
-        debug!(
-            "receive snapshot finish msg";
-            "cid" => task.cid, "cb_ctx" => ?cb_ctx
-        );
-
-        match snapshot {
-            Ok(snapshot) => {
-                SCHED_STAGE_COUNTER_VEC
-                    .with_label_values(&[task.tag, "snapshot_ok"])
-                    .inc();
-
-                self.process_by_worker(cb_ctx, snapshot, task);
-            }
-            Err(err) => {
-                SCHED_STAGE_COUNTER_VEC
-                    .with_label_values(&[task.tag, "snapshot_err"])
-                    .inc();
-
-                error!("get snapshot failed"; "cid" => task.cid, "err" => ?err);
-                notify_scheduler(
-                    self.take_scheduler(),
-                    Msg::FinishedWithErr {
-                        cid: task.cid,
-                        err: Error::from(err),
-                        tag: task.tag,
-                    },
-                );
-            }
-        }
-    }
-
-    /// Delivers a command to a worker thread for processing.
-    fn process_by_worker(mut self, cb_ctx: CbContext, snapshot: E::Snap, mut task: Task) {
-        SCHED_STAGE_COUNTER_VEC
-            .with_label_values(&[task.tag, "process"])
-            .inc();
-        debug!(
-            "process cmd with snapshot";
-            "cid" => task.cid, "cb_ctx" => ?cb_ctx
-        );
-        let tag = task.tag;
-        if let Some(term) = cb_ctx.term {
-            task.cmd.mut_context().set_term(term);
-        }
-        let sched_pool = self.take_pool();
-        let engine = sched_pool.engine;
-        let readonly = task.cmd.readonly();
-        sched_pool.pool.spawn(move || {
-            fail_point!("scheduler_async_snapshot_finish");
-
-            let read_duration = Instant::now_coarse();
-
-            let region_id = task.region_id;
-            let ts = task.ts;
-            let timer = SlowTimer::new();
-
-            let statistics = if readonly {
-                self.process_read(snapshot, task)
-            } else {
-                self.process_write(engine, snapshot, task)
-            };
-            tls_add_statistics(tag, &statistics);
-            slow_log!(
-                timer,
-                "[region {}] scheduler handle command: {}, ts: {}",
-                region_id,
-                tag,
-                ts
-            );
-
-            tls_collect_read_duration(tag, read_duration.elapsed());
-            future::ok::<_, ()>(())
-        });
-    }
-
-    /// Processes a read command within a worker thread, then posts `ReadFinished` message back to the
-    /// `Scheduler`.
-    fn process_read(mut self, snapshot: E::Snap, task: Task) -> Statistics {
-        fail_point!("txn_before_process_read");
-        debug!("process read cmd in worker pool"; "cid" => task.cid);
-        let tag = task.tag;
-        let cid = task.cid;
-        let mut statistics = Statistics::default();
-        let pr = match process_read_impl::<E>(task.cmd, snapshot, &mut statistics) {
-            Err(e) => ProcessResult::Failed { err: e.into() },
-            Ok(pr) => pr,
-        };
-        notify_scheduler(self.take_scheduler(), Msg::ReadFinished { cid, pr, tag });
-        statistics
-    }
-
-    /// Processes a write command within a worker thread, then posts either a `WriteFinished`
-    /// message if successful or a `FinishedWithErr` message back to the `Scheduler`.
-    fn process_write(mut self, engine: E, snapshot: E::Snap, task: Task) -> Statistics {
-        fail_point!("txn_before_process_write");
-        let tag = task.tag;
-        let cid = task.cid;
-        let ts = task.ts;
-        let mut statistics = Statistics::default();
-        let scheduler = self.take_scheduler();
-        let waiter_mgr_scheduler = self.take_waiter_mgr_scheduler();
-        let detector_scheduler = self.take_detector_scheduler();
-        let msg = match process_write_impl(
-            task.cmd,
-            snapshot,
-            waiter_mgr_scheduler,
-            detector_scheduler,
-            &mut statistics,
-        ) {
-            // Initiates an async write operation on the storage engine, there'll be a `WriteFinished`
-            // message when it finishes.
-            Ok(WriteResult {
-                ctx,
-                to_be_write,
-                rows,
-                pr,
-                lock_info,
-            }) => {
-                SCHED_STAGE_COUNTER_VEC
-                    .with_label_values(&[tag, "write"])
-                    .inc();
-
-                if lock_info.is_some() {
-                    let (lock, is_first_lock) = lock_info.unwrap();
-                    Msg::WaitForLock {
-                        cid,
-                        start_ts: ts,
-                        pr,
-                        lock,
-                        is_first_lock,
-                    }
-                } else if to_be_write.is_empty() {
-                    Msg::WriteFinished {
-                        cid,
-                        pr,
-                        result: Ok(()),
-                        tag,
-                    }
-                } else {
-                    let sched = scheduler.clone();
-                    // The callback to receive async results of write prepare from the storage engine.
-                    let engine_cb = Box::new(move |(_, result)| {
-                        notify_scheduler(
-                            sched,
-                            Msg::WriteFinished {
-                                cid,
-                                pr,
-                                result,
-                                tag,
-                            },
-                        );
-                        KV_COMMAND_KEYWRITE_HISTOGRAM_VEC
-                            .with_label_values(&[tag])
-                            .observe(rows as f64);
-                    });
-
-                    if let Err(e) = engine.async_write(&ctx, to_be_write, engine_cb) {
-                        SCHED_STAGE_COUNTER_VEC
-                            .with_label_values(&[tag, "async_write_err"])
-                            .inc();
-
-                        error!("engine async_write failed"; "cid" => cid, "err" => ?e);
-                        let err = e.into();
-                        Msg::FinishedWithErr { cid, err, tag }
-                    } else {
-                        return statistics;
-                    }
-                }
-            }
-            // Write prepare failure typically means conflicting transactions are detected. Delivers the
-            // error to the callback, and releases the latches.
-            Err(err) => {
-                SCHED_STAGE_COUNTER_VEC
-                    .with_label_values(&[tag, "prepare_write_err"])
-                    .inc();
-
-                debug!("write command failed at prewrite"; "cid" => cid);
-                Msg::FinishedWithErr { cid, err, tag }
-            }
-        };
-        notify_scheduler(scheduler, msg);
-        statistics
     }
 }
 
@@ -801,4 +590,157 @@ fn find_mvcc_infos_by_key<S: Snapshot>(
         values.push((ts, v));
     }
     Ok((lock, writes, values))
+}
+
+/// Delivers a command to a worker thread for processing.
+pub fn process_task_with_snapshot<E: Engine, S: MsgScheduler>(
+    executor: Executor<S>,
+    engine: E,
+    cb_ctx: CbContext,
+    snapshot: E::Snap,
+    mut task: Task,
+) -> Option<Msg> {
+    debug!(
+        "process cmd with snapshot";
+        "cid" => task.cid, "cb_ctx" => ?cb_ctx
+    );
+
+    SCHED_STAGE_COUNTER_VEC
+        .with_label_values(&[task.tag, "process"])
+        .inc();
+
+    let tag = task.tag;
+    if let Some(term) = cb_ctx.term {
+        task.cmd.mut_context().set_term(term);
+    }
+
+    let readonly = task.cmd.readonly();
+    let read_duration = Instant::now_coarse();
+    let region_id = task.region_id;
+    let ts = task.ts;
+    let timer = SlowTimer::new();
+
+    let msg = if readonly {
+        process_read::<E>(snapshot, task)
+    } else {
+        process_write(executor, engine, snapshot, task)
+    };
+    slow_log!(
+        timer,
+        "[region {}] scheduler handle command: {}, ts: {}",
+        region_id,
+        tag,
+        ts
+    );
+
+    tls_collect_read_duration(tag, read_duration.elapsed());
+    msg
+}
+
+fn process_read<E: Engine>(snapshot: E::Snap, task: Task) -> Option<Msg> {
+    fail_point!("txn_before_process_read");
+    debug!("process read cmd in worker pool"; "cid" => task.cid);
+    let tag = task.tag;
+    let cid = task.cid;
+    let mut statistics = Statistics::default();
+    let pr = match process_read_impl::<E>(task.cmd, snapshot, &mut statistics) {
+        Err(e) => ProcessResult::Failed { err: e.into() },
+        Ok(pr) => pr,
+    };
+    tls_add_statistics(tag, &statistics);
+    Some(Msg::ReadFinished { cid, pr, tag })
+}
+
+fn process_write<E: Engine, S: MsgScheduler>(
+    executor: Executor<S>,
+    engine: E,
+    snapshot: E::Snap,
+    task: Task,
+) -> Option<Msg> {
+    fail_point!("txn_before_process_write");
+    let tag = task.tag;
+    let cid = task.cid;
+    let ts = task.ts;
+    let mut statistics = Statistics::default();
+    let waiter_mgr_scheduler = executor.waiter_mgr_scheduler;
+    let detector_scheduler = executor.detector_scheduler;
+    let msg = match process_write_impl(
+        task.cmd,
+        snapshot,
+        waiter_mgr_scheduler,
+        detector_scheduler,
+        &mut statistics,
+    ) {
+        // Initiates an async write operation on the storage engine, there'll be a `WriteFinished`
+        // message when it finishes.
+        Ok(WriteResult {
+            ctx,
+            to_be_write,
+            rows,
+            pr,
+            lock_info,
+        }) => {
+            SCHED_STAGE_COUNTER_VEC
+                .with_label_values(&[tag, "write"])
+                .inc();
+            if lock_info.is_some() {
+                let (lock, is_first_lock) = lock_info.unwrap();
+                Some(Msg::WaitForLock {
+                    cid,
+                    start_ts: ts,
+                    pr,
+                    lock,
+                    is_first_lock,
+                })
+            } else if to_be_write.is_empty() {
+                Some(Msg::WriteFinished {
+                    cid,
+                    pr,
+                    result: Ok(()),
+                    tag,
+                })
+            } else {
+                let sched = executor.scheduler.clone();
+                // The callback to receive async results of write prepare from the storage engine.
+                let engine_cb = Box::new(move |(_, result)| {
+                    notify_scheduler(
+                        sched,
+                        Msg::WriteFinished {
+                            cid,
+                            pr,
+                            result,
+                            tag,
+                        },
+                    );
+                    KV_COMMAND_KEYWRITE_HISTOGRAM_VEC
+                        .with_label_values(&[tag])
+                        .observe(rows as f64);
+                });
+
+                if let Err(e) = engine.async_write(&ctx, to_be_write, engine_cb) {
+                    SCHED_STAGE_COUNTER_VEC
+                        .with_label_values(&[tag, "async_write_err"])
+                        .inc();
+
+                    error!("engine async_write failed"; "cid" => cid, "err" => ?e);
+                    let err = e.into();
+                    Some(Msg::FinishedWithErr { cid, err, tag })
+                } else {
+                    None
+                }
+            }
+        }
+        // Write prepare failure typically means conflicting transactions are detected. Delivers the
+        // error to the callback, and releases the latches.
+        Err(err) => {
+            SCHED_STAGE_COUNTER_VEC
+                .with_label_values(&[tag, "prepare_write_err"])
+                .inc();
+
+            debug!("write command failed at prewrite"; "cid" => cid);
+            Some(Msg::FinishedWithErr { cid, err, tag })
+        }
+    };
+    tls_add_statistics(task.tag, &statistics);
+    msg
 }

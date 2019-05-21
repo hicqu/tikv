@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use engine::IterOption;
 use engine::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use futures::Future;
 use kvproto::kvrpcpb::Context;
 
 use crate::storage::kv::{
@@ -87,6 +88,13 @@ impl Engine for BTreeEngine {
     fn async_snapshot(&self, _ctx: &Context, cb: EngineCallback<Self::Snap>) -> EngineResult<()> {
         cb((CbContext::new(), Ok(BTreeEngineSnapshot::new(&self))));
         Ok(())
+    }
+
+    fn snapshot_future(
+        &self,
+        _: &Context,
+    ) -> Box<dyn Future<Item = (CbContext, Self::Snap), Error = EngineError> + Send + 'static> {
+        unimplemented!();
     }
 }
 
