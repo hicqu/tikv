@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::u64;
 
+use futures::future;
 use kvproto::kvrpcpb::CommandPri;
 use prometheus::HistogramTimer;
 use tikv_util::collections::HashMap;
@@ -310,22 +311,26 @@ impl<E: Engine> Scheduler<E> {
     }
 
     fn schedule_command(&self, cmd: Command, callback: StorageCb) {
-        let cid = self.inner.gen_id();
-        debug!("received new command"; "cid" => cid, "cmd" => ?cmd);
+        let scheduler = self.clone();
+        self.inner.worker_pool.pool.spawn(move || {
+            let cid = scheduler.inner.gen_id();
+            debug!("received new command"; "cid" => cid, "cmd" => ?cmd);
 
-        let tag = cmd.tag();
-        let priority_tag = cmd.priority_tag();
-        let task = Task::new(cid, cmd);
-        // TODO: enqueue_task should return an reference of the tctx.
-        self.inner.enqueue_task(task, callback);
-        self.try_to_wake_up(cid);
+            let tag = cmd.tag();
+            let priority_tag = cmd.priority_tag();
+            let task = Task::new(cid, cmd);
+            // TODO: enqueue_task should return an reference of the tctx.
+            scheduler.inner.enqueue_task(task, callback);
+            scheduler.try_to_wake_up(cid);
 
-        SCHED_STAGE_COUNTER_VEC
-            .with_label_values(&[tag, "new"])
-            .inc();
-        SCHED_COMMANDS_PRI_COUNTER_VEC
-            .with_label_values(&[priority_tag])
-            .inc();
+            SCHED_STAGE_COUNTER_VEC
+                .with_label_values(&[tag, "new"])
+                .inc();
+            SCHED_COMMANDS_PRI_COUNTER_VEC
+                .with_label_values(&[priority_tag])
+                .inc();
+            future::ok::<_, ()>(())
+        });
     }
 
     /// Tries to acquire all the necessary latches. If all the necessary latches are acquired,
