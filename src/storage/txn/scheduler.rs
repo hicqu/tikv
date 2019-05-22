@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::u64;
 
+use futures::future;
 use kvproto::kvrpcpb::CommandPri;
 use prometheus::HistogramTimer;
 use tikv_util::collections::HashMap;
@@ -358,7 +359,14 @@ impl<E: Engine> Scheduler<E> {
             );
             return;
         }
-        self.schedule_command(cmd, callback);
+        let scheduler = Scheduler::<E> {
+            engine: None,
+            inner: Arc::clone(&self.inner),
+        };
+        self.inner.worker_pool.pool.spawn(move || {
+            scheduler.schedule_command(cmd, callback);
+            future::ok::<_, ()>(())
+        });
     }
 
     /// Initiates an async operation to get a snapshot from the storage engine, then posts a
