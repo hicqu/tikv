@@ -3,6 +3,7 @@
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io::Error as IoError;
 use std::result;
+use std::sync::Arc;
 use std::time::Duration;
 
 use engine::rocks::TablePropertiesCollection;
@@ -105,8 +106,10 @@ impl From<RaftServerError> for kv::Error {
 /// `RaftKv` is a storage engine base on `RaftStore`.
 #[derive(Clone)]
 pub struct RaftKv<S: RaftStoreRouter + 'static> {
-    router: S,
+    router: Arc<S>,
 }
+
+unsafe impl<S: RaftStoreRouter + 'static> Send for RaftKv<S> {}
 
 pub enum CmdRes {
     Resp(Vec<Response>),
@@ -159,7 +162,7 @@ fn on_read_result(mut read_resp: ReadResponse, req_cnt: usize) -> (CbContext, Re
 impl<S: RaftStoreRouter> RaftKv<S> {
     /// Create a RaftKv using specified configuration.
     pub fn new(router: S) -> RaftKv<S> {
-        RaftKv { router }
+        RaftKv { router: Arc::new(router) }
     }
 
     fn new_request_header(&self, ctx: &Context) -> RaftRequestHeader {
