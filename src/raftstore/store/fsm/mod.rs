@@ -25,3 +25,20 @@ pub use self::store::{
     create_raft_batch_system, new_compaction_listener, RaftBatchSystem, RaftPollerBuilder,
     RaftRouter, StoreInfo,
 };
+
+#[cfg(test)]
+mod benches {
+    use crate::test;
+    use super::*;
+    use crate::raftstore::store::Config;
+
+    #[bench]
+    fn bench_router_clone(b: &mut test::Bencher) {
+        let cfg = Config::default();
+        let (router, _) = create_raft_batch_system(&cfg);
+        b.iter(|| {
+            let x = router.clone();
+            drop(x);
+        })
+    }
+}
