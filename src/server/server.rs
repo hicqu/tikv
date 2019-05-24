@@ -1,22 +1,17 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::i32;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use engine::Engines;
 use futures::{Future, Stream};
-use grpcio::{ChannelBuilder, EnvBuilder, Environment, Server as GrpcServer, ServerBuilder};
-use kvproto::debugpb_grpc::create_debug;
-use kvproto::import_sstpb_grpc::create_import_sst;
-use kvproto::tikvpb_grpc::*;
+use grpcio::{EnvBuilder, Environment};
 use tokio_threadpool::{Builder as ThreadPoolBuilder, ThreadPool};
 use tokio_timer::timer::Handle;
 
 use crate::storage::lock_manager::deadlock::Service as DeadlockService;
-use kvproto::deadlock_grpc::create_deadlock;
 
 use crate::coprocessor::Endpoint;
 use crate::import::ImportSSTService;
@@ -25,7 +20,6 @@ use crate::storage::{Engine, Storage};
 use tikv_util::security::SecurityManager;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
 use tikv_util::worker::Worker;
-use tikv_util::Either;
 
 use super::load_statistics::*;
 use super::raft_client::RaftClient;
@@ -37,7 +31,6 @@ use super::{Config, Result};
 
 const LOAD_STATISTICS_SLOTS: usize = 4;
 const LOAD_STATISTICS_INTERVAL: Duration = Duration::from_millis(100);
-const MAX_GRPC_RECV_MSG_LEN: i32 = 10 * 1024 * 1024;
 pub const GRPC_THREAD_PREFIX: &str = "grpc-server";
 pub const STATS_THREAD_PREFIX: &str = "transport-stats";
 
@@ -47,10 +40,7 @@ pub const STATS_THREAD_PREFIX: &str = "transport-stats";
 /// and a snapshot worker.
 pub struct Server<T: RaftStoreRouter + 'static, S: StoreAddrResolver + 'static> {
     env: Arc<Environment>,
-    /// A GrpcServer builder or a GrpcServer.
-    ///
-    /// If the listening port is configured, the server will be started lazily.
-    builder_or_server: Option<Either<ServerBuilder, GrpcServer>>,
+
     local_addr: SocketAddr,
     // Transport.
     trans: ServerTransport<T, S>,
@@ -75,9 +65,9 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
         raft_router: T,
         resolver: S,
         snap_mgr: SnapManager,
-        debug_engines: Option<Engines>,
-        import_service: Option<ImportSSTService<T>>,
-        deadlock_service: Option<DeadlockService>,
+        _debug_engines: Option<Engines>,
+        _import_service: Option<ImportSSTService<T>>,
+        _deadlock_service: Option<DeadlockService>,
     ) -> Result<Self> {
         // A helper thread (or pool) for transport layer.
         let stats_pool = ThreadPoolBuilder::new()
@@ -94,49 +84,48 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
         );
         let snap_worker = Worker::new("snap-handler");
 
-        let kv_service = KvService::new(
-            storage,
-            cop,
-            raft_router.clone(),
-            snap_worker.scheduler(),
-            Arc::clone(&thread_load),
-        );
+        use tokio::net::TcpListener;
+        use tower_hyper::server::{Http, Server as HyperServer};
 
-        let mut addr = SocketAddr::from_str(&cfg.addr)?;
-        let ip = format!("{}", addr.ip());
-        let channel_args = ChannelBuilder::new(Arc::clone(&env))
-            .stream_initial_window_size(cfg.grpc_stream_initial_window_size.0 as i32)
-            .max_concurrent_stream(cfg.grpc_concurrent_stream)
-            .max_receive_message_len(MAX_GRPC_RECV_MSG_LEN)
-            .max_send_message_len(-1)
-            .http2_max_ping_strikes(i32::MAX) // For pings without data from clients.
-            .build_args();
-        let builder_or_server = {
-            let mut sb = ServerBuilder::new(Arc::clone(&env))
-                .channel_args(channel_args)
-                .register_service(create_tikv(kv_service));
-            sb = security_mgr.bind(sb, &ip, addr.port());
-            if let Some(engines) = debug_engines {
-                let debug_service = DebugService::new(engines, raft_router.clone());
-                sb = sb.register_service(create_debug(debug_service));
-            }
-            if let Some(service) = import_service {
-                sb = sb.register_service(create_import_sst(service));
-            }
-            if let Some(service) = deadlock_service {
-                sb = sb.register_service(create_deadlock(service));
-            }
-            // When port is 0, it has to be binded now to get a valid address, which
-            // is then reported to PD before the server is up. 0 is usually used in tests.
-            if addr.port() == 0 {
-                let server = sb.build()?;
-                let (ref host, port) = server.bind_addrs()[0];
-                addr = SocketAddr::new(IpAddr::from_str(host)?, port as u16);
-                Either::Right(server)
-            } else {
-                Either::Left(sb)
-            }
+        let mut runtime = tokio::runtime::Builder::new()
+            .name_prefix("grpc-runtime")
+            .build()
+            .unwrap();
+
+        let mut http = Http::new();
+        let mut http2 = http.http2_only(true).clone();
+        #[allow(deprecated)]
+        http2.executor(runtime.executor());
+
+        let kv_service = tower_grpc_tikv::Service {
+            inner: KvService::new(
+                storage,
+                cop,
+                raft_router.clone(),
+                snap_worker.scheduler(),
+                Arc::clone(&thread_load),
+            ),
+            runtime: runtime.executor(),
         };
+
+        let addr = SocketAddr::from_str(&cfg.addr)?;
+        let bind = TcpListener::bind(&addr).expect("bind");
+        let mut server = HyperServer::new(tower_grpc_tikv::TikvServer::new(kv_service));
+
+        ::std::thread::spawn(move || {
+            runtime
+                .block_on(
+                    bind.incoming()
+                        .for_each(move |sock| {
+                            sock.set_nodelay(true).unwrap();
+                            let serve = server.serve_with(sock, http2.clone());
+                            tokio::spawn(serve.map_err(|e| error!("h2 error: {:?}", e)));
+                            Ok(())
+                        })
+                        .map_err(|e| error!("accept error: {}", e)),
+                )
+                .unwrap()
+        });
 
         info!("listening on addr"; "addr" => addr);
 
@@ -158,7 +147,6 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
 
         let svr = Server {
             env: Arc::clone(&env),
-            builder_or_server: Some(builder_or_server),
             local_addr: addr,
             trans,
             raft_router,
@@ -186,13 +174,6 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
             Arc::clone(&cfg),
         );
         box_try!(self.snap_worker.start(snap_runner));
-        let builder_or_server = self.builder_or_server.take().unwrap();
-        let mut grpc_server = match builder_or_server {
-            Either::Left(builder) => builder.build()?,
-            Either::Right(server) => server,
-        };
-        grpc_server.start();
-        self.builder_or_server = Some(Either::Right(grpc_server));
 
         let mut load_stats = {
             let tl = Arc::clone(&self.thread_load);
@@ -215,9 +196,6 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
     /// Stops the TiKV server.
     pub fn stop(&mut self) -> Result<()> {
         self.snap_worker.stop();
-        if let Some(Either::Right(mut server)) = self.builder_or_server.take() {
-            server.shutdown();
-        }
         if let Some(pool) = self.stats_pool.take() {
             let _ = pool.shutdown_now().wait();
         }

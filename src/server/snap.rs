@@ -7,12 +7,8 @@ use std::time::{Duration, Instant};
 
 use futures::{future, Async, Future, Poll, Stream};
 use futures_cpupool::{Builder as CpuPoolBuilder, CpuPool};
-use grpcio::{
-    ChannelBuilder, ClientStreamingSink, Environment, RequestStream, RpcStatus, RpcStatusCode,
-    WriteFlags,
-};
-use kvproto::raft_serverpb::RaftMessage;
-use kvproto::raft_serverpb::{Done, SnapshotChunk};
+use grpcio::{ChannelBuilder, Environment, WriteFlags};
+use kvproto::raft_serverpb::{RaftMessage, SnapshotChunk};
 use kvproto::tikvpb_grpc::TikvClient;
 
 use crate::raftstore::store::{SnapEntry, SnapKey, SnapManager, Snapshot};
@@ -31,8 +27,8 @@ const DEFAULT_POOL_SIZE: usize = 4;
 /// A task for either receiving Snapshot or sending Snapshot
 pub enum Task {
     Recv {
-        stream: RequestStream<SnapshotChunk>,
-        sink: ClientStreamingSink<Done>,
+        stream: Box<dyn Stream<Item = SnapshotChunk, Error = ()> + Send + 'static>,
+        cb: Callback,
     },
     Send {
         addr: String,
@@ -235,12 +231,11 @@ impl RecvSnapContext {
 }
 
 fn recv_snap<R: RaftStoreRouter + 'static>(
-    stream: RequestStream<SnapshotChunk>,
-    sink: ClientStreamingSink<Done>,
+    stream: Box<dyn Stream<Item = SnapshotChunk, Error = ()> + Send + 'static>,
     snap_mgr: SnapManager,
     raft_router: R,
 ) -> impl Future<Item = (), Error = Error> {
-    let stream = stream.map_err(Error::from);
+    let stream = stream.map_err(|_| box_err!("grpc"));
 
     let f = stream.into_future().map_err(|(e, _)| e).and_then(
         move |(head, chunks)| -> Box<dyn Future<Item = (), Error = Error> + Send> {
@@ -280,14 +275,7 @@ fn recv_snap<R: RaftStoreRouter + 'static>(
             )
         },
     );
-    f.then(move |res| match res {
-        Ok(()) => sink.success(Done::new()),
-        Err(e) => {
-            let status = RpcStatus::new(RpcStatusCode::Unknown, Some(format!("{:?}", e)));
-            sink.fail(status)
-        }
-    })
-    .map_err(Error::from)
+    f
 }
 
 pub struct Runner<R: RaftStoreRouter + 'static> {
@@ -328,12 +316,12 @@ impl<R: RaftStoreRouter + 'static> Runner<R> {
 impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
     fn run(&mut self, task: Task) {
         match task {
-            Task::Recv { stream, sink } => {
+            Task::Recv { stream, cb } => {
                 if self.recving_count.load(Ordering::SeqCst) >= self.cfg.concurrent_recv_snap_limit
                 {
                     warn!("too many recving snapshot tasks, ignore");
-                    let status = RpcStatus::new(RpcStatusCode::ResourceExhausted, None);
-                    self.pool.spawn(sink.fail(status)).forget();
+                    let error = Err(box_err!("too many recving snapshot tasks"));
+                    cb(error);
                     return;
                 }
                 SNAP_TASK_COUNTER.with_label_values(&["recv"]).inc();
@@ -342,11 +330,12 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                 let raft_router = self.raft_router.clone();
                 let recving_count = Arc::clone(&self.recving_count);
                 recving_count.fetch_add(1, Ordering::SeqCst);
-                let f = recv_snap(stream, sink, snap_mgr, raft_router).then(move |result| {
+                let f = recv_snap(stream, snap_mgr, raft_router).then(move |result| {
                     recving_count.fetch_sub(1, Ordering::SeqCst);
-                    if let Err(e) = result {
+                    if let Err(ref e) = result {
                         error!("failed to recv snapshot"; "err" => %e);
                     }
+                    cb(result);
                     future::ok::<_, ()>(())
                 });
                 self.pool.spawn(f).forget();

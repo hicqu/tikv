@@ -3,15 +3,7 @@
 #![feature(slice_patterns)]
 #![feature(proc_macro_hygiene)]
 
-#[macro_use(
-    slog_kv,
-    slog_crit,
-    slog_info,
-    slog_log,
-    slog_record,
-    slog_b,
-    slog_record_static
-)]
+#[macro_use(slog_crit, slog_info)]
 extern crate slog;
 #[macro_use]
 extern crate slog_global;

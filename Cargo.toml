@@ -126,9 +126,9 @@ match_template = { path = "components/match_template" }
 cop_datatype = { path = "components/cop_datatype" }
 cop_codegen = { path = "components/cop_codegen" }
 tipb_helper = { path = "components/tipb_helper" }
-tipb = { git = "https://github.com/pingcap/tipb.git" }
+tipb = { path = "/home/qupeng/github.com/pingcap/tipb" }
 # TODO: use master branch after the next version is released.
-kvproto = { git = "https://github.com/pingcap/kvproto.git", branch = "release-3.0" }
+kvproto = { git = "https://github.com/hicqu/kvproto.git", branch = "3.0-tower-grpc" }
 log_wrappers = { path = "components/log_wrappers" }
 engine = { path = "components/engine" }
 tikv_util = { path = "components/tikv_util" }
@@ -144,6 +144,16 @@ features = ["nightly", "push", "process"]
 [dependencies.prometheus-static-metric]
 version = "0.1.4"
 default-features = false
+
+[dependencies.tower-hyper]
+git = "https://github.com/tower-rs/tower-hyper"
+
+[dependencies.tower-grpc]
+git = "https://github.com/hicqu/tower-grpc"
+branch = "protobuf-instead-prost"
+
+[dependencies.tokio]
+version = "0.1"
 
 # TODO: remove this when slog is compatible with the log 0.4
 [replace]

@@ -15,6 +15,7 @@ use crate::storage::mvcc::{Error as MvccError, LockType, Write as MvccWrite, Wri
 use crate::storage::txn::Error as TxnError;
 use crate::storage::{self, Engine, Key, Mutation, Options, Storage, Value};
 use futures::executor::{self, Notify, Spawn};
+use futures::sync::oneshot;
 use futures::{future, Async, Future, Sink, Stream};
 use grpcio::{
     ClientStreamingSink, DuplexSink, Error as GrpcError, RequestStream, RpcContext, RpcStatus,
@@ -706,14 +707,24 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         stream: RequestStream<SnapshotChunk>,
         sink: ClientStreamingSink<Done>,
     ) {
-        let task = SnapTask::Recv { stream, sink };
-        if let Err(e) = self.snap_scheduler.schedule(task) {
-            let sink = match e.into_inner() {
-                SnapTask::Recv { sink, .. } => sink,
-                _ => unreachable!(),
-            };
+        let stream = Box::new(stream.map_err(|e| error!("receive snapshot fail: {:?}", e)));
+        let (tx, rx) = oneshot::channel();
+        let cb = Box::new(|res: crate::server::Result<()>| tx.send(res).unwrap());
+        let task = SnapTask::Recv { stream, cb };
+        if self.snap_scheduler.schedule(task).is_err() {
             let status = RpcStatus::new(RpcStatusCode::ResourceExhausted, None);
             ctx.spawn(sink.fail(status).map_err(|_| ()));
+        } else {
+            ctx.spawn(rx.map_err(|_| ()).and_then(|res| {
+                let f = match res {
+                    Ok(_) => sink.success(Done::default()),
+                    Err(_) => {
+                        let status = RpcStatus::new(RpcStatusCode::Internal, None);
+                        sink.fail(status)
+                    }
+                };
+                f.map_err(|_| ())
+            }))
         }
     }
 
@@ -987,6 +998,152 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
                 "err" => ?e
             );
         }));
+    }
+}
+
+pub mod tower_grpc_tikv {
+    use super::{
+        handle_batch_commands_request, unbounded, BatchCommandsRequest, BatchCommandsResponse,
+        BatchRaftMessage, BatchReceiver, Done, Engine, RaftMessage, RaftStoreRouter,
+        Service as ServiceInner, SnapTask, SnapshotChunk, GRPC_MSG_MAX_BATCH_SIZE,
+        GRPC_MSG_NOTIFY_SIZE, GRPC_REQ_BATCH_COMMANDS_SIZE, GRPC_RESP_BATCH_COMMANDS_SIZE,
+        RAFT_MESSAGE_BATCH_SIZE, RAFT_MESSAGE_RECV_COUNTER,
+    };
+    use futures::sync::oneshot;
+    use futures::{future, Future, Stream};
+    use kvproto::tower_grpc_tikvpb::server::Tikv;
+    use std::sync::Arc;
+    use tokio::runtime::TaskExecutor;
+    use tower_grpc::{Code, Request, Response, Status, Streaming};
+
+    pub use kvproto::tower_grpc_tikvpb::server::TikvServer;
+
+    #[derive(Clone)]
+    pub struct Service<T: RaftStoreRouter + 'static, E: Engine> {
+        pub inner: ServiceInner<T, E>,
+        pub runtime: TaskExecutor,
+    }
+
+    impl<T: RaftStoreRouter + 'static, E: Engine> Tikv for Service<T, E> {
+        type SnapshotFuture =
+            Box<dyn Future<Item = Response<Done>, Error = Status> + Send + 'static>;
+
+        type RaftFuture = Box<dyn Future<Item = Response<Done>, Error = Status> + Send + 'static>;
+        type BatchRaftFuture =
+            Box<dyn Future<Item = Response<Done>, Error = Status> + Send + 'static>;
+
+        type BatchCommandsStream =
+            Box<dyn Stream<Item = BatchCommandsResponse, Error = Status> + Send + 'static>;
+        type BatchCommandsFuture = Box<
+            dyn Future<Item = Response<Self::BatchCommandsStream>, Error = Status> + Send + 'static,
+        >;
+
+        fn snapshot(&mut self, request: Request<Streaming<SnapshotChunk>>) -> Self::SnapshotFuture {
+            let stream = request.into_inner();
+            let stream = Box::new(stream.map_err(|e| error!("receive snapshot fail: {:?}", e)));
+            let (tx, rx) = oneshot::channel();
+            let cb = Box::new(|res: crate::server::Result<()>| tx.send(res).unwrap());
+
+            let task = SnapTask::Recv { stream, cb };
+            if self.inner.snap_scheduler.schedule(task).is_err() {
+                let status = Status::new(Code::Internal, "snapshot fail");
+                return Box::new(future::err::<_, _>(status)) as Self::SnapshotFuture;
+            }
+            let f = rx
+                .map(|_| Response::new(Done::new()))
+                .map_err(|_| Status::new(Code::Internal, "snapshot fail"));
+            Box::new(f) as Self::SnapshotFuture
+        }
+
+        fn raft(&mut self, request: Request<Streaming<RaftMessage>>) -> Self::RaftFuture {
+            let ch = self.inner.ch.clone();
+            let f = request
+                .into_inner()
+                .map_err(|e| error!("tower_grpc::Streaming error: {:?}", e))
+                .for_each(move |msg| {
+                    RAFT_MESSAGE_RECV_COUNTER.inc();
+                    ch.send_raft_msg(msg)
+                        .map_err(|_| error!("RaftStoreRouter::send_raft_msg fail"))
+                })
+                .then(|res| match res {
+                    Ok(_) => Err(Status::new(Code::Internal, "raft success")),
+                    Err(_) => Err(Status::new(Code::Internal, "raft fail")),
+                });
+            Box::new(f) as Self::RaftFuture
+        }
+
+        fn batch_raft(
+            &mut self,
+            request: Request<Streaming<BatchRaftMessage>>,
+        ) -> Self::BatchRaftFuture {
+            info!("batch_raft RPC is called, new gRPC stream established");
+            let ch = self.inner.ch.clone();
+            let f = request
+                .into_inner()
+                .map_err(|e| error!("tower_grpc::Streaming error: {:?}", e))
+                .for_each(move |mut msgs| {
+                    let len = msgs.get_msgs().len();
+                    RAFT_MESSAGE_RECV_COUNTER.inc_by(len as i64);
+                    RAFT_MESSAGE_BATCH_SIZE.observe(len as f64);
+                    for msg in msgs.take_msgs().into_iter() {
+                        if ch.send_raft_msg(msg).is_err() {
+                            error!("RaftStoreRouter::send_raft_msg fail");
+                            return Err(());
+                        }
+                    }
+                    Ok(())
+                })
+                .then(|res| match res {
+                    Ok(_) => Err(Status::new(Code::Internal, "raft success")),
+                    Err(_) => Err(Status::new(Code::Internal, "raft fail")),
+                });
+            Box::new(f) as Self::BatchRaftFuture
+        }
+
+        fn batch_commands(
+            &mut self,
+            request: Request<Streaming<BatchCommandsRequest>>,
+        ) -> Self::BatchCommandsFuture {
+            let (tx, rx) = unbounded(GRPC_MSG_NOTIFY_SIZE);
+            let storage = self.inner.storage.clone();
+            let cop = self.inner.cop.clone();
+
+            let request_handler = request.into_inner().for_each(move |mut req| {
+                let request_ids = req.take_request_ids();
+                let requests = req.take_requests().into_vec();
+                GRPC_REQ_BATCH_COMMANDS_SIZE.observe(requests.len() as f64);
+                for (id, req) in request_ids.into_iter().zip(requests) {
+                    let peer = "unknown_client".to_owned();
+                    handle_batch_commands_request(&storage, &cop, peer, id, req, tx.clone());
+                }
+                future::ok::<_, _>(())
+            });
+
+            self.runtime
+                .spawn(request_handler.map_err(|e| error!("batch commands error"; "err" => %e)));
+
+            let thread_load = Arc::clone(&self.inner.thread_load);
+            let response_retriever = BatchReceiver::new(
+                rx,
+                GRPC_MSG_MAX_BATCH_SIZE,
+                BatchCommandsResponse::new,
+                |batch_resp, (id, resp)| {
+                    batch_resp.mut_request_ids().push(id);
+                    batch_resp.mut_responses().push(resp);
+                },
+            );
+
+            let response_retriever = response_retriever
+                .inspect(|r| GRPC_RESP_BATCH_COMMANDS_SIZE.observe(r.request_ids.len() as f64))
+                .map(move |mut r| {
+                    r.set_transport_layer_load(thread_load.load() as u64);
+                    r
+                })
+                .map_err(|e| Status::new(Code::Internal, format!("{:?}", e)));
+
+            let s = Box::new(response_retriever) as Self::BatchCommandsStream;
+            Box::new(future::ok::<_, _>(Response::new(s))) as Self::BatchCommandsFuture
+        }
     }
 }
 
