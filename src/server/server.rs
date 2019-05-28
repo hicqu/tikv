@@ -89,6 +89,7 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
 
         let mut runtime = tokio::runtime::Builder::new()
             .name_prefix("grpc-runtime")
+            .core_threads(cfg.grpc_concurrency)
             .build()
             .unwrap();
 
