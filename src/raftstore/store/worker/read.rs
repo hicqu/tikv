@@ -241,6 +241,7 @@ impl<C: ProposalRouter> LocalReader<C> {
             None => {
                 self.metrics.borrow_mut().rejected_by_cache_miss += 1;
                 debug!("rejected by cache miss"; "region_id" => region_id);
+                println!("rejected by cache miss");
                 return Ok(None);
             }
         };
@@ -253,6 +254,7 @@ impl<C: ProposalRouter> LocalReader<C> {
         // Check peer id.
         if let Err(e) = util::check_peer_id(req, delegate.peer_id) {
             self.metrics.borrow_mut().rejected_by_peer_id_mismatch += 1;
+            println!("peer id not match");
             return Err(e);
         }
 
@@ -264,6 +266,7 @@ impl<C: ProposalRouter> LocalReader<C> {
                 "header_term" => req.get_header().get_term(),
             );
             self.metrics.borrow_mut().rejected_by_term_mismatch += 1;
+            println!("term not match");
             return Err(e);
         }
 
@@ -272,6 +275,7 @@ impl<C: ProposalRouter> LocalReader<C> {
             self.metrics.borrow_mut().rejected_by_epoch += 1;
             // Stale epoch, redirect it to raftstore to get the latest region.
             debug!("rejected by epoch not match"; "tag" => &delegate.tag);
+            println!("epoch not match");
             return Ok(None);
         }
 
@@ -296,9 +300,11 @@ impl<C: ProposalRouter> LocalReader<C> {
             true,  /* we need snapshot time */
         );
 
+        println!("propose_raft_command: {:?}", cmd);
         loop {
             match self.pre_propose_raft_command(&cmd.request) {
                 Ok(Some(delegate)) => {
+                    println!("after pre_propose_raft_command, handle in local reader");
                     let mut metrics = self.metrics.borrow_mut();
                     if let Some(resp) =
                         delegate.handle_read(&cmd.request, &mut executor, &mut *metrics)
@@ -314,11 +320,13 @@ impl<C: ProposalRouter> LocalReader<C> {
                 // It can not handle the request, forwards to raftstore.
                 Ok(None) => {
                     if self.delegates.borrow().get(&region_id).is_some() {
+                        println!("after pre_propose_raft_command, redirect");
                         break;
                     }
                     let meta = self.store_meta.lock().unwrap();
                     match meta.readers.get(&region_id).cloned() {
                         Some(reader) => {
+                            println!("after pre_propose_raft_command, redirect");
                             self.delegates.borrow_mut().insert(region_id, Some(reader));
                         }
                         None => {
@@ -329,6 +337,7 @@ impl<C: ProposalRouter> LocalReader<C> {
                     }
                 }
                 Err(e) => {
+                    println!("after pre_propose_raft_command, reply error directly");
                     let mut response = cmd_resp::new_error(e);
                     if let Some(Some(ref delegate)) = self.delegates.borrow().get(&region_id) {
                         cmd_resp::bind_term(&mut response, delegate.term);
