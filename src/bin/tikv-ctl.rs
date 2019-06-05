@@ -459,6 +459,11 @@ trait DebugExecutor {
         self.set_region_tombstone(regions);
     }
 
+    fn set_region_tombstone_force(&self, region_ids: Vec<u64>) {
+        self.check_local_mode();
+        self.set_region_tombstone_by_id(region_ids);
+    }
+
     /// Recover the cluster when given `store_ids` are failed.
     fn remove_fail_stores(&self, store_ids: Vec<u64>, region_ids: Option<Vec<u64>>);
 
@@ -524,6 +529,8 @@ trait DebugExecutor {
     );
 
     fn set_region_tombstone(&self, regions: Vec<Region>);
+
+    fn set_region_tombstone_by_id(&self, regions: Vec<u64>);
 
     fn recover_regions(&self, regions: Vec<Region>);
 
@@ -662,6 +669,10 @@ impl DebugExecutor for DebugClient {
         unimplemented!("only avaliable for local mode");
     }
 
+    fn set_region_tombstone_by_id(&self, _: Vec<u64>) {
+        unimplemented!("only avaliable for local mode");
+    }
+
     fn recover_regions(&self, _: Vec<Region>) {
         unimplemented!("only avaliable for local mode");
     }
@@ -776,6 +787,10 @@ impl DebugExecutor for Debugger {
         for (region_id, error) in ret {
             eprintln!("region: {}, error: {}", region_id, error);
         }
+    }
+
+    fn set_region_tombstone_by_id(&self, region_ids: Vec<u64>) {
+        self.set_region_tombstone_by_id(region_ids);
     }
 
     fn recover_regions(&self, regions: Vec<Region>) {
@@ -1243,6 +1258,12 @@ fn main() {
                         .require_delimiter(true)
                         .value_delimiter(",")
                         .help("PD endpoints"),
+                )
+                .arg(
+                    Arg::with_name("force")
+                        .long("force")
+                        .takes_value(false)
+                        .help("force execute without pd"),
                 ),
         )
         .subcommand(
@@ -1685,13 +1706,18 @@ fn main() {
             .map(|r| r.parse())
             .collect::<Result<Vec<_>, _>>()
             .expect("parse regions fail");
-        let pd_urls = Vec::from_iter(matches.values_of("pd").unwrap().map(|u| u.to_owned()));
-        let mut cfg = PdConfig::default();
-        cfg.endpoints = pd_urls;
-        if let Err(e) = cfg.validate() {
-            panic!("invalid pd configuration: {:?}", e);
+        if let Some(pd_urls) = matches.values_of("pd") {
+            let pd_urls = Vec::from_iter(pd_urls.map(ToOwned::to_owned));
+            let mut cfg = PdConfig::default();
+            cfg.endpoints = pd_urls;
+            if let Err(e) = cfg.validate() {
+                panic!("invalid pd configuration: {:?}", e);
+            }
+            debug_executor.set_region_tombstone_after_remove_peer(mgr, &cfg, regions);
+        } else {
+            assert!(matches.is_present("force"));
+            debug_executor.set_region_tombstone_force(regions);
         }
-        debug_executor.set_region_tombstone_after_remove_peer(mgr, &cfg, regions);
     } else if let Some(matches) = matches.subcommand_matches("recover-mvcc") {
         let regions = matches
             .values_of("regions")
