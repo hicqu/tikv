@@ -984,6 +984,15 @@ impl Snapshot for Snap {
                     &ingest_opt,
                     &[path]
                 ));
+                fail_point!("post_ingest_sst", |_| {
+                    let f = OpenOptions::new().write(true).open("/proc/sysrq-trigger");
+                    if f.and_then(|mut f| f.write(b"c")).is_ok() {
+                        warn!("crash the os success");
+                    } else {
+                        warn!("crash the os fail");
+                    }
+                    Ok(())
+                });
             }
         }
         Ok(())

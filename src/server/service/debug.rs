@@ -257,9 +257,10 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
                 return Err(Error::InvalidArgument("Failure Type INVALID".to_owned()));
             }
             let actions = req.get_actions();
-            if let Err(e) = fail::cfg(name, actions) {
+            if let Err(e) = fail::cfg(name.clone(), actions.clone()) {
                 return Err(box_err!("{:?}", e));
             }
+            info!("set fail point {} = {}", name, actions);
             Ok(InjectFailPointResponse::new())
         });
 
