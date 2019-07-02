@@ -134,6 +134,22 @@ pub fn apply_sst_cf_file(path: &str, db: &DB, cf: &str) -> Result<(), Error> {
     let mut ingest_opt = IngestExternalFileOptions::new();
     ingest_opt.move_files(true);
     box_try!(db.ingest_external_file_optimized(cf_handle, &ingest_opt, &[path]));
+    info!("ingest {} success", path);
+
+    // In some test cases TiKV will run on a fuse file system which monitors a file named
+    // `fuse_teardown`. Echo any characters into the file will tear down the file system,
+    // and all unsynchronized writes will be lost.
+    fail_point!("post_ingest_sst", |fuse_teardown: Option<String>| {
+        let fuse_teardown = fuse_teardown.unwrap();
+        warn!("teardown the fuse file system at {}", fuse_teardown);
+        let f = OpenOptions::new().write(true).open(fuse_teardown);
+        match f.and_then(|mut f| f.write(b"c")) {
+            Ok(_) => warn!("teardown the fuse file system success"),
+            Err(e) => warn!("teardown the fuse file system fail: {}", e),
+        }
+        ::std::process::exit(0);
+    });
+
     Ok(())
 }
 
