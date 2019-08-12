@@ -205,6 +205,11 @@ pub enum ExecResult {
     IngestSst {
         ssts: Vec<SstMeta>,
     },
+    MvccGc {
+        safe_point: u64,
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+    },
 }
 
 /// The possible returned value when applying logs.
@@ -974,7 +979,8 @@ impl ApplyDelegate {
                 | ExecResult::CompactLog { .. }
                 | ExecResult::DeleteRange { .. }
                 | ExecResult::IngestSst { .. }
-                | ExecResult::CatchUpLogs { .. } => {}
+                | ExecResult::CatchUpLogs { .. }
+                | ExecResult::MvccGc { .. } => {}
                 ExecResult::SplitRegion { ref derived, .. } => {
                     self.region = derived.clone();
                     self.metrics.size_diff_hint = 0;
@@ -1072,6 +1078,7 @@ impl ApplyDelegate {
             AdminCmdType::PrepareMerge => self.exec_prepare_merge(ctx, request),
             AdminCmdType::CommitMerge => self.exec_commit_merge(ctx, request),
             AdminCmdType::RollbackMerge => self.exec_rollback_merge(ctx, request),
+            AdminCmdType::MvccGc => self.exec_mvcc_gc(ctx, request),
             AdminCmdType::InvalidAdmin => Err(box_err!("unsupported admin command type")),
         }?;
         response.set_cmd_type(cmd_type);
@@ -1953,6 +1960,24 @@ impl ApplyDelegate {
             ApplyResult::Res(ExecResult::RollbackMerge {
                 region,
                 commit: rollback.get_commit(),
+            }),
+        ))
+    }
+
+    fn exec_mvcc_gc(
+        &mut self,
+        _: &mut ApplyContext,
+        req: &AdminRequest,
+    ) -> Result<(AdminResponse, ApplyResult)> {
+        let safe_point = req.get_mvcc_gc().get_safe_point();
+        let start_key = self.region.get_start_key().to_owned();
+        let end_key = self.region.get_end_key().to_owned();
+        Ok((
+            AdminResponse::default(),
+            ApplyResult::Res(ExecResult::MvccGc {
+                safe_point,
+                start_key,
+                end_key,
             }),
         ))
     }
