@@ -20,8 +20,8 @@ use tikv::config::TiKvConfig;
 use tikv::coprocessor;
 use tikv::import::{ImportSSTService, SSTImporter};
 use tikv::raftstore::coprocessor::{CoprocessorHost, RegionInfoAccessor};
+use tikv::raftstore::store::fsm;
 use tikv::raftstore::store::fsm::store::{StoreMeta, PENDING_VOTES_CAP};
-use tikv::raftstore::store::{fsm, LocalReader};
 use tikv::raftstore::store::{new_compaction_listener, SnapManagerBuilder};
 use tikv::server::lock_manager::LockManager;
 use tikv::server::resolve;
@@ -104,6 +104,7 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig, security_mgr: Arc<Sec
 
     // Initialize raftstore channels.
     let (router, system) = fsm::create_raft_batch_system(&cfg.raft_store);
+    let apply_router = system.apply_router();
 
     let compaction_listener = new_compaction_listener(router.clone());
 
@@ -168,8 +169,7 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig, security_mgr: Arc<Sec
 
     let engines = Engines::new(Arc::new(kv_engine), Arc::new(raft_engine), cache.is_some());
     let store_meta = Arc::new(Mutex::new(StoreMeta::new(PENDING_VOTES_CAP)));
-    let local_reader = LocalReader::new(engines.kv.clone(), store_meta.clone(), router.clone());
-    let raft_router = ServerRaftStoreRouter::new(router.clone(), local_reader);
+    let raft_router = ServerRaftStoreRouter::new(router.clone(), apply_router);
 
     let engine = RaftKv::new(raft_router.clone());
 

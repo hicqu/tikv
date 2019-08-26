@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::raftstore::coprocessor::{CoprocessorHost, RegionChangeEvent};
 use crate::raftstore::store::fsm::store::PollContext;
 use crate::raftstore::store::fsm::{
-    apply, Apply, ApplyMetrics, ApplyTask, ApplyTaskRes, GroupState, Proposal, RegionProposal,
+    apply, Apply, ApplyMetrics, ApplyTask, ApplyTaskRes, GroupState, Proposal,
 };
 use crate::raftstore::store::keys::{enc_end_key, enc_start_key};
 use crate::raftstore::store::worker::{ReadDelegate, ReadProgress, RegionTask};
@@ -276,7 +276,7 @@ pub struct Peer {
     pub peer_heartbeats: HashMap<u64, Instant>,
 
     proposals: ProposalQueue,
-    apply_proposals: Vec<Proposal>,
+    apply_proposals: VecDeque<Proposal>,
 
     leader_missing_time: Option<Instant>,
     leader_lease: Lease,
@@ -382,7 +382,7 @@ impl Peer {
             region_id: region.get_id(),
             raft_group,
             proposals: Default::default(),
-            apply_proposals: vec![],
+            apply_proposals: VecDeque::new(),
             pending_reads: Default::default(),
             peer_cache: RefCell::new(HashMap::default()),
             peer_heartbeats: HashMap::default(),
@@ -1098,16 +1098,6 @@ impl Peer {
         false
     }
 
-    pub fn take_apply_proposals(&mut self) -> Option<RegionProposal> {
-        if self.apply_proposals.is_empty() {
-            return None;
-        }
-
-        let proposals = mem::replace(&mut self.apply_proposals, vec![]);
-        let region_proposal = RegionProposal::new(self.peer_id(), self.region_id, proposals);
-        Some(region_proposal)
-    }
-
     pub fn handle_raft_ready_append<T: Transport, C>(
         &mut self,
         ctx: &mut PollContext<T, C>,
@@ -1355,9 +1345,38 @@ impl Peer {
                     self.raft_group.skip_bcast_commit(true);
                     self.last_urgent_proposal_idx = u64::MAX;
                 }
+
+                let mut indices_and_terms = committed_entries
+                    .iter()
+                    .map(|e| (e.get_index(), e.get_term()))
+                    .collect::<Vec<_>>()
+                    .into_iter();
+
                 let apply = Apply::new(self.region_id, self.term(), committed_entries);
-                ctx.apply_router
-                    .schedule_task(self.region_id, ApplyTask::apply(apply));
+                let task = ApplyTask::apply(apply);
+                if ctx.apply_router.schedule_task(self.region_id, task) {
+                    'LOOP: while let Some(first) = self.apply_proposals.pop_front() {
+                        if first.index <= self.last_applying_idx {
+                            while let Some((term, index)) = indices_and_terms.next() {
+                                assert!(index <= first.index);
+                                if index == first.index {
+                                    if term != first.term {
+                                        // It's a stale proposal.
+                                        apply::notify_stale_req(term, first.cb);
+                                    } else {
+                                        let mut resp = RaftCmdResponse::default();
+                                        resp.mut_header().set_current_term(first.term);
+                                        first.cb.invoke_with_response(resp);
+                                    }
+                                    continue 'LOOP;
+                                }
+                            }
+                            unreachable!();
+                        }
+                        self.apply_proposals.push_front(first);
+                        break;
+                    }
+                }
             }
             // Check whether there is a pending generate snapshot task, the task
             // needs to be sent to the apply system.
@@ -1707,7 +1726,8 @@ impl Peer {
         meta.renew_lease_time = poll_ctx.lease_time;
 
         if !cb.is_none() {
-            self.apply_proposals.push(Proposal { cb });
+            let proposal = Proposal::new(meta.index, meta.term, cb);
+            self.apply_proposals.push_back(proposal);
         }
 
         self.proposals.push(meta);

@@ -35,7 +35,7 @@ use crate::raftstore::store::fsm::{
     batch, create_apply_batch_system, ApplyBatchSystem, ApplyPollerBuilder, ApplyRouter,
     BasicMailbox, BatchRouter, BatchSystem, HandlerBuilder,
 };
-use crate::raftstore::store::fsm::{ApplyNotifier, Fsm, PollHandler, RegionProposal};
+use crate::raftstore::store::fsm::{ApplyNotifier, Fsm, PollHandler};
 use crate::raftstore::store::keys::{self, data_end_key, data_key, enc_end_key, enc_start_key};
 use crate::raftstore::store::local_metrics::RaftMetrics;
 use crate::raftstore::store::metrics::*;
@@ -455,7 +455,6 @@ pub struct RaftPoller<T: 'static, C: 'static> {
     previous_metrics: RaftMetrics,
     timer: SlowTimer,
     poll_ctx: PollContext<T, C>,
-    pending_proposals: Vec<RegionProposal>,
     messages_per_tick: usize,
 }
 
@@ -558,15 +557,12 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
 }
 
 impl<T: Transport, C: PdClient> PollHandler<PeerFsm, StoreFsm> for RaftPoller<T, C> {
-    fn begin(&mut self, batch_size: usize) {
+    fn begin(&mut self, _batch_size: usize) {
         self.previous_metrics = self.poll_ctx.raft_metrics.clone();
         self.poll_ctx.pending_count = 0;
         self.poll_ctx.sync_log = false;
         self.poll_ctx.has_ready = false;
         self.poll_ctx.need_flush_trans = false;
-        if self.pending_proposals.capacity() == 0 {
-            self.pending_proposals = Vec::with_capacity(batch_size);
-        }
         self.timer = SlowTimer::new();
     }
 
@@ -641,7 +637,7 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm, StoreFsm> for RaftPoller<T,
         }
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
-        delegate.collect_ready(&mut self.pending_proposals);
+        delegate.collect_ready();
         expected_msg_count
     }
 
@@ -906,7 +902,6 @@ where
             timer: SlowTimer::new(),
             messages_per_tick: ctx.cfg.messages_per_tick,
             poll_ctx: ctx,
-            pending_proposals: Vec::new(),
         }
     }
 }
@@ -934,6 +929,10 @@ pub struct RaftBatchSystem {
 impl RaftBatchSystem {
     pub fn router(&self) -> RaftRouter {
         self.router.clone()
+    }
+
+    pub fn apply_router(&self) -> ApplyRouter {
+        self.apply_router.clone()
     }
 
     pub fn spawn<T: Transport + 'static, C: PdClient + 'static>(

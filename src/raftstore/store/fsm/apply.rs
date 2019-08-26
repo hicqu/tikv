@@ -1992,22 +1992,14 @@ impl Registration {
 }
 
 pub struct Proposal {
+    pub index: u64,
+    pub term: u64,
     pub cb: Callback,
 }
 
-pub struct RegionProposal {
-    pub id: u64,
-    pub region_id: u64,
-    pub props: Vec<Proposal>,
-}
-
-impl RegionProposal {
-    pub fn new(id: u64, region_id: u64, props: Vec<Proposal>) -> RegionProposal {
-        RegionProposal {
-            id,
-            region_id,
-            props,
-        }
+impl Proposal {
+    pub fn new(index: u64, term: u64, cb: Callback) -> Proposal {
+        Proposal { index, term, cb }
     }
 }
 
@@ -2656,52 +2648,51 @@ impl HandlerBuilder<ApplyFsm, ControlFsm> for Builder {
 pub type ApplyRouter = BatchRouter<ApplyFsm, ControlFsm>;
 
 impl ApplyRouter {
-    pub fn schedule_task(&self, region_id: u64, msg: Msg) {
-        let reg = match self.try_send(region_id, msg) {
-            Either::Left(Ok(())) => return,
-            Either::Left(Err(TrySendError::Disconnected(msg))) | Either::Right(msg) => match msg {
-                Msg::Registration(reg) => reg,
-                Msg::Apply { .. } | Msg::Destroy(_) | Msg::LogsUpToDate(_) => {
-                    info!(
-                        "target region is not found, drop messages";
-                        "region_id" => region_id
-                    );
-                    return;
-                }
-                Msg::Snapshot(_) => {
-                    warn!(
-                        "region is removed before taking snapshot, are we shutting down?";
-                        "region_id" => region_id
-                    );
-                    return;
-                }
-                Msg::CatchUpLogs(cul) => {
-                    warn!(
-                        "region is removed before merged, are we shutting down?";
-                        "region_id" => region_id,
-                        "merge" => ?cul.merge,
-                    );
-                    return;
-                }
-                Msg::LocalRead(cmd) => {
-                    let region_id = cmd.request.get_header().get_region_id();
-                    notify_req_region_removed(region_id, cmd.callback);
-                    warn!("region not found for local read"; "region_id" => region_id);
-                    return;
-                }
-                #[cfg(test)]
-                Msg::Validate(_, _) => return,
-            },
+    pub fn schedule_task(&self, region_id: u64, msg: Msg) -> bool {
+        let msg = match self.try_send(region_id, msg) {
+            Either::Left(Ok(())) => return true,
+            Either::Left(Err(TrySendError::Disconnected(msg))) | Either::Right(msg) => msg,
             Either::Left(Err(TrySendError::Full(_))) => unreachable!(),
         };
-
-        // Messages in one region are sent in sequence, so there is no race here.
-        // However, this can't be handled inside control fsm, as messages can be
-        // queued inside both queue of control fsm and normal fsm, which can reorder
-        // messages.
-        let (sender, apply_fsm) = ApplyFsm::from_registration(reg);
-        let mailbox = BasicMailbox::new(sender, apply_fsm);
-        self.register(region_id, mailbox);
+        match msg {
+            Msg::Registration(reg) => {
+                // Messages in one region are sent in sequence, so there is no race here.
+                // However, this can't be handled inside control fsm, as messages can be
+                // queued inside both queue of control fsm and normal fsm, which can reorder
+                // messages.
+                let (sender, apply_fsm) = ApplyFsm::from_registration(reg);
+                let mailbox = BasicMailbox::new(sender, apply_fsm);
+                self.register(region_id, mailbox);
+            }
+            Msg::Apply { .. } | Msg::Destroy(_) | Msg::LogsUpToDate(_) => {
+                info!(
+                    "target region is not found, drop messages";
+                    "region_id" => region_id
+                );
+            }
+            Msg::Snapshot(_) => {
+                warn!(
+                    "region is removed before taking snapshot, are we shutting down?";
+                    "region_id" => region_id
+                );
+            }
+            Msg::CatchUpLogs(cul) => {
+                warn!(
+                    "region is removed before merged, are we shutting down?";
+                    "region_id" => region_id,
+                    "merge" => ?cul.merge,
+                );
+                return;
+            }
+            Msg::LocalRead(cmd) => {
+                let region_id = cmd.request.get_header().get_region_id();
+                notify_req_region_removed(region_id, cmd.callback);
+                warn!("region not found for local read"; "region_id" => region_id);
+            }
+            #[cfg(test)]
+            Msg::Validate(_, _) => {}
+        }
+        false
     }
 }
 
