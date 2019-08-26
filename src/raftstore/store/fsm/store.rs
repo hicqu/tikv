@@ -44,8 +44,8 @@ use crate::raftstore::store::transport::Transport;
 use crate::raftstore::store::util::is_initial_msg;
 use crate::raftstore::store::worker::{
     CleanupRunner, CleanupSSTRunner, CleanupSSTTask, CleanupTask, CompactRunner, CompactTask,
-    ConsistencyCheckRunner, ConsistencyCheckTask, PdRunner, RaftlogGcRunner, ReadDelegate,
-    RegionRunner, RegionTask, SplitCheckRunner, SplitCheckTask, MvccGcRunner, MvccGcTask, 
+    ConsistencyCheckRunner, ConsistencyCheckTask, MvccGcRunner, MvccGcTask, PdRunner,
+    RaftlogGcRunner, ReadDelegate, RegionRunner, RegionTask, SplitCheckRunner, SplitCheckTask,
 };
 use crate::raftstore::store::PdTask;
 use crate::raftstore::store::{
