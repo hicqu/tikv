@@ -252,6 +252,9 @@ pub trait PollHandler<N, C> {
 
     /// This function is called at the end of every round.
     fn end(&mut self, batch: &mut [Box<N>]);
+
+    /// Call when the poller thread exits.
+    fn cleanup(&mut self) {}
 }
 
 /// Internal poller that fetches batch and call handler hooks for readiness.
@@ -335,6 +338,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             // from becoming hungry if some regions are hot points.
             self.fetch_batch(&mut batch, self.max_batch_size);
         }
+        self.handler.cleanup();
     }
 }
 

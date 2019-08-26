@@ -688,7 +688,7 @@ pub struct RaftPollerBuilder<T, C> {
     apply_router: ApplyRouter,
     pub router: RaftRouter,
     pub importer: Arc<SSTImporter>,
-    store_meta: Arc<Mutex<StoreMeta>>,
+    pub store_meta: Arc<Mutex<StoreMeta>>,
     future_poller: ThreadPoolSender,
     snap_mgr: SnapManager,
     pub coprocessor_host: Arc<CoprocessorHost>,

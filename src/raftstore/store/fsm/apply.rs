@@ -1,14 +1,15 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::borrow::Cow;
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
-use std::{cmp, usize};
+use std::sync::{Arc, Mutex};
+use std::{cmp, ptr, usize};
 
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine::rocks;
@@ -31,6 +32,7 @@ use uuid::Uuid;
 
 use crate::import::SSTImporter;
 use crate::raftstore::coprocessor::CoprocessorHost;
+use crate::raftstore::store::fsm::store::StoreMeta;
 use crate::raftstore::store::fsm::{RaftPollerBuilder, RaftRouter};
 use crate::raftstore::store::metrics::*;
 use crate::raftstore::store::msg::{Callback, PeerMsg};
@@ -38,6 +40,8 @@ use crate::raftstore::store::peer::Peer;
 use crate::raftstore::store::peer_storage::{self, write_initial_apply_state, write_peer_state};
 use crate::raftstore::store::util::check_region_epoch;
 use crate::raftstore::store::util::KeysInfoFormatter;
+use crate::raftstore::store::worker::LocalReader;
+use crate::raftstore::store::RaftCommand;
 use crate::raftstore::store::{cmd_resp, keys, util, Config};
 use crate::raftstore::{Error, Result};
 use tikv_util::escape;
@@ -2271,6 +2275,7 @@ pub enum Msg {
     LogsUpToDate(u64),
     Destroy(Destroy),
     Snapshot(GenSnapTask),
+    LocalRead(RaftCommand),
     #[cfg(test)]
     Validate(u64, Box<dyn FnOnce(&ApplyDelegate) + Send>),
 }
@@ -2306,6 +2311,11 @@ impl Debug for Msg {
             Msg::Snapshot(GenSnapTask { region_id, .. }) => {
                 write!(f, "[region {}] requests a snapshot", region_id)
             }
+            Msg::LocalRead(ref cmd) => write!(
+                f,
+                "[region {}] local read",
+                cmd.request.get_header().get_region_id()
+            ),
             #[cfg(test)]
             Msg::Validate(region_id, _) => write!(f, "[region {}] validate", region_id),
         }
@@ -2632,6 +2642,12 @@ impl ApplyFsm {
         );
     }
 
+    fn handle_local_read(&mut self, cmd: RaftCommand) {
+        with_tls_local_reader(move |reader| {
+            reader.execute_raft_command(cmd);
+        });
+    }
+
     fn handle_tasks(&mut self, apply_ctx: &mut ApplyContext, msgs: &mut Vec<Msg>) {
         let mut channel_timer = None;
         let mut drainer = msgs.drain(..);
@@ -2653,6 +2669,7 @@ impl ApplyFsm {
                 Some(Msg::CatchUpLogs(cul)) => self.catch_up_logs_for_merge(apply_ctx, cul),
                 Some(Msg::LogsUpToDate(_)) => {}
                 Some(Msg::Snapshot(snap_task)) => self.handle_snapshot(apply_ctx, snap_task),
+                Some(Msg::LocalRead(cmd)) => self.handle_local_read(cmd),
                 #[cfg(test)]
                 Some(Msg::Validate(_, f)) => f(&self.delegate),
                 None => break,
@@ -2769,6 +2786,10 @@ impl PollHandler<ApplyFsm, ControlFsm> for ApplyPoller {
             }
         }
     }
+
+    fn cleanup(&mut self) {
+        destroy_tls_local_reader();
+    }
 }
 
 pub struct Builder {
@@ -2778,8 +2799,33 @@ pub struct Builder {
     importer: Arc<SSTImporter>,
     region_scheduler: Scheduler<RegionTask>,
     engines: Engines,
+    store_meta: Arc<Mutex<StoreMeta>>,
+    raft_router: RaftRouter,
     sender: Notifier,
     router: ApplyRouter,
+}
+
+thread_local! {
+    static TLS_LOCAL_READER: UnsafeCell<*mut ()> = UnsafeCell::new(ptr::null_mut());
+}
+
+fn set_tls_local_reader(reader: LocalReader<RaftRouter>) {
+    let reader = Box::into_raw(Box::new(reader)) as *mut ();
+    TLS_LOCAL_READER.with(|r| unsafe { *r.get() = reader });
+}
+
+fn with_tls_local_reader<F: FnOnce(&LocalReader<RaftRouter>)>(f: F) {
+    TLS_LOCAL_READER.with(|r| {
+        let reader = unsafe { &*(*r.get() as *const LocalReader<RaftRouter>) };
+        f(reader)
+    })
+}
+
+fn destroy_tls_local_reader() {
+    TLS_LOCAL_READER.with(|r| unsafe {
+        drop(Box::from_raw(*r.get() as *mut LocalReader<RaftRouter>));
+        *r.get() = ptr::null_mut();
+    });
 }
 
 impl Builder {
@@ -2795,6 +2841,8 @@ impl Builder {
             importer: builder.importer.clone(),
             region_scheduler: builder.region_scheduler.clone(),
             engines: builder.engines.clone(),
+            store_meta: builder.store_meta.clone(),
+            raft_router: builder.router.clone(),
             sender,
             router,
         }
@@ -2805,6 +2853,11 @@ impl HandlerBuilder<ApplyFsm, ControlFsm> for Builder {
     type Handler = ApplyPoller;
 
     fn build(&mut self) -> ApplyPoller {
+        let kv = Arc::clone(&self.engines.kv);
+        let store_meta = Arc::clone(&self.store_meta);
+        let raft_router = self.raft_router.clone();
+        let local_reader = LocalReader::new(kv, store_meta, raft_router);
+        set_tls_local_reader(local_reader);
         ApplyPoller {
             msg_buf: Vec::with_capacity(self.cfg.messages_per_tick),
             apply_ctx: ApplyContext::new(
@@ -2861,6 +2914,12 @@ impl ApplyRouter {
                         "region_id" => region_id,
                         "merge" => ?cul.merge,
                     );
+                    return;
+                }
+                Msg::LocalRead(cmd) => {
+                    let region_id = cmd.request.get_header().get_region_id();
+                    notify_req_region_removed(region_id, cmd.callback);
+                    warn!("region not found for local read"; "region_id" => region_id);
                     return;
                 }
                 #[cfg(test)]
