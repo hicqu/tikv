@@ -32,7 +32,7 @@ use crate::raftstore::store::fsm::peer::{
 #[cfg(feature = "failpoints")]
 use crate::raftstore::store::fsm::ApplyTaskRes;
 use crate::raftstore::store::fsm::{
-    batch, create_apply_batch_system, ApplyBatchSystem, ApplyPollerBuilder, ApplyRouter, ApplyTask,
+    batch, create_apply_batch_system, ApplyBatchSystem, ApplyPollerBuilder, ApplyRouter,
     BasicMailbox, BatchRouter, BatchSystem, HandlerBuilder,
 };
 use crate::raftstore::store::fsm::{ApplyNotifier, Fsm, PollHandler, RegionProposal};
@@ -464,13 +464,6 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
         // Only enable the fail point when the store id is equal to 3, which is
         // the id of slow store in tests.
         fail_point!("on_raft_ready", self.poll_ctx.store_id() == 3, |_| {});
-        if !self.pending_proposals.is_empty() {
-            for prop in self.pending_proposals.drain(..) {
-                self.poll_ctx
-                    .apply_router
-                    .schedule_task(prop.region_id, ApplyTask::Proposal(prop));
-            }
-        }
         if self.poll_ctx.need_flush_trans {
             self.poll_ctx.trans.flush();
             self.poll_ctx.need_flush_trans = false;

@@ -52,93 +52,16 @@ use tikv_util::Either;
 use tikv_util::MustConsumeVec;
 
 use super::metrics::*;
-use super::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler};
+use super::{
+    BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, Mailbox, NormalScheduler,
+    PollHandler,
+};
 
 use super::super::RegionTask;
 
 const WRITE_BATCH_MAX_KEYS: usize = 128;
 const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
 const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
-const SHRINK_PENDING_CMD_QUEUE_CAP: usize = 64;
-
-pub struct PendingCmd {
-    pub index: u64,
-    pub term: u64,
-    pub cb: Option<Callback>,
-}
-
-impl PendingCmd {
-    fn new(index: u64, term: u64, cb: Callback) -> PendingCmd {
-        PendingCmd {
-            index,
-            term,
-            cb: Some(cb),
-        }
-    }
-}
-
-impl Drop for PendingCmd {
-    fn drop(&mut self) {
-        if self.cb.is_some() {
-            safe_panic!(
-                "callback of pending command at [index: {}, term: {}] is leak",
-                self.index,
-                self.term
-            );
-        }
-    }
-}
-
-impl Debug for PendingCmd {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "PendingCmd [index: {}, term: {}, has_cb: {}]",
-            self.index,
-            self.term,
-            self.cb.is_some()
-        )
-    }
-}
-
-/// Commands waiting to be committed and applied.
-#[derive(Default, Debug)]
-pub struct PendingCmdQueue {
-    normals: VecDeque<PendingCmd>,
-    conf_change: Option<PendingCmd>,
-}
-
-impl PendingCmdQueue {
-    fn pop_normal(&mut self, index: u64, term: u64) -> Option<PendingCmd> {
-        self.normals.pop_front().and_then(|cmd| {
-            if self.normals.capacity() > SHRINK_PENDING_CMD_QUEUE_CAP
-                && self.normals.len() < SHRINK_PENDING_CMD_QUEUE_CAP
-            {
-                self.normals.shrink_to_fit();
-            }
-            if (cmd.term, cmd.index) > (term, index) {
-                self.normals.push_front(cmd);
-                return None;
-            }
-            Some(cmd)
-        })
-    }
-
-    fn append_normal(&mut self, cmd: PendingCmd) {
-        self.normals.push_back(cmd);
-    }
-
-    fn take_conf_change(&mut self) -> Option<PendingCmd> {
-        // conf change will not be affected when changing between follower and leader,
-        // so there is no need to check term.
-        self.conf_change.take()
-    }
-
-    // TODO: seems we don't need to separate conf change from normal entries.
-    fn set_conf_change(&mut self, cmd: PendingCmd) {
-        self.conf_change = Some(cmd);
-    }
-}
 
 #[derive(Default, Debug)]
 pub struct ChangePeer {
@@ -234,7 +157,7 @@ impl ExecContext {
 
 struct ApplyCallback {
     region: Region,
-    cbs: Vec<(Option<Callback>, RaftCmdResponse)>,
+    cbs: Vec<RaftCmdResponse>,
 }
 
 impl ApplyCallback {
@@ -244,16 +167,13 @@ impl ApplyCallback {
     }
 
     fn invoke_all(self, host: &CoprocessorHost) {
-        for (cb, mut resp) in self.cbs {
+        for mut resp in self.cbs {
             host.post_apply(&self.region, &mut resp);
-            if let Some(cb) = cb {
-                cb.invoke_with_response(resp)
-            };
         }
     }
 
-    fn push(&mut self, cb: Option<Callback>, resp: RaftCmdResponse) {
-        self.cbs.push((cb, resp));
+    fn push(&mut self, resp: RaftCmdResponse) {
+        self.cbs.push(resp);
     }
 }
 
@@ -480,34 +400,10 @@ impl ApplyContext {
     }
 }
 
-/// Calls the callback of `cmd` when the Region is removed.
-fn notify_region_removed(region_id: u64, peer_id: u64, mut cmd: PendingCmd) {
-    debug!(
-        "region is removed, notify commands";
-        "region_id" => region_id,
-        "peer_id" => peer_id,
-        "index" => cmd.index,
-        "term" => cmd.term
-    );
-    notify_req_region_removed(region_id, cmd.cb.take().unwrap());
-}
-
 pub fn notify_req_region_removed(region_id: u64, cb: Callback) {
     let region_not_found = Error::RegionNotFound(region_id);
     let resp = cmd_resp::new_error(region_not_found);
     cb.invoke_with_response(resp);
-}
-
-/// Calls the callback of `cmd` when it can not be processed further.
-fn notify_stale_command(region_id: u64, peer_id: u64, term: u64, mut cmd: PendingCmd) {
-    info!(
-        "command is stale, skip";
-        "region_id" => region_id,
-        "peer_id" => peer_id,
-        "index" => cmd.index,
-        "term" => cmd.term
-    );
-    notify_stale_req(term, cmd.cb.take().unwrap());
 }
 
 pub fn notify_stale_req(term: u64, cb: Callback) {
@@ -612,8 +508,6 @@ pub struct ApplyDelegate {
     /// any following committed logs in same Ready should be applied failed.
     pending_remove: bool,
 
-    /// The commands waiting to be committed and applied
-    pending_cmds: PendingCmdQueue,
     /// The counter of pending request snapshots. See more in `Peer`.
     pending_request_snapshot_count: Arc<AtomicUsize>,
 
@@ -660,7 +554,6 @@ impl ApplyDelegate {
             ready_source_region_id: 0,
             wait_merge_state: None,
             is_merging: false,
-            pending_cmds: Default::default(),
             metrics: Default::default(),
             last_merge_version: 0,
             pending_request_snapshot_count: reg.pending_request_snapshot_count,
@@ -792,17 +685,6 @@ impl ApplyDelegate {
         self.applied_index_term = term;
         assert!(term > 0);
 
-        // 1. When a peer become leader, it will send an empty entry.
-        // 2. When a leader tries to read index during transferring leader,
-        //    it will also propose an empty entry. But that entry will not contain
-        //    any associated callback. So no need to clear callback.
-        while let Some(mut cmd) = self.pending_cmds.pop_normal(std::u64::MAX, term - 1) {
-            apply_ctx
-                .cbs
-                .last_mut()
-                .unwrap()
-                .push(cmd.cb.take(), cmd_resp::err_resp(Error::StaleCommand, term));
-        }
         ApplyResult::None
     }
 
@@ -835,37 +717,6 @@ impl ApplyDelegate {
         }
     }
 
-    fn find_cb(&mut self, index: u64, term: u64, is_conf_change: bool) -> Option<Callback> {
-        let (region_id, peer_id) = (self.region_id(), self.id());
-        if is_conf_change {
-            if let Some(mut cmd) = self.pending_cmds.take_conf_change() {
-                if cmd.index == index && cmd.term == term {
-                    return Some(cmd.cb.take().unwrap());
-                } else {
-                    notify_stale_command(region_id, peer_id, self.term, cmd);
-                }
-            }
-            return None;
-        }
-        while let Some(mut head) = self.pending_cmds.pop_normal(index, term) {
-            if head.term == term {
-                if head.index == index {
-                    return Some(head.cb.take().unwrap());
-                } else {
-                    panic!(
-                        "{} unexpected callback at term {}, found index {}, expected {}",
-                        self.tag, term, head.index, index
-                    );
-                }
-            } else {
-                // Because of the lack of original RaftCmdRequest, we skip calling
-                // coprocessor here.
-                notify_stale_command(region_id, peer_id, self.term, head);
-            }
-        }
-        None
-    }
-
     fn process_raft_cmd(
         &mut self,
         apply_ctx: &mut ApplyContext,
@@ -884,7 +735,6 @@ impl ApplyDelegate {
             apply_ctx.sync_log_hint = true;
         }
 
-        let is_conf_change = get_change_peer_cmd(&cmd).is_some();
         apply_ctx.host.pre_apply(&self.region, &cmd);
         let (mut resp, exec_result) = self.apply_raft_cmd(apply_ctx, index, term, cmd);
         if let ApplyResult::WaitMergeSource(_) = exec_result {
@@ -901,8 +751,7 @@ impl ApplyDelegate {
         // TODO: if we have exec_result, maybe we should return this callback too. Outer
         // store will call it after handing exec result.
         cmd_resp::bind_term(&mut resp, self.term);
-        let cmd_cb = self.find_cb(index, term, is_conf_change);
-        apply_ctx.cbs.last_mut().unwrap().push(cmd_cb, resp);
+        apply_ctx.cbs.last_mut().unwrap().push(resp);
 
         exec_result
     }
@@ -999,22 +848,6 @@ impl ApplyDelegate {
     fn destroy(&mut self, apply_ctx: &mut ApplyContext) {
         self.stopped = true;
         apply_ctx.router.close(self.region_id());
-        for cmd in self.pending_cmds.normals.drain(..) {
-            notify_region_removed(self.region.get_id(), self.id, cmd);
-        }
-        if let Some(cmd) = self.pending_cmds.conf_change.take() {
-            notify_region_removed(self.region.get_id(), self.id, cmd);
-        }
-    }
-
-    fn clear_all_commands_as_stale(&mut self) {
-        let (region_id, peer_id) = (self.region_id(), self.id());
-        for cmd in self.pending_cmds.normals.drain(..) {
-            notify_stale_command(region_id, peer_id, self.term, cmd);
-        }
-        if let Some(cmd) = self.pending_cmds.conf_change.take() {
-            notify_stale_command(region_id, peer_id, self.term, cmd);
-        }
     }
 
     fn new_ctx(&self, index: u64, term: u64) -> ExecContext {
@@ -2159,21 +1992,7 @@ impl Registration {
 }
 
 pub struct Proposal {
-    is_conf_change: bool,
-    index: u64,
-    term: u64,
     pub cb: Callback,
-}
-
-impl Proposal {
-    pub fn new(is_conf_change: bool, index: u64, term: u64, cb: Callback) -> Proposal {
-        Proposal {
-            is_conf_change,
-            index,
-            term,
-            cb,
-        }
-    }
 }
 
 pub struct RegionProposal {
@@ -2270,7 +2089,6 @@ pub enum Msg {
         apply: Apply,
     },
     Registration(Registration),
-    Proposal(RegionProposal),
     CatchUpLogs(CatchUpLogs),
     LogsUpToDate(u64),
     Destroy(Destroy),
@@ -2301,7 +2119,6 @@ impl Debug for Msg {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Msg::Apply { apply, .. } => write!(f, "[region {}] async apply", apply.region_id),
-            Msg::Proposal(ref p) => write!(f, "[region {}] {} region proposal", p.region_id, p.id),
             Msg::Registration(ref r) => {
                 write!(f, "[region {}] Reg {:?}", r.region.get_id(), r.apply_state)
             }
@@ -2389,7 +2206,6 @@ impl ApplyFsm {
         );
         assert_eq!(self.delegate.id, reg.id);
         self.delegate.term = reg.term;
-        self.delegate.clear_all_commands_as_stale();
         self.delegate = ApplyDelegate::from_registration(reg);
     }
 
@@ -2420,37 +2236,6 @@ impl ApplyFsm {
         if self.delegate.pending_remove {
             self.delegate.destroy(apply_ctx);
         }
-    }
-
-    /// Handles proposals, and appends the commands to the apply delegate.
-    fn handle_proposal(&mut self, region_proposal: RegionProposal) {
-        let (region_id, peer_id) = (self.delegate.region_id(), self.delegate.id());
-        let propose_num = region_proposal.props.len();
-        assert_eq!(self.delegate.id, region_proposal.id);
-        if self.delegate.stopped {
-            for p in region_proposal.props {
-                let cmd = PendingCmd::new(p.index, p.term, p.cb);
-                notify_stale_command(region_id, peer_id, self.delegate.term, cmd);
-            }
-            return;
-        }
-        for p in region_proposal.props {
-            let cmd = PendingCmd::new(p.index, p.term, p.cb);
-            if p.is_conf_change {
-                if let Some(cmd) = self.delegate.pending_cmds.take_conf_change() {
-                    // if it loses leadership before conf change is replicated, there may be
-                    // a stale pending conf change before next conf change is applied. If it
-                    // becomes leader again with the stale pending conf change, will enter
-                    // this block, so we notify leadership may have been changed.
-                    notify_stale_command(region_id, peer_id, self.delegate.term, cmd);
-                }
-                self.delegate.pending_cmds.set_conf_change(cmd);
-            } else {
-                self.delegate.pending_cmds.append_normal(cmd);
-            }
-        }
-        // TODO: observe it in batch.
-        APPLY_PROPOSAL.observe(propose_num as f64);
     }
 
     fn destroy(&mut self, ctx: &mut ApplyContext) {
@@ -2663,7 +2448,6 @@ impl ApplyFsm {
                         break;
                     }
                 }
-                Some(Msg::Proposal(prop)) => self.handle_proposal(prop),
                 Some(Msg::Registration(reg)) => self.handle_registration(reg),
                 Some(Msg::Destroy(d)) => self.handle_destroy(apply_ctx, d),
                 Some(Msg::CatchUpLogs(cul)) => self.catch_up_logs_for_merge(apply_ctx, cul),
@@ -2704,12 +2488,6 @@ impl Fsm for ApplyFsm {
         Self: Sized,
     {
         self.mailbox.take()
-    }
-}
-
-impl Drop for ApplyFsm {
-    fn drop(&mut self) {
-        self.delegate.clear_all_commands_as_stale();
     }
 }
 
@@ -2883,17 +2661,6 @@ impl ApplyRouter {
             Either::Left(Ok(())) => return,
             Either::Left(Err(TrySendError::Disconnected(msg))) | Either::Right(msg) => match msg {
                 Msg::Registration(reg) => reg,
-                Msg::Proposal(props) => {
-                    info!(
-                        "target region is not found, drop proposals";
-                        "region_id" => region_id
-                    );
-                    for p in props.props {
-                        let cmd = PendingCmd::new(p.index, p.term, p.cb);
-                        notify_region_removed(props.region_id, props.id, cmd);
-                    }
-                    return;
-                }
                 Msg::Apply { .. } | Msg::Destroy(_) | Msg::LogsUpToDate(_) => {
                     info!(
                         "target region is not found, drop messages";

@@ -1653,7 +1653,6 @@ impl Peer {
 
         ctx.raft_metrics.propose.all += 1;
 
-        let mut is_conf_change = false;
         let is_urgent = is_request_urgent(&req);
 
         let policy = self.inspect(&req);
@@ -1667,10 +1666,7 @@ impl Peer {
             Ok(RequestPolicy::ProposeTransferLeader) => {
                 return self.propose_transfer_leader(ctx, req, cb);
             }
-            Ok(RequestPolicy::ProposeConfChange) => {
-                is_conf_change = true;
-                self.propose_conf_change(ctx, &req)
-            }
+            Ok(RequestPolicy::ProposeConfChange) => self.propose_conf_change(ctx, &req),
             Err(e) => Err(e),
         };
 
@@ -1692,7 +1688,7 @@ impl Peer {
                     term: self.term(),
                     renew_lease_time: None,
                 };
-                self.post_propose(ctx, meta, is_conf_change, cb);
+                self.post_propose(ctx, meta, cb);
                 true
             }
         }
@@ -1702,7 +1698,6 @@ impl Peer {
         &mut self,
         poll_ctx: &mut PollContext<T, C>,
         mut meta: ProposalMeta,
-        is_conf_change: bool,
         cb: Callback,
     ) {
         // Try to renew leader lease on every consistent read/write request.
@@ -1712,8 +1707,7 @@ impl Peer {
         meta.renew_lease_time = poll_ctx.lease_time;
 
         if !cb.is_none() {
-            let p = Proposal::new(is_conf_change, meta.index, meta.term, cb);
-            self.apply_proposals.push(p);
+            self.apply_proposals.push(Proposal { cb });
         }
 
         self.proposals.push(meta);
@@ -2013,7 +2007,7 @@ impl Peer {
                     term: self.term(),
                     renew_lease_time: Some(renew_lease_time),
                 };
-                self.post_propose(poll_ctx, meta, false, Callback::None);
+                self.post_propose(poll_ctx, meta, Callback::None);
             }
         }
 
