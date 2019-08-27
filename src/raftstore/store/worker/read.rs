@@ -13,7 +13,7 @@ use kvproto::raft_cmdpb::{CmdType, RaftCmdRequest, RaftCmdResponse};
 use time::Timespec;
 
 use crate::raftstore::errors::RAFTSTORE_IS_BUSY;
-use crate::raftstore::store::fsm::RaftRouter;
+use crate::raftstore::store::fsm::{apply, RaftRouter};
 use crate::raftstore::store::util::{self, LeaseState, RemoteLease};
 use crate::raftstore::store::{
     cmd_resp, Peer, ProposalRouter, RaftCommand, ReadExecutor, ReadResponse, RequestInspector,
@@ -352,6 +352,38 @@ impl<C: ProposalRouter> LocalReader<C> {
     pub fn execute_raft_command(&self, cmd: RaftCommand) {
         self.propose_raft_command(cmd);
         self.metrics.borrow_mut().maybe_flush();
+    }
+
+    pub fn read_index(&self, cmd: RaftCommand, index: Option<u64>, term: u64) {
+        let region_id = cmd.request.get_header().get_region_id();
+        let mut executor = ReadExecutor::new(
+            self.kv_engine.clone(),
+            true,
+            true, /* we need snapshot time */
+        );
+
+        let d = match self
+            .delegates
+            .borrow_mut()
+            .get_mut(&region_id)
+            .and_then(|d| d.take())
+        {
+            Some(d) => d,
+            None => {
+                let meta = self.store_meta.lock().unwrap();
+                match meta.readers.get(&region_id).cloned() {
+                    Some(r) => r,
+                    None => {
+                        apply::notify_req_region_removed(region_id, cmd.callback);
+                        return;
+                    }
+                }
+            }
+        };
+        let mut resp = executor.execute(&cmd.request, &d.region, index);
+        cmd_resp::bind_term(&mut resp.response, term);
+        cmd.callback.invoke_read(resp);
+        self.delegates.borrow_mut().insert(region_id, Some(d));
     }
 
     /// Task accepts `RaftCmdRequest`s that contain Get/Snap requests.

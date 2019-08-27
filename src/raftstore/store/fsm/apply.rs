@@ -2115,6 +2115,10 @@ pub enum Msg {
     Destroy(Destroy),
     Snapshot(GenSnapTask),
     LocalRead(RaftCommand),
+    ReadIndex {
+        cmd: RaftCommand,
+        index: Option<u64>,
+    },
     #[cfg(test)]
     Validate(u64, Box<dyn FnOnce(&ApplyDelegate) + Send>),
 }
@@ -2153,6 +2157,11 @@ impl Debug for Msg {
                 f,
                 "[region {}] local read",
                 cmd.request.get_header().get_region_id()
+            ),
+            Msg::ReadIndex { ref cmd, .. } => write!(
+                f,
+                "[region {}] read index",
+                cmd.request.get_header().get_region_id(),
             ),
             #[cfg(test)]
             Msg::Validate(region_id, _) => write!(f, "[region {}] validate", region_id),
@@ -2448,9 +2457,22 @@ impl ApplyFsm {
         );
     }
 
-    fn handle_local_read(&mut self, cmd: RaftCommand) {
+    fn handle_local_read(&mut self, apply_ctx: &mut ApplyContext, cmd: RaftCommand) {
+        apply_ctx.commit_opt(&mut self.delegate, true);
         with_tls_local_reader(move |reader| {
             reader.execute_raft_command(cmd);
+        });
+    }
+
+    fn handle_read_index(
+        &mut self,
+        apply_ctx: &mut ApplyContext,
+        cmd: RaftCommand,
+        index: Option<u64>,
+    ) {
+        apply_ctx.commit_opt(&mut self.delegate, true);
+        with_tls_local_reader(move |reader| {
+            reader.read_index(cmd, index, self.delegate.term);
         });
     }
 
@@ -2474,7 +2496,10 @@ impl ApplyFsm {
                 Some(Msg::CatchUpLogs(cul)) => self.catch_up_logs_for_merge(apply_ctx, cul),
                 Some(Msg::LogsUpToDate(_)) => {}
                 Some(Msg::Snapshot(snap_task)) => self.handle_snapshot(apply_ctx, snap_task),
-                Some(Msg::LocalRead(cmd)) => self.handle_local_read(cmd),
+                Some(Msg::LocalRead(cmd)) => self.handle_local_read(apply_ctx, cmd),
+                Some(Msg::ReadIndex { cmd, index }) => {
+                    self.handle_read_index(apply_ctx, cmd, index)
+                }
                 #[cfg(test)]
                 Some(Msg::Validate(_, f)) => f(&self.delegate),
                 None => break,
@@ -2719,7 +2744,7 @@ impl ApplyRouter {
                 );
                 return;
             }
-            Msg::LocalRead(cmd) => {
+            Msg::LocalRead(cmd) | Msg::ReadIndex { cmd, .. } => {
                 let region_id = cmd.request.get_header().get_region_id();
                 notify_req_region_removed(region_id, cmd.callback);
                 warn!("region not found for local read"; "region_id" => region_id);

@@ -137,8 +137,8 @@ impl RaftStoreRouter for ServerRaftStoreRouter {
         let cmd = RaftCommand::new(req, cb);
         let region_id = cmd.request.get_header().get_region_id();
         if LocalReader::<RaftRouter>::acceptable(&cmd.request) {
-            self.local_reader
-                .schedule_task(region_id, ApplyTask::LocalRead(cmd));
+            let task = ApplyTask::LocalRead(cmd);
+            self.local_reader.schedule_task(region_id, task);
             Ok(())
         } else {
             self.router

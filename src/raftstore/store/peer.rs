@@ -36,8 +36,9 @@ use crate::raftstore::store::fsm::{
 };
 use crate::raftstore::store::keys::{enc_end_key, enc_start_key};
 use crate::raftstore::store::worker::{ReadDelegate, ReadProgress, RegionTask};
-use crate::raftstore::store::PdTask;
-use crate::raftstore::store::{keys, Callback, Config, ReadResponse, RegionSnapshot};
+use crate::raftstore::store::{
+    keys, Callback, Config, PdTask, RaftCommand, ReadResponse, RegionSnapshot,
+};
 use crate::raftstore::{Error, Result};
 use pd_client::INVALID_ID;
 use tikv_util::collections::HashMap;
@@ -1446,7 +1447,11 @@ impl Peer {
                         "peer_id" => self.peer.get_id(),
                     );
                     for (req, cb) in read.cmds.drain(..) {
-                        cb.invoke_read(self.handle_read(ctx, req, true, read.read_index));
+                        let task = ApplyTask::ReadIndex {
+                            cmd: RaftCommand::new(req, cb),
+                            index: read.read_index,
+                        };
+                        ctx.apply_router.schedule_task(self.region_id, task);
                     }
                     self.pending_reads.ready_cnt -= 1;
                 } else if self.ready_to_handle_unsafe_replica_read(read.read_index.unwrap()) {
@@ -1457,7 +1462,11 @@ impl Peer {
                     );
                     for (req, cb) in read.cmds.drain(..) {
                         if req.get_header().get_replica_read() {
-                            cb.invoke_read(self.handle_read(ctx, req, true, read.read_index));
+                            let task = ApplyTask::ReadIndex {
+                                cmd: RaftCommand::new(req, cb),
+                                index: read.read_index,
+                            };
+                            ctx.apply_router.schedule_task(self.region_id, task);
                         } else {
                             apply::notify_stale_req(term, cb);
                         }
@@ -1495,7 +1504,11 @@ impl Peer {
                     "peer_id" => self.peer.get_id(),
                 );
                 for (req, cb) in read.cmds.drain(..) {
-                    cb.invoke_read(self.handle_read(ctx, req, true, Some(state.index)));
+                    let task = ApplyTask::ReadIndex {
+                        cmd: RaftCommand::new(req, cb),
+                        index: Some(state.index),
+                    };
+                    ctx.apply_router.schedule_task(self.region_id, task);
                 }
                 propose_time = Some(read.renew_lease_time);
             }
@@ -1569,7 +1582,11 @@ impl Peer {
                     );
                     RAFT_READ_INDEX_PENDING_COUNT.sub(read.cmds.len() as i64);
                     for (req, cb) in read.cmds.drain(..) {
-                        cb.invoke_read(self.handle_read(ctx, req, true, read.read_index));
+                        let task = ApplyTask::ReadIndex {
+                            cmd: RaftCommand::new(req, cb),
+                            index: read.read_index,
+                        };
+                        ctx.apply_router.schedule_task(self.region_id, task);
                     }
                 }
                 self.pending_reads.ready_cnt = 0;
@@ -1929,7 +1946,8 @@ impl Peer {
 
     fn read_local<T, C>(&mut self, ctx: &mut PollContext<T, C>, req: RaftCmdRequest, cb: Callback) {
         ctx.raft_metrics.propose.local_read += 1;
-        cb.invoke_read(self.handle_read(ctx, req, false, None))
+        let task = ApplyTask::LocalRead(RaftCommand::new(req, cb));
+        ctx.apply_router.schedule_task(self.region_id, task);
     }
 
     fn pre_read_index(&self) -> Result<()> {
@@ -2317,24 +2335,6 @@ impl Peer {
         }
 
         Ok(propose_index)
-    }
-
-    fn handle_read<T, C>(
-        &mut self,
-        ctx: &mut PollContext<T, C>,
-        req: RaftCmdRequest,
-        check_epoch: bool,
-        read_index: Option<u64>,
-    ) -> ReadResponse {
-        let mut resp = ReadExecutor::new(
-            ctx.engines.kv.clone(),
-            check_epoch,
-            false, /* we don't need snapshot time */
-        )
-        .execute(&req, self.region(), read_index);
-
-        cmd_resp::bind_term(&mut resp.response, self.term());
-        resp
     }
 
     pub fn term(&self) -> u64 {
