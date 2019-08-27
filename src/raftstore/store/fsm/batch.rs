@@ -253,6 +253,9 @@ pub trait PollHandler<N, C> {
     /// This function is called at the end of every round.
     fn end(&mut self, batch: &mut [Box<N>]);
 
+    /// Call before handle any tasks.
+    fn after_start(&mut self) {}
+
     /// Call when the poller thread exits.
     fn cleanup(&mut self) {}
 }
@@ -300,6 +303,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
 
     // Poll for readiness and forward to handler. Remove stale peer if necessary.
     fn poll(&mut self) {
+        self.handler.after_start();
         let mut batch = Batch::with_capacity(self.max_batch_size);
         let mut exhausted_fsms = Vec::with_capacity(self.max_batch_size);
 

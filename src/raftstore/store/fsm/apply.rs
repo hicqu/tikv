@@ -573,6 +573,7 @@ impl ApplyDelegate {
         &mut self,
         apply_ctx: &mut ApplyContext,
         mut committed_entries: Vec<Entry>,
+        raft_cmds: Vec<Option<RaftCmdRequest>>,
     ) {
         if committed_entries.is_empty() {
             return;
@@ -583,8 +584,10 @@ impl ApplyDelegate {
         // commands again.
         apply_ctx.committed_count += committed_entries.len();
         let mut drainer = committed_entries.drain(..);
+        let mut raft_cmds = raft_cmds.into_iter();
         let mut results = VecDeque::new();
         while let Some(entry) = drainer.next() {
+            let raft_cmd = raft_cmds.next().unwrap();
             if self.pending_remove {
                 // This peer is about to be destroyed, skip everything.
                 break;
@@ -611,8 +614,12 @@ impl ApplyDelegate {
             }
 
             let res = match entry.get_entry_type() {
-                EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, &entry),
-                EntryType::EntryConfChange => self.handle_raft_entry_conf_change(apply_ctx, &entry),
+                EntryType::EntryNormal => {
+                    self.handle_raft_entry_normal(apply_ctx, &entry, raft_cmd)
+                }
+                EntryType::EntryConfChange => {
+                    self.handle_raft_entry_conf_change(apply_ctx, &entry, raft_cmd)
+                }
             };
 
             match res {
@@ -666,18 +673,17 @@ impl ApplyDelegate {
         &mut self,
         apply_ctx: &mut ApplyContext,
         entry: &Entry,
+        cmd: Option<RaftCmdRequest>,
     ) -> ApplyResult {
         let index = entry.get_index();
         let term = entry.get_term();
         let data = entry.get_data();
 
         if !data.is_empty() {
-            let cmd = util::parse_data_at(data, index, &self.tag);
-
+            let cmd = cmd.unwrap_or_else(|| util::parse_data_at(data, index, &self.tag));
             if should_write_to_engine(&cmd, apply_ctx.kv_wb().count()) {
                 apply_ctx.commit(self);
             }
-
             return self.process_raft_cmd(apply_ctx, index, term, cmd);
         }
 
@@ -692,11 +698,13 @@ impl ApplyDelegate {
         &mut self,
         apply_ctx: &mut ApplyContext,
         entry: &Entry,
+        cmd: Option<RaftCmdRequest>,
     ) -> ApplyResult {
         let index = entry.get_index();
         let term = entry.get_term();
         let conf_change: ConfChange = util::parse_data_at(entry.get_data(), index, &self.tag);
-        let cmd = util::parse_data_at(conf_change.get_context(), index, &self.tag);
+        let cmd =
+            cmd.unwrap_or_else(|| util::parse_data_at(conf_change.get_context(), index, &self.tag));
         match self.process_raft_cmd(apply_ctx, index, term, cmd) {
             ApplyResult::None => {
                 // If failed, tell Raft that the `ConfChange` was aborted.
@@ -1956,14 +1964,35 @@ pub struct Apply {
     pub region_id: u64,
     pub term: u64,
     pub entries: Vec<Entry>,
+    pub raft_cmds: Vec<Option<RaftCmdRequest>>,
 }
 
 impl Apply {
-    pub fn new(region_id: u64, term: u64, entries: Vec<Entry>) -> Apply {
+    pub fn new(region_id: u64, term: u64, mut entries: Vec<Entry>) -> Apply {
+        let mut raft_cmds = Vec::with_capacity(entries.len());
+        for entry in &mut entries {
+            let index = entry.get_index();
+            let data = entry.get_data();
+            let raft_cmd = match entry.get_entry_type() {
+                EntryType::EntryNormal => {
+                    if !data.is_empty() {
+                        Some(util::parse_data_at(data, index, ""))
+                    } else {
+                        None
+                    }
+                }
+                EntryType::EntryConfChange => {
+                    let conf_change: ConfChange = util::parse_data_at(data, index, "");
+                    Some(util::parse_data_at(conf_change.get_context(), index, ""))
+                }
+            };
+            raft_cmds.push(raft_cmd);
+        }
         Apply {
             region_id,
             term,
             entries,
+            raft_cmds,
         }
     }
 }
@@ -2220,7 +2249,7 @@ impl ApplyFsm {
         self.delegate.term = apply.term;
 
         self.delegate
-            .handle_raft_committed_entries(apply_ctx, apply.entries);
+            .handle_raft_committed_entries(apply_ctx, apply.entries, apply.raft_cmds);
         if self.delegate.wait_merge_state.is_some() {
             return;
         }
@@ -2287,7 +2316,7 @@ impl ApplyFsm {
         }
         if !state.pending_entries.is_empty() {
             self.delegate
-                .handle_raft_committed_entries(ctx, state.pending_entries);
+                .handle_raft_committed_entries(ctx, state.pending_entries, vec![]);
             if let Some(ref mut s) = self.delegate.wait_merge_state {
                 // So the delegate is executing another `CommitMerge` in pending_entries.
                 s.pending_msgs = state.pending_msgs;
@@ -2500,6 +2529,7 @@ pub struct ApplyPoller {
     msg_buf: Vec<Msg>,
     apply_ctx: ApplyContext,
     messages_per_tick: usize,
+    local_reader: Option<LocalReader<RaftRouter>>,
 }
 
 impl PollHandler<ApplyFsm, ControlFsm> for ApplyPoller {
@@ -2555,6 +2585,11 @@ impl PollHandler<ApplyFsm, ControlFsm> for ApplyPoller {
                 fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
             }
         }
+    }
+
+    fn after_start(&mut self) {
+        let reader = self.local_reader.take().unwrap();
+        set_tls_local_reader(reader);
     }
 
     fn cleanup(&mut self) {
@@ -2627,7 +2662,6 @@ impl HandlerBuilder<ApplyFsm, ControlFsm> for Builder {
         let store_meta = Arc::clone(&self.store_meta);
         let raft_router = self.raft_router.clone();
         let local_reader = LocalReader::new(kv, store_meta, raft_router);
-        set_tls_local_reader(local_reader);
         ApplyPoller {
             msg_buf: Vec::with_capacity(self.cfg.messages_per_tick),
             apply_ctx: ApplyContext::new(
@@ -2641,6 +2675,7 @@ impl HandlerBuilder<ApplyFsm, ControlFsm> for Builder {
                 &self.cfg,
             ),
             messages_per_tick: self.cfg.messages_per_tick,
+            local_reader: Some(local_reader),
         }
     }
 }

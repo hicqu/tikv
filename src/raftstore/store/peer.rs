@@ -1351,30 +1351,56 @@ impl Peer {
                     .map(|e| (e.get_index(), e.get_term()))
                     .collect::<Vec<_>>()
                     .into_iter();
+                let mut normals_admins = Vec::with_capacity(indices_and_terms.len());
 
                 let apply = Apply::new(self.region_id, self.term(), committed_entries);
+                for cmd in &apply.raft_cmds {
+                    match cmd {
+                        None => normals_admins.push((0, 0)),
+                        Some(cmd) => {
+                            if cmd.has_admin_request() {
+                                normals_admins.push((0, 1));
+                            } else {
+                                let normals = cmd.get_requests().len();
+                                normals_admins.push((normals, 0));
+                            }
+                        }
+                    }
+                }
+                let mut normals_admins = normals_admins.into_iter();
+
                 let task = ApplyTask::apply(apply);
                 if ctx.apply_router.schedule_task(self.region_id, task) {
-                    'LOOP: while let Some(first) = self.apply_proposals.pop_front() {
-                        if first.index <= self.last_applying_idx {
-                            while let Some((term, index)) = indices_and_terms.next() {
-                                assert!(index <= first.index);
-                                if index == first.index {
-                                    if term != first.term {
-                                        // It's a stale proposal.
-                                        apply::notify_stale_req(term, first.cb);
-                                    } else {
-                                        let mut resp = RaftCmdResponse::default();
-                                        resp.mut_header().set_current_term(first.term);
-                                        first.cb.invoke_with_response(resp);
-                                    }
-                                    continue 'LOOP;
-                                }
-                            }
-                            unreachable!();
+                    while let Some(first) = self.apply_proposals.pop_front() {
+                        if first.index > self.last_applying_idx {
+                            self.apply_proposals.push_front(first);
+                            break;
                         }
-                        self.apply_proposals.push_front(first);
-                        break;
+                        let mut term = 0;
+                        let mut normal_admin = (0, 0);
+                        while let Some((i, t)) = indices_and_terms.next() {
+                            normal_admin = normals_admins.next().unwrap();
+                            assert!(i <= first.index);
+                            if i == first.index {
+                                term = t;
+                                break;
+                            }
+                        }
+                        assert!(term != 0);
+                        if term != first.term {
+                            // It's a stale proposal.
+                            apply::notify_stale_req(term, first.cb);
+                        } else {
+                            let mut resp = RaftCmdResponse::default();
+                            resp.mut_header().set_current_term(first.term);
+                            if normal_admin.1 > 0 {
+                                resp.set_admin_response(AdminResponse::default());
+                            }
+                            for _ in 0..normal_admin.0 {
+                                resp.mut_responses().push(Response::default());
+                            }
+                            first.cb.invoke_with_response(resp);
+                        }
                     }
                 }
             }
