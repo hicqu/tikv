@@ -676,6 +676,7 @@ struct WriteCompactionFilter {
     rows: usize,
     stale_versions: usize,
     deleted: usize,
+    default_deleted: usize,
     skipped: usize, // can't delete because it's not the last level.
     start: Instant,
 }
@@ -705,6 +706,7 @@ impl WriteCompactionFilter {
             rows: 0,
             stale_versions: 0,
             deleted: 0,
+            default_deleted: 0,
             skipped: 0,
             start: Instant::now_coarse(),
         }
@@ -736,6 +738,7 @@ impl Drop for WriteCompactionFilter {
             "stale_versions" => self.stale_versions,
             "rows" => self.rows,
             "deleted" => self.deleted,
+            "default_deleted" => self.default_deleted,
             "skipped" => self.skipped,
         );
         GC_DELETED_VERSIONS.inc_by(self.deleted as i64);
@@ -800,6 +803,7 @@ impl CompactionFilter for WriteCompactionFilter {
             if !has_short {
                 let key = Key::from_encoded_slice(key_prefix).append_ts(start_ts);
                 self.delete_default_key(key.as_encoded());
+                self.default_deleted += 1;
             }
             self.deleted += 1;
         }
