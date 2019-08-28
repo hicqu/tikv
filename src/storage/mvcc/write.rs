@@ -3,7 +3,7 @@
 use super::super::types::Value;
 use super::lock::LockType;
 use super::{Error, Result};
-use crate::storage::{SHORT_VALUE_MAX_LEN, SHORT_VALUE_PREFIX};
+use crate::storage::SHORT_VALUE_PREFIX;
 use byteorder::ReadBytesExt;
 use tikv_util::codec::number::{self, NumberEncoder, MAX_VAR_U64_LEN};
 
@@ -84,12 +84,19 @@ impl Write {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(1 + MAX_VAR_U64_LEN + SHORT_VALUE_MAX_LEN + 2);
+        // u8(type) + var_u64(ts).
+        let mut size = 1 + MAX_VAR_U64_LEN;
+        if let Some(ref v) = self.short_value {
+            // u8(short prefix) + var_u64(short len) + content.
+            size += 1 + MAX_VAR_U64_LEN + v.len();
+        }
+
+        let mut b = Vec::with_capacity(size);
         b.push(self.write_type.to_u8());
         b.encode_var_u64(self.start_ts).unwrap();
         if let Some(ref v) = self.short_value {
             b.push(SHORT_VALUE_PREFIX);
-            b.push(v.len() as u8);
+            b.encode_var_u64(v.len() as u64).unwrap();
             b.extend_from_slice(v);
         }
         b
@@ -108,7 +115,7 @@ impl Write {
         let flag = b.read_u8()?;
         assert_eq!(flag, SHORT_VALUE_PREFIX, "invalid flag [{}] in write", flag);
 
-        let len = b.read_u8()?;
+        let len = number::decode_var_u64(&mut b)?;
         if len as usize != b.len() {
             panic!(
                 "short value len [{}] not equal to content len [{}]",

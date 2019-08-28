@@ -2,9 +2,7 @@
 
 use super::super::types::Value;
 use super::{Error, Result};
-use crate::storage::{
-    Mutation, FOR_UPDATE_TS_PREFIX, SHORT_VALUE_MAX_LEN, SHORT_VALUE_PREFIX, TXN_SIZE_PREFIX,
-};
+use crate::storage::{Mutation, FOR_UPDATE_TS_PREFIX, SHORT_VALUE_PREFIX, TXN_SIZE_PREFIX};
 use byteorder::ReadBytesExt;
 use tikv_util::codec::bytes::{self, BytesEncoder};
 use tikv_util::codec::number::{self, NumberEncoder, MAX_VAR_U64_LEN};
@@ -85,16 +83,29 @@ impl Lock {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(
-            1 + MAX_VAR_U64_LEN + self.primary.len() + MAX_VAR_U64_LEN + SHORT_VALUE_MAX_LEN + 2,
-        );
+        // type + pklen + pk + ts + ttl.
+        let mut size = 1 + MAX_VAR_U64_LEN + self.primary.len() + MAX_VAR_U64_LEN * 2;
+        if let Some(ref v) = self.short_value {
+            // short_prefix + len + value.
+            size += 1 + MAX_VAR_U64_LEN + v.len();
+        }
+        if self.for_update_ts > 0 {
+            // update_ts_prefix + ts.
+            size += 1 + std::mem::size_of::<u64>();
+        }
+        if self.txn_size > 0 {
+            // size_prefix + size.
+            size += 1 + std::mem::size_of::<u64>();
+        }
+
+        let mut b = Vec::with_capacity(size);
         b.push(self.lock_type.to_u8());
         b.encode_compact_bytes(&self.primary).unwrap();
         b.encode_var_u64(self.ts).unwrap();
         b.encode_var_u64(self.ttl).unwrap();
         if let Some(ref v) = self.short_value {
             b.push(SHORT_VALUE_PREFIX);
-            b.push(v.len() as u8);
+            b.encode_var_u64(v.len() as u64).unwrap();
             b.extend_from_slice(v);
         }
         if self.for_update_ts > 0 {
@@ -131,7 +142,7 @@ impl Lock {
         while !b.is_empty() {
             match b.read_u8()? {
                 SHORT_VALUE_PREFIX => {
-                    let len = b.read_u8()?;
+                    let len = number::decode_var_u64(&mut b)?;
                     if b.len() < len as usize {
                         panic!(
                             "content len [{}] shorter than short value len [{}]",
