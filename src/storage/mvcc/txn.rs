@@ -641,18 +641,7 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
         let db = MVCC_GC_DB.lock().unwrap().as_ref().map(Arc::clone);
         match (safe_point, db) {
             (Some(sp), Some(db)) => {
-                let cf_handle = get_cf_handle(&db, CF_WRITE).unwrap();
-                let max_level = db.get_options_cf(cf_handle).get_num_levels() - 1;
-                let output_level = context.output_level();
-                if context.is_manual_compaction() && output_level < max_level {
-                    // For manual compactions, only run the filter for the last level.
-                    return std::ptr::null_mut();
-                }
-                let max_delete = match Key::split_on_ts_for(context.end_key()) {
-                    Ok((k, _)) => k.to_vec(),
-                    _ => vec![],
-                };
-                let filter = Box::new(WriteCompactionFilter::new(sp, db, output_level, max_delete));
+                let filter = Box::new(WriteCompactionFilter::new(sp, db, context));
                 unsafe { new_compaction_filter_raw(name, true, filter) }
             }
             _ => std::ptr::null_mut(),
@@ -665,7 +654,8 @@ struct WriteCompactionFilter {
     db: Arc<DB>,
     max_level: usize,
     output_level: usize,
-    max_delete: Vec<u8>,
+    start_key: Vec<u8>,
+    end_key: Vec<u8>,
 
     write_batch: WriteBatch,
     key_prefix: Vec<u8>,
@@ -682,20 +672,23 @@ struct WriteCompactionFilter {
 }
 
 impl WriteCompactionFilter {
-    fn new(
-        safe_point: Arc<AtomicU64>,
-        db: Arc<DB>,
-        output_level: usize,
-        max_delete: Vec<u8>,
-    ) -> Self {
+    fn new(safe_point: Arc<AtomicU64>, db: Arc<DB>, context: &CompactionFilterContext) -> Self {
         let cf_handle = get_cf_handle(&db, CF_WRITE).unwrap();
         let max_level = db.get_options_cf(cf_handle).get_num_levels() - 1;
+        let output_level = context.output_level();
+        let start_key = Key::split_on_ts_for(context.start_key())
+            .map(|(k, _)| k.to_vec())
+            .unwrap_or_default();
+        let end_key = Key::split_on_ts_for(context.end_key())
+            .map(|(k, _)| k.to_vec())
+            .unwrap_or_default();
         WriteCompactionFilter {
             safe_point,
             db,
             max_level,
             output_level,
-            max_delete,
+            start_key,
+            end_key,
 
             write_batch: WriteBatch::with_capacity(DEFAULT_DELETE_BATCH_SIZE),
             key_prefix: vec![],
@@ -740,6 +733,8 @@ impl Drop for WriteCompactionFilter {
             "deleted" => self.deleted,
             "default_deleted" => self.default_deleted,
             "skipped" => self.skipped,
+            "start_key" => format!("{:X?}", self.start_key),
+            "end_key" => format!("{:X?}", self.end_key),
         );
         GC_DELETED_VERSIONS.inc_by(self.deleted as i64);
     }
@@ -786,7 +781,7 @@ impl CompactionFilter for WriteCompactionFilter {
                 WriteType::Rollback | WriteType::Lock => filtered = true,
                 WriteType::Delete => {
                     self.remove_older = true;
-                    if self.output_level == self.max_level && self.key_prefix != self.max_delete {
+                    if self.output_level == self.max_level && self.key_prefix != self.end_key {
                         filtered = true;
                     } else {
                         self.skipped += 1;
