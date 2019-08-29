@@ -51,11 +51,7 @@ use tikv_util::worker::Scheduler;
 use tikv_util::Either;
 use tikv_util::MustConsumeVec;
 
-use super::metrics::*;
-use super::{
-    BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, Mailbox, NormalScheduler,
-    PollHandler,
-};
+use super::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler};
 
 use super::super::RegionTask;
 
@@ -2742,7 +2738,6 @@ impl ApplyRouter {
                     "region_id" => region_id,
                     "merge" => ?cul.merge,
                 );
-                return;
             }
             Msg::LocalRead(cmd) | Msg::ReadIndex { cmd, .. } => {
                 let region_id = cmd.request.get_header().get_region_id();
