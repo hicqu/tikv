@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
-use std::{cmp, ptr, usize};
+use std::{cmp, mem, ptr, usize};
 
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine::rocks;
@@ -44,6 +44,7 @@ use crate::raftstore::store::worker::LocalReader;
 use crate::raftstore::store::RaftCommand;
 use crate::raftstore::store::{cmd_resp, keys, util, Config};
 use crate::raftstore::{Error, Result};
+use tikv_util::collections::HashMap;
 use tikv_util::escape;
 use tikv_util::mpsc::{loose_bounded, LooseBoundedSender, Receiver};
 use tikv_util::time::{duration_to_sec, Instant, SlowTimer};
@@ -56,7 +57,7 @@ use super::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHan
 use super::super::RegionTask;
 
 const WRITE_BATCH_MAX_KEYS: usize = 128;
-const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
+const DEFAULT_APPLY_WB_SIZE: usize = 128 * 1024;
 const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
 
 #[derive(Default, Debug)]
@@ -153,23 +154,25 @@ impl ExecContext {
 
 struct ApplyCallback {
     region: Region,
-    cbs: Vec<RaftCmdResponse>,
+    responses: Vec<RaftCmdResponse>,
 }
 
 impl ApplyCallback {
     fn new(region: Region) -> ApplyCallback {
-        let cbs = vec![];
-        ApplyCallback { region, cbs }
+        ApplyCallback {
+            region,
+            responses: vec![],
+        }
     }
 
     fn invoke_all(self, host: &CoprocessorHost) {
-        for mut resp in self.cbs {
+        for mut resp in self.responses {
             host.post_apply(&self.region, &mut resp);
         }
     }
 
     fn push(&mut self, resp: RaftCmdResponse) {
-        self.cbs.push(resp);
+        self.responses.push(resp);
     }
 }
 
@@ -209,6 +212,9 @@ struct ApplyContext {
     kv_wb_last_bytes: u64,
     kv_wb_last_keys: u64,
 
+    local_reads: HashMap<u64, Vec<RaftCommand>>,
+    index_reads: VecDeque<(RaftCommand, Option<u64>, u64)>,
+
     last_applied_index: u64,
     committed_count: usize,
 
@@ -245,6 +251,8 @@ impl ApplyContext {
             apply_res: vec![],
             kv_wb_last_bytes: 0,
             kv_wb_last_keys: 0,
+            local_reads: HashMap::default(),
+            index_reads: VecDeque::with_capacity(1024),
             last_applied_index: 0,
             committed_count: 0,
             enable_sync_log: cfg.sync_log,
@@ -319,6 +327,17 @@ impl ApplyContext {
         }
         for cbs in self.cbs.drain(..) {
             cbs.invoke_all(&self.host);
+        }
+        let local_reads = mem::replace(&mut self.local_reads, HashMap::default());
+        for (_, cmds) in local_reads {
+            LOCAL_READ_BATCH_SIZE.observe(cmds.len() as f64);
+            for cmd in cmds {
+                with_tls_local_reader(move |reader| reader.execute_raft_command(cmd));
+            }
+        }
+        INDEX_READ_BATCH_SIZE.observe(self.index_reads.len() as f64);
+        while let Some((cmd, index, term)) = self.index_reads.pop_front() {
+            with_tls_local_reader(move |reader| reader.read_index(cmd, index, term));
         }
         need_sync
     }
@@ -2454,10 +2473,9 @@ impl ApplyFsm {
     }
 
     fn handle_local_read(&mut self, apply_ctx: &mut ApplyContext, cmd: RaftCommand) {
-        apply_ctx.commit_opt(&mut self.delegate, true);
-        with_tls_local_reader(move |reader| {
-            reader.execute_raft_command(cmd);
-        });
+        let region_id = cmd.request.get_header().get_region_id();
+        let cmds = apply_ctx.local_reads.entry(region_id).or_insert(vec![]);
+        cmds.push(cmd);
     }
 
     fn handle_read_index(
@@ -2466,10 +2484,9 @@ impl ApplyFsm {
         cmd: RaftCommand,
         index: Option<u64>,
     ) {
-        apply_ctx.commit_opt(&mut self.delegate, true);
-        with_tls_local_reader(move |reader| {
-            reader.read_index(cmd, index, self.delegate.term);
-        });
+        apply_ctx
+            .index_reads
+            .push_back((cmd, index, self.delegate.term));
     }
 
     fn handle_tasks(&mut self, apply_ctx: &mut ApplyContext, msgs: &mut Vec<Msg>) {

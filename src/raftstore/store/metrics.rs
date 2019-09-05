@@ -223,4 +223,16 @@ lazy_static! {
             "tikv_raftstore_read_index_pending",
             "pending read index count"
         ).unwrap();
+    pub static ref LOCAL_READ_BATCH_SIZE: Histogram = register_histogram!(
+        "tikv_raftstore_local_read_batch",
+        "Batch size of local read",
+        exponential_buckets(1.0, 2.0, 10).unwrap()
+    )
+    .unwrap();
+    pub static ref INDEX_READ_BATCH_SIZE: Histogram = register_histogram!(
+        "tikv_raftstore_index_read_batch",
+        "Batch size of index read",
+        exponential_buckets(1.0, 2.0, 10).unwrap()
+    )
+    .unwrap();
 }
