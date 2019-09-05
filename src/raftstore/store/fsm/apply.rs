@@ -2473,6 +2473,9 @@ impl ApplyFsm {
     }
 
     fn handle_local_read(&mut self, apply_ctx: &mut ApplyContext, cmd: RaftCommand) {
+        if apply_ctx.timer.is_none() {
+            apply_ctx.timer = Some(SlowTimer::new());
+        }
         let region_id = cmd.request.get_header().get_region_id();
         let cmds = apply_ctx.local_reads.entry(region_id).or_insert(vec![]);
         cmds.push(cmd);
@@ -2484,9 +2487,11 @@ impl ApplyFsm {
         cmd: RaftCommand,
         index: Option<u64>,
     ) {
-        apply_ctx
-            .index_reads
-            .push_back((cmd, index, self.delegate.term));
+        if apply_ctx.timer.is_none() {
+            apply_ctx.timer = Some(SlowTimer::new());
+        }
+        let task = (cmd, index, self.delegate.term);
+        apply_ctx.index_reads.push_back(task);
     }
 
     fn handle_tasks(&mut self, apply_ctx: &mut ApplyContext, msgs: &mut Vec<Msg>) {
