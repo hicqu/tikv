@@ -57,6 +57,7 @@ use super::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHan
 use super::super::RegionTask;
 
 const WRITE_BATCH_MAX_KEYS: usize = 128;
+const WRITE_BATCH_MAX_SIZE: usize = 128 * 1024;
 const DEFAULT_APPLY_WB_SIZE: usize = 128 * 1024;
 const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
 
@@ -427,7 +428,7 @@ pub fn notify_stale_req(term: u64, cb: Callback) {
 }
 
 /// Checks if a write is needed to be issued before handling the command.
-fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_keys: usize) -> bool {
+fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_keys: usize, kv_wb_size: usize) -> bool {
     if cmd.has_admin_request() {
         match cmd.get_admin_request().get_cmd_type() {
             // ComputeHash require an up to date snapshot.
@@ -441,7 +442,7 @@ fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_keys: usize) -> bool {
 
     // When write batch contains more than `recommended` keys, write the batch
     // to engine.
-    if kv_wb_keys >= WRITE_BATCH_MAX_KEYS {
+    if kv_wb_keys >= WRITE_BATCH_MAX_KEYS || kv_wb_size >= WRITE_BATCH_MAX_SIZE {
         return true;
     }
 
@@ -696,7 +697,11 @@ impl ApplyDelegate {
 
         if !data.is_empty() {
             let cmd = cmd.unwrap_or_else(|| util::parse_data_at(data, index, &self.tag));
-            if should_write_to_engine(&cmd, apply_ctx.kv_wb().count()) {
+            if should_write_to_engine(
+                &cmd,
+                apply_ctx.kv_wb().count(),
+                apply_ctx.kv_wb().data_size(),
+            ) {
                 apply_ctx.commit(self);
             }
             return self.process_raft_cmd(apply_ctx, index, term, cmd);
@@ -755,6 +760,7 @@ impl ApplyDelegate {
         }
 
         if cmd.has_admin_request() {
+            apply_ctx.commit(self);
             apply_ctx.sync_log_hint = true;
         }
 
@@ -2473,6 +2479,11 @@ impl ApplyFsm {
     }
 
     fn handle_local_read(&mut self, apply_ctx: &mut ApplyContext, cmd: RaftCommand) {
+        if let Err(e) = check_region_epoch(&cmd.request, &self.delegate.region, false) {
+            let resp = cmd_resp::new_error(e);
+            cmd.callback.invoke_with_response(resp);
+            return;
+        }
         if apply_ctx.timer.is_none() {
             apply_ctx.timer = Some(SlowTimer::new());
         }
@@ -2487,6 +2498,11 @@ impl ApplyFsm {
         cmd: RaftCommand,
         index: Option<u64>,
     ) {
+        if let Err(e) = check_region_epoch(&cmd.request, &self.delegate.region, false) {
+            let resp = cmd_resp::new_error(e);
+            cmd.callback.invoke_with_response(resp);
+            return;
+        }
         if apply_ctx.timer.is_none() {
             apply_ctx.timer = Some(SlowTimer::new());
         }

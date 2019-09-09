@@ -358,7 +358,7 @@ impl<C: ProposalRouter> LocalReader<C> {
         let region_id = cmd.request.get_header().get_region_id();
         let mut executor = ReadExecutor::new(
             self.kv_engine.clone(),
-            true,
+            false,
             true, /* we need snapshot time */
         );
 
