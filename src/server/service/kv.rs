@@ -849,26 +849,6 @@ impl<T: RaftStoreRouter + 'static, E: Engine, L: LockMgr> Tikv for Service<T, E,
                 let mut resp = SplitRegionResponse::default();
                 if v.response.get_header().has_error() {
                     resp.set_region_error(v.response.mut_header().take_error());
-                } else {
-                    let admin_resp = v.response.mut_admin_response();
-                    let regions: Vec<_> = admin_resp.mut_splits().take_regions().into();
-                    if regions.len() < 2 {
-                        error!(
-                            "invalid split response";
-                            "region_id" => region_id,
-                            "resp" => ?admin_resp
-                        );
-                        resp.mut_region_error().set_message(format!(
-                            "Internal Error: invalid response: {:?}",
-                            admin_resp
-                        ));
-                    } else {
-                        if regions.len() == 2 {
-                            resp.set_left(regions[0].clone());
-                            resp.set_right(regions[1].clone());
-                        }
-                        resp.set_regions(regions.into());
-                    }
                 }
                 resp
             })

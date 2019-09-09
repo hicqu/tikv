@@ -316,6 +316,7 @@ pub struct Peer {
 
     /// The counter records pending snapshot requests.
     pub pending_request_snapshot_count: Arc<AtomicUsize>,
+    pub pending_admin_request_count: Arc<AtomicUsize>,
     /// The index of last scheduled committed raft log.
     pub last_applying_idx: u64,
     /// The index of last compacted raft log. It is used for the next compact log task.
@@ -399,6 +400,7 @@ impl Peer {
             pending_remove: false,
             pending_merge_state: None,
             pending_request_snapshot_count: Arc::new(AtomicUsize::new(0)),
+            pending_admin_request_count: Arc::new(AtomicUsize::new(0)),
             last_proposed_prepare_merge_idx: 0,
             last_committed_prepare_merge_idx: 0,
             leader_missing_time: Some(Instant::now()),
@@ -660,6 +662,8 @@ impl Peer {
         {
             // Epoch version changed, disable read on the localreader for this region.
             self.leader_lease.expire_remote_lease();
+            self.pending_admin_request_count
+                .fetch_sub(1, Ordering::Release);
         }
         self.mut_store().set_region(region.clone());
         let progress = ReadProgress::region(region);
@@ -2194,6 +2198,18 @@ impl Peer {
         poll_ctx: &mut PollContext<T, C>,
         mut req: RaftCmdRequest,
     ) -> Result<u64> {
+        if self.pending_admin_request_count.load(Ordering::Acquire) > 0 {
+            return Err(Error::StaleCommand);
+        }
+
+        // whether the proposal will change version or not.
+        let has_admin = req.has_admin_request()
+            && (req.get_admin_request().get_cmd_type() == AdminCmdType::Split
+                || req.get_admin_request().get_cmd_type() == AdminCmdType::BatchSplit
+                || req.get_admin_request().get_cmd_type() == AdminCmdType::PrepareMerge
+                || req.get_admin_request().get_cmd_type() == AdminCmdType::CommitMerge
+                || req.get_admin_request().get_cmd_type() == AdminCmdType::RollbackMerge);
+
         if self.pending_merge_state.is_some()
             && req.get_admin_request().get_cmd_type() != AdminCmdType::RollbackMerge
         {
@@ -2236,6 +2252,11 @@ impl Peer {
             // The message is dropped silently, this usually due to leader absence
             // or transferring leader. Both cases can be considered as NotLeader error.
             return Err(Error::NotLeader(self.region_id, None));
+        }
+
+        if has_admin {
+            self.pending_admin_request_count
+                .fetch_add(1, Ordering::Release);
         }
 
         if ctx.contains(ProposalContext::PREPARE_MERGE) {

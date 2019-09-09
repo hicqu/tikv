@@ -527,6 +527,8 @@ pub struct ApplyDelegate {
     /// The counter of pending request snapshots. See more in `Peer`.
     pending_request_snapshot_count: Arc<AtomicUsize>,
 
+    pending_admin_request_count: Arc<AtomicUsize>,
+
     /// Marks the delegate as merged by CommitMerge.
     merged: bool,
     /// Indicates the peer is in merging, if that compact log won't be performed.
@@ -573,6 +575,7 @@ impl ApplyDelegate {
             metrics: Default::default(),
             last_merge_version: 0,
             pending_request_snapshot_count: reg.pending_request_snapshot_count,
+            pending_admin_request_count: reg.pending_admin_request_count,
         }
     }
 
@@ -920,7 +923,13 @@ impl ApplyDelegate {
             );
         }
 
-        let (mut response, exec_result) = match cmd_type {
+        let need_change_version = cmd_type == AdminCmdType::Split
+            || cmd_type == AdminCmdType::BatchSplit
+            || cmd_type == AdminCmdType::PrepareMerge
+            || cmd_type == AdminCmdType::CommitMerge
+            || cmd_type == AdminCmdType::RollbackMerge;
+
+        let res = match cmd_type {
             AdminCmdType::ChangePeer => self.exec_change_peer(ctx, request),
             AdminCmdType::Split => self.exec_split(ctx, request),
             AdminCmdType::BatchSplit => self.exec_batch_split(ctx, request),
@@ -933,7 +942,16 @@ impl ApplyDelegate {
             AdminCmdType::CommitMerge => self.exec_commit_merge(ctx, request),
             AdminCmdType::RollbackMerge => self.exec_rollback_merge(ctx, request),
             AdminCmdType::InvalidAdmin => Err(box_err!("unsupported admin command type")),
-        }?;
+        };
+        let (mut response, exec_result) = match (res, need_change_version) {
+            (Err(e), true) => {
+                self.pending_admin_request_count
+                    .fetch_sub(1, Ordering::Release);
+                return Err(e);
+            }
+            (Err(e), false) => return Err(e),
+            (Ok((resp, result)), _) => (resp, result),
+        };
         response.set_cmd_type(cmd_type);
 
         let mut resp = RaftCmdResponse::default();
@@ -2026,6 +2044,7 @@ pub struct Registration {
     pub applied_index_term: u64,
     pub region: Region,
     pub pending_request_snapshot_count: Arc<AtomicUsize>,
+    pub pending_admin_request_count: Arc<AtomicUsize>,
 }
 
 impl Registration {
@@ -2037,6 +2056,7 @@ impl Registration {
             applied_index_term: peer.get_store().applied_index_term(),
             region: peer.region().clone(),
             pending_request_snapshot_count: peer.pending_request_snapshot_count.clone(),
+            pending_admin_request_count: peer.pending_admin_request_count.clone(),
         }
     }
 }
