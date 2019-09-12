@@ -56,7 +56,7 @@ use super::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHan
 
 use super::super::RegionTask;
 
-const WRITE_BATCH_MAX_KEYS: usize = 128;
+const WRITE_BATCH_MAX_KEYS: usize = 128 * 1024;
 const WRITE_BATCH_MAX_SIZE: usize = 128 * 1024;
 const DEFAULT_APPLY_WB_SIZE: usize = 128 * 1024;
 const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
@@ -763,7 +763,6 @@ impl ApplyDelegate {
         }
 
         if cmd.has_admin_request() {
-            apply_ctx.commit(self);
             apply_ctx.sync_log_hint = true;
         }
 
