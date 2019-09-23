@@ -129,6 +129,11 @@ pub struct Config {
     #[doc(hidden)]
     #[serde(skip_serializing)]
     pub region_split_size: ReadableSize,
+
+    #[doc(hidden)]
+    pub apply_write_batch_max_keys: usize,
+    #[doc(hidden)]
+    pub apply_write_batch_max_bytes: usize,
 }
 
 impl Default for Config {
@@ -197,6 +202,9 @@ impl Default for Config {
             // They are preserved for compatibility check.
             region_max_size: ReadableSize(0),
             region_split_size: ReadableSize(0),
+
+            apply_write_batch_max_keys: 1024,
+            apply_write_batch_max_bytes: 512 * 1024,
         }
     }
 }

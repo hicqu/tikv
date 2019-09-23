@@ -52,9 +52,6 @@ use super::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHan
 
 use super::super::RegionTask;
 
-const WRITE_BATCH_MAX_KEYS: usize = 128;
-const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
-const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
 const SHRINK_PENDING_CMD_QUEUE_CAP: usize = 64;
 
 pub struct PendingCmd {
@@ -298,6 +295,9 @@ struct ApplyContext {
     sync_log_hint: bool,
     // Whether to use the delete range API instead of deleting one by one.
     use_delete_range: bool,
+
+    apply_write_batch_max_keys: usize,
+    apply_write_batch_max_bytes: usize,
 }
 
 impl ApplyContext {
@@ -331,6 +331,8 @@ impl ApplyContext {
             sync_log_hint: false,
             exec_ctx: None,
             use_delete_range: cfg.use_delete_range,
+            apply_write_batch_max_keys: cfg.apply_write_batch_max_keys,
+            apply_write_batch_max_bytes: cfg.apply_write_batch_max_bytes,
         }
     }
 
@@ -341,7 +343,7 @@ impl ApplyContext {
     /// After all delegates are handled, `write_to_db` method should be called.
     pub fn prepare_for(&mut self, delegate: &ApplyDelegate) {
         if self.kv_wb.is_none() {
-            self.kv_wb = Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE));
+            self.kv_wb = Some(WriteBatch::with_capacity(self.apply_write_batch_max_bytes));
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
         }
@@ -387,9 +389,9 @@ impl ApplyContext {
                 });
             self.sync_log_hint = false;
             let data_size = self.kv_wb().data_size();
-            if data_size > APPLY_WB_SHRINK_SIZE {
+            if data_size > self.apply_write_batch_max_bytes * 2 {
                 // Control the memory usage for the WriteBatch.
-                self.kv_wb = Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE));
+                self.kv_wb = Some(WriteBatch::with_capacity(self.apply_write_batch_max_bytes));
             } else {
                 // Clear data, reuse the WriteBatch, this can reduce memory allocations and deallocations.
                 self.kv_wb().clear();
@@ -512,7 +514,7 @@ pub fn notify_stale_req(term: u64, cb: Callback) {
 }
 
 /// Checks if a write is needed to be issued before handling the command.
-fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_keys: usize) -> bool {
+fn should_write_to_engine(cmd: &RaftCmdRequest, apply_ctx: &ApplyContext) -> bool {
     if cmd.has_admin_request() {
         match cmd.get_admin_request().get_cmd_type() {
             // ComputeHash require an up to date snapshot.
@@ -524,9 +526,10 @@ fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_keys: usize) -> bool {
         }
     }
 
-    // When write batch contains more than `recommended` keys, write the batch
-    // to engine.
-    if kv_wb_keys >= WRITE_BATCH_MAX_KEYS {
+    // When write batch contains more than `recommended` keys, write the batch to engine.
+    if apply_ctx.kv_wb().count() >= apply_ctx.apply_write_batch_max_keys
+        || apply_ctx.kv_wb().data_size() >= apply_ctx.apply_write_batch_max_bytes
+    {
         return true;
     }
 
@@ -776,11 +779,9 @@ impl ApplyDelegate {
 
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
-
-            if should_write_to_engine(&cmd, apply_ctx.kv_wb().count()) {
+            if should_write_to_engine(&cmd, apply_ctx) {
                 apply_ctx.commit(self);
             }
-
             return self.process_raft_cmd(apply_ctx, index, term, cmd);
         }
 
@@ -2596,7 +2597,9 @@ impl ApplyFsm {
                 apply_ctx.timer = Some(SlowTimer::new());
             }
             if apply_ctx.kv_wb.is_none() {
-                apply_ctx.kv_wb = Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE));
+                apply_ctx.kv_wb = Some(WriteBatch::with_capacity(
+                    apply_ctx.apply_write_batch_max_bytes,
+                ));
             }
             self.delegate
                 .write_apply_state(&apply_ctx.engines, apply_ctx.kv_wb());
