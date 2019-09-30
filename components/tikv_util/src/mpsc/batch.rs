@@ -1,5 +1,6 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::mem::ManuallyDrop;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -101,7 +102,7 @@ impl Drop for Notifier {
 }
 
 pub struct Sender<T> {
-    sender: Option<channel::Sender<T>>,
+    sender: ManuallyDrop<channel::Sender<T>>,
     state: Arc<State>,
 }
 
@@ -118,7 +119,9 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     #[inline]
     fn drop(&mut self) {
-        drop(self.sender.take());
+        unsafe {
+            ManuallyDrop::drop(&mut self.sender);
+        }
         self.state.notify();
     }
 }
@@ -131,21 +134,21 @@ pub struct Receiver<T> {
 impl<T> Sender<T> {
     #[inline]
     pub fn send(&self, t: T) -> Result<(), SendError<T>> {
-        self.sender.as_ref().unwrap().send(t)?;
+        self.sender.send(t)?;
         self.state.try_notify_post_send();
         Ok(())
     }
 
     #[inline]
     pub fn send_and_notify(&self, t: T) -> Result<(), SendError<T>> {
-        self.sender.as_ref().unwrap().send(t)?;
+        self.sender.send(t)?;
         self.state.notify();
         Ok(())
     }
 
     #[inline]
     pub fn try_send(&self, t: T) -> Result<(), TrySendError<T>> {
-        self.sender.as_ref().unwrap().try_send(t)?;
+        self.sender.try_send(t)?;
         self.state.try_notify_post_send();
         Ok(())
     }
@@ -189,7 +192,7 @@ pub fn unbounded<T>(notify_size: usize) -> (Sender<T>, Receiver<T>) {
     let (sender, receiver) = channel::unbounded();
     (
         Sender {
-            sender: Some(sender),
+            sender: ManuallyDrop::new(sender),
             state: state.clone(),
         },
         Receiver { receiver, state },
@@ -208,7 +211,7 @@ pub fn bounded<T>(cap: usize, notify_size: usize) -> (Sender<T>, Receiver<T>) {
     let (sender, receiver) = channel::bounded(cap);
     (
         Sender {
-            sender: Some(sender),
+            sender: ManuallyDrop::new(sender),
             state: state.clone(),
         },
         Receiver { receiver, state },
