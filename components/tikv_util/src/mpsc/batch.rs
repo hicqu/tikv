@@ -120,6 +120,8 @@ impl<T> Drop for Sender<T> {
     #[inline]
     fn drop(&mut self) {
         unsafe {
+            // `self.sender` must be dropped before the receiver respectively is notified.
+            // Otherwise the receiver's poller could be lost forever.
             ManuallyDrop::drop(&mut self.sender);
         }
         self.state.notify();
