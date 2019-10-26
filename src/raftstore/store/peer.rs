@@ -807,10 +807,22 @@ impl Peer {
                 | MessageType::MsgSnapStatus
                 | MessageType::MsgCheckQuorum
                 | MessageType::MsgReadIndex
-                | MessageType::MsgReadIndexResp
+                | MessageType::MsgReadIndexResp => {}
                 // TODO: maybe add these two into metrics
-                | MessageType::MsgBroadcast
-                | MessageType::MsgBroadcastResp => {}
+                MessageType::MsgBroadcastResp => {
+                    info!(
+                        "[follower replication]send MsgBroadcast";
+                        "to" => msg.to,
+                        "from" => msg.from,
+                    );
+                }
+                MessageType::MsgBroadcast => {
+                    info!(
+                        "[follower replication]send MsgBroadcastResp";
+                        "from" => msg.from,
+                        "proxy" => msg.proxy,
+                    );
+                }
             }
             self.send_raft_message(msg, trans);
         }
