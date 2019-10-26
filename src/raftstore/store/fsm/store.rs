@@ -767,7 +767,8 @@ impl<T, C: PdClient> RaftPollerBuilder<T, C> {
                 self.region_scheduler.clone(),
                 self.engines.clone(),
                 region,
-                &meta.store_location,
+                &mut meta,
+                self.pd_client.clone(),
             ));
             if local_state.get_state() == PeerState::Merging {
                 info!("region is merging"; "region" => ?region, "store_id" => store_id);
@@ -805,7 +806,8 @@ impl<T, C: PdClient> RaftPollerBuilder<T, C> {
                 self.region_scheduler.clone(),
                 self.engines.clone(),
                 &region,
-                &meta.store_location,
+                &mut meta,
+                self.pd_client.clone(),
             )?;
             peer.schedule_applying_snapshot();
             meta.region_ranges
@@ -1343,7 +1345,7 @@ impl<'a, T: Transport, C: PdClient> StoreFsmDelegate<'a, T, C> {
         // we may encounter a message with larger peer id, which means
         // current peer is stale, then we should remove current peer
         let mut guard = self.ctx.store_meta.lock().unwrap();
-        let meta: &mut StoreMeta = &mut *guard;
+        let mut meta: &mut StoreMeta = &mut *guard;
         if meta.regions.contains_key(&region_id) {
             return Ok(true);
         }
@@ -1417,14 +1419,15 @@ impl<'a, T: Transport, C: PdClient> StoreFsmDelegate<'a, T, C> {
         }
 
         // New created peers should know it's learner or not.
-        let (tx, peer) = PeerFsm::replicate(
+        let (tx, peer) = PeerFsm::replicate::<C>(
             self.ctx.store_id(),
             &self.ctx.cfg,
             self.ctx.region_scheduler.clone(),
             self.ctx.engines.clone(),
             region_id,
             target.clone(),
-            &meta.store_location,
+            &mut meta,
+            self.ctx.pd_client.clone(),
         )?;
         // following snapshot may overlap, should insert into region_ranges after
         // snapshot is applied.

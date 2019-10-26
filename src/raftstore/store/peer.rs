@@ -31,7 +31,7 @@ use time::Timespec;
 use uuid::Uuid;
 
 use crate::raftstore::coprocessor::{CoprocessorHost, RegionChangeEvent};
-use crate::raftstore::store::fsm::store::PollContext;
+use crate::raftstore::store::fsm::store::{PollContext, StoreMeta};
 use crate::raftstore::store::fsm::{
     apply, Apply, ApplyMetrics, ApplyTask, ApplyTaskRes, GroupState, Proposal, RegionProposal,
 };
@@ -40,7 +40,7 @@ use crate::raftstore::store::worker::{ReadDelegate, ReadProgress, RegionTask};
 use crate::raftstore::store::PdTask;
 use crate::raftstore::store::{keys, Callback, Config, ReadResponse, RegionSnapshot};
 use crate::raftstore::{Error, Result};
-use pd_client::INVALID_ID;
+use pd_client::{PdClient, INVALID_ID};
 use tikv_util::collections::HashMap;
 use tikv_util::time::{duration_to_sec, monotonic_raw_now};
 use tikv_util::worker::Scheduler;
@@ -343,14 +343,15 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn new(
+    pub fn new<C: PdClient>(
         store_id: u64,
-        store_location: &HashMap<u64, String>,
+        store_meta: &mut StoreMeta,
         cfg: &Config,
         sched: Scheduler<RegionTask>,
         engines: Engines,
         region: &metapb::Region,
         peer: metapb::Peer,
+        pd_client: Arc<C>,
     ) -> Result<Peer> {
         if peer.get_id() == raft::INVALID_ID {
             return Err(box_err!("invalid peer id"));
@@ -361,13 +362,21 @@ impl Peer {
         let ps = PeerStorage::new(engines.clone(), region, sched, peer.get_id(), tag.clone())?;
 
         let applied_index = ps.applied_index();
-        let peers = region
-            .get_peers()
-            .iter()
-            .map(|peer| (peer.id, peer.store_id))
-            .collect::<Vec<_>>();
+        let mut peers = Vec::new();
+        let mut locations = ::std::mem::replace(&mut store_meta.store_location, HashMap::default());
+        for p in region.get_peers().iter() {
+            let peer_id = p.id;
+            let store_id = p.store_id;
+            if locations.get(&store_id).is_none() {
+                let mut stores = pd_client.get_all_stores(true).unwrap();
+                let new_locations = stores.drain(..).map(|store| (store.id, store.region)).collect::<HashMap<_, _>>();
+                locations = new_locations;
+            }
+            peers.push((peer_id, store_id));
+        }
+        store_meta.store_location = locations;
         let group_config = GroupsConfig::new(
-            util::group_peers_by_store_location(&peers, store_location),
+            util::group_peers_by_store_location(&peers, &store_meta.store_location),
             ProxyStrategy::default(),
         );
         let raft_cfg = raft::Config {

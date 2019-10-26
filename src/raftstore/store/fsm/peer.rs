@@ -124,13 +124,14 @@ impl PeerFsm {
     // If we create the peer actively, like bootstrap/split/merge region, we should
     // use this function to create the peer. The region must contain the peer info
     // for this store.
-    pub fn create(
+    pub fn create<C: PdClient>(
         store_id: u64,
         cfg: &Config,
         sched: Scheduler<RegionTask>,
         engines: Engines,
         region: &metapb::Region,
-        store_locations: &HashMap<u64, String>,
+        store_meta: &mut StoreMeta,
+        pd: Arc<C>,
     ) -> Result<(LooseBoundedSender<PeerMsg>, Box<PeerFsm>)> {
         let meta_peer = match util::find_peer(region, store_id) {
             None => {
@@ -152,14 +153,15 @@ impl PeerFsm {
         Ok((
             tx,
             Box::new(PeerFsm {
-                peer: Peer::new(
+                peer: Peer::new::<C>(
                     store_id,
-                    store_locations,
+                    store_meta,
                     cfg,
                     sched,
                     engines,
                     region,
                     meta_peer,
+                    pd,
                 )?,
                 tick_registry: PeerTicks::empty(),
                 missing_ticks: 0,
@@ -175,14 +177,15 @@ impl PeerFsm {
     // The peer can be created from another node with raft membership changes, and we only
     // know the region_id and peer_id when creating this replicated peer, the region info
     // will be retrieved later after applying snapshot.
-    pub fn replicate(
+    pub fn replicate<C: PdClient>(
         store_id: u64,
         cfg: &Config,
         sched: Scheduler<RegionTask>,
         engines: Engines,
         region_id: u64,
         peer: metapb::Peer,
-        store_locations: &HashMap<u64, String>,
+        store_meta: &mut StoreMeta,
+        pd_client: Arc<C>,
     ) -> Result<(LooseBoundedSender<PeerMsg>, Box<PeerFsm>)> {
         // We will remove tombstone key when apply snapshot
         info!(
@@ -198,14 +201,15 @@ impl PeerFsm {
         Ok((
             tx,
             Box::new(PeerFsm {
-                peer: Peer::new(
+                peer: Peer::new::<C>(
                     store_id,
-                    store_locations,
+                    store_meta,
                     cfg,
                     sched,
                     engines,
                     &region,
                     peer,
+                    pd_client,
                 )?,
                 tick_registry: PeerTicks::empty(),
                 missing_ticks: 0,
@@ -1507,14 +1511,29 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
         }
         let new_config = {
             let group_config = self.fsm.peer.raft_group.raft.groups().meta.clone();
-            let store_meta = self.ctx.store_meta.lock().unwrap();
+            let mut store_meta = self.ctx.store_meta.lock().unwrap();
             // Region have been updated in exec_change_peer
+            let mut peers = Vec::new();
+            let mut locations = ::std::mem::replace(&mut store_meta.store_location, HashMap::default());
+            for p in cp.region.get_peers().iter() {
+                let peer_id = p.id;
+                let store_id = p.store_id;
+                if locations.get(&store_id).is_none() {
+                    let mut stores = self.ctx.pd_client.get_all_stores(true).unwrap();
+                    let new_locations = stores.drain(..).map(|store| (store.id, store.region)).collect::<HashMap<_, _>>();
+                    locations = new_locations;
+                }
+                peers.push((peer_id, store_id));
+            }
+            store_meta.store_location = locations;
             let peers = cp
                 .region
                 .get_peers()
                 .iter()
                 .map(|peer| (peer.id, peer.store_id))
                 .collect::<Vec<_>>();
+            
+            
             let inner = util::group_peers_by_store_location(&peers, &store_meta.store_location);
             GroupsConfig::new(inner, group_config.strategy())
         };
@@ -1579,7 +1598,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
     fn on_ready_split_region(&mut self, derived: metapb::Region, regions: Vec<metapb::Region>) {
         self.register_split_region_check_tick();
         let mut guard = self.ctx.store_meta.lock().unwrap();
-        let meta: &mut StoreMeta = &mut *guard;
+        let mut meta: &mut StoreMeta = &mut *guard;
         let region_id = derived.get_id();
         meta.set_region(&self.ctx.coprocessor_host, derived, &mut self.fsm.peer);
         self.fsm.peer.post_split();
@@ -1656,7 +1675,8 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 self.ctx.region_scheduler.clone(),
                 self.ctx.engines.clone(),
                 &new_region,
-                &meta.store_location,
+                &mut meta,
+                self.ctx.pd_client.clone(),
             ) {
                 Ok((sender, new_peer)) => (sender, new_peer),
                 Err(e) => {
