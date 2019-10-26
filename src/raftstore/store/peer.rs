@@ -812,6 +812,8 @@ impl Peer {
                 MessageType::MsgBroadcastResp => {
                     info!(
                         "[follower replication]send MsgBroadcast";
+                        "region_id" => self.region_id,
+                        "peer" => &self.tag,
                         "to" => msg.to,
                         "from" => msg.from,
                     );
@@ -819,6 +821,8 @@ impl Peer {
                 MessageType::MsgBroadcast => {
                     info!(
                         "[follower replication]send MsgBroadcastResp";
+                        "region_id" => self.region_id,
+                        "peer" => &self.tag,
                         "from" => msg.from,
                         "proxy" => msg.proxy,
                     );
