@@ -463,13 +463,6 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
         // Only enable the fail point when the store id is equal to 3, which is
         // the id of slow store in tests.
         fail_point!("on_raft_ready", self.poll_ctx.store_id() == 3, |_| {});
-        if !self.pending_proposals.is_empty() {
-            for prop in self.pending_proposals.drain(..) {
-                self.poll_ctx
-                    .apply_router
-                    .schedule_task(prop.region_id, ApplyTask::Proposal(prop));
-            }
-        }
         if self.poll_ctx.need_flush_trans
             && (!self.poll_ctx.kv_wb.is_empty() || !self.poll_ctx.raft_wb.is_empty())
         {
@@ -566,9 +559,6 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm, StoreFsm> for RaftPoller<T,
         self.poll_ctx.pending_count = 0;
         self.poll_ctx.sync_log = false;
         self.poll_ctx.has_ready = false;
-        if self.pending_proposals.capacity() == 0 {
-            self.pending_proposals = Vec::with_capacity(batch_size);
-        }
         self.timer = SlowTimer::new();
     }
 
