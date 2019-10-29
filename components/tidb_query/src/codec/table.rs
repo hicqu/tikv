@@ -10,9 +10,9 @@ use tidb_query_datatype::FieldTypeTp;
 use tipb::ColumnInfo;
 
 use super::mysql::{Duration, Time};
-use super::{datum, Datum, Error, Result};
+use super::{datum, datum::DatumDecoder, Datum, Error, Result};
 use crate::expr::EvalContext;
-use tikv_util::codec::number::{self, NumberEncoder};
+use codec::prelude::*;
 use tikv_util::codec::BytesSlice;
 use tikv_util::collections::{HashMap, HashSet};
 
@@ -30,19 +30,19 @@ pub const TABLE_PREFIX_KEY_LEN: usize = TABLE_PREFIX_LEN + ID_LEN;
 /// `TableEncoder` encodes the table record/index prefix.
 trait TableEncoder: NumberEncoder {
     fn append_table_record_prefix(&mut self, table_id: i64) -> Result<()> {
-        self.write_all(TABLE_PREFIX)?;
-        self.encode_i64(table_id)?;
-        self.write_all(RECORD_PREFIX_SEP).map_err(Error::from)
+        self.write_bytes(TABLE_PREFIX)?;
+        self.write_i64(table_id)?;
+        self.write_bytes(RECORD_PREFIX_SEP).map_err(Error::from)
     }
 
     fn append_table_index_prefix(&mut self, table_id: i64) -> Result<()> {
-        self.write_all(TABLE_PREFIX)?;
-        self.encode_i64(table_id)?;
-        self.write_all(INDEX_PREFIX_SEP).map_err(Error::from)
+        self.write_bytes(TABLE_PREFIX)?;
+        self.write_i64(table_id)?;
+        self.write_bytes(INDEX_PREFIX_SEP).map_err(Error::from)
     }
 }
 
-impl<T: Write> TableEncoder for T {}
+impl<T: BufferWriter> TableEncoder for T {}
 
 /// Extracts table prefix from table record or index.
 #[inline]
@@ -75,15 +75,14 @@ pub fn check_table_ranges(ranges: &[KeyRange]) -> Result<()> {
 
 /// Decodes table ID from the key.
 pub fn decode_table_id(key: &[u8]) -> Result<i64> {
-    if !key.starts_with(TABLE_PREFIX) {
+    let mut buf = key;
+    if buf.read_bytes(TABLE_PREFIX_LEN)? != TABLE_PREFIX {
         return Err(invalid_type!(
             "record key expected, but got {}",
             hex::encode_upper(key)
         ));
     }
-
-    let mut remaining = &key[TABLE_PREFIX.len()..];
-    number::decode_i64(&mut remaining).map_err(Error::from)
+    buf.read_i64().map_err(Error::from)
 }
 
 /// `flatten` flattens the datum.
@@ -123,7 +122,7 @@ pub fn encode_row_key(table_id: i64, handle: i64) -> Vec<u8> {
     let mut key = Vec::with_capacity(RECORD_ROW_KEY_LEN);
     // can't panic
     key.append_table_record_prefix(table_id).unwrap();
-    key.encode_i64(handle).unwrap();
+    key.write_i64(handle).unwrap();
     key
 }
 
@@ -131,32 +130,29 @@ pub fn encode_row_key(table_id: i64, handle: i64) -> Vec<u8> {
 pub fn encode_column_key(table_id: i64, handle: i64, column_id: i64) -> Vec<u8> {
     let mut key = Vec::with_capacity(RECORD_ROW_KEY_LEN + ID_LEN);
     key.append_table_record_prefix(table_id).unwrap();
-    key.encode_i64(handle).unwrap();
-    key.encode_i64(column_id).unwrap();
+    key.write_i64(handle).unwrap();
+    key.write_i64(column_id).unwrap();
     key
 }
 
 /// `decode_handle` decodes the key and gets the handle.
 pub fn decode_handle(encoded: &[u8]) -> Result<i64> {
-    if !encoded.starts_with(TABLE_PREFIX) {
+    let mut buf = encoded;
+    if buf.read_bytes(TABLE_PREFIX_LEN)? != TABLE_PREFIX {
         return Err(invalid_type!(
             "record key expected, but got {}",
             hex::encode_upper(encoded)
         ));
     }
+    buf.read_i64()?;
 
-    let mut remaining = &encoded[TABLE_PREFIX.len()..];
-    number::decode_i64(&mut remaining)?;
-
-    if !remaining.starts_with(RECORD_PREFIX_SEP) {
+    if buf.read_bytes(RECORD_PREFIX_SEP.len())? != RECORD_PREFIX_SEP {
         return Err(invalid_type!(
             "record key expected, but got {}",
             hex::encode_upper(encoded)
         ));
     }
-
-    remaining = &remaining[RECORD_PREFIX_SEP.len()..];
-    number::decode_i64(&mut remaining).map_err(Error::from)
+    buf.read_i64().map_err(Error::from)
 }
 
 /// `truncate_as_row_key` truncate extra part of a tidb key and just keep the row key part.
@@ -169,7 +165,7 @@ pub fn truncate_as_row_key(key: &[u8]) -> Result<&[u8]> {
 pub fn encode_index_seek_key(table_id: i64, idx_id: i64, encoded: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(PREFIX_LEN + ID_LEN + encoded.len());
     key.append_table_index_prefix(table_id).unwrap();
-    key.encode_i64(idx_id).unwrap();
+    key.write_i64(idx_id).unwrap();
     key.write_all(encoded).unwrap();
     key
 }
@@ -177,17 +173,17 @@ pub fn encode_index_seek_key(table_id: i64, idx_id: i64, encoded: &[u8]) -> Vec<
 // `decode_index_key` decodes datums from an index key.
 pub fn decode_index_key(
     ctx: &EvalContext,
-    mut encoded: &[u8],
+    encoded: &[u8],
     infos: &[ColumnInfo],
 ) -> Result<Vec<Datum>> {
-    encoded = &encoded[PREFIX_LEN + ID_LEN..];
+    let mut buf = &encoded[PREFIX_LEN + ID_LEN..];
     let mut res = vec![];
 
     for info in infos {
-        if encoded.is_empty() {
+        if buf.is_empty() {
             return Err(box_err!("{} is too short.", hex::encode_upper(encoded)));
         }
-        let mut v = datum::decode_datum(&mut encoded)?;
+        let mut v = buf.read_datum()?;
         v = unflatten(ctx, v, info)?;
         res.push(v);
     }
@@ -208,7 +204,9 @@ fn unflatten(ctx: &EvalContext, datum: Datum, field_type: &dyn FieldTypeAccessor
             let t = Time::from_packed_u64(datum.u64(), tp.try_into()?, fsp, &ctx.cfg.tz)?;
             Ok(Datum::Time(t))
         }
-        FieldTypeTp::Duration => Duration::from_nanos(datum.i64(), 0).map(Datum::Dur),
+        FieldTypeTp::Duration => {
+            Duration::from_nanos(datum.i64(), field_type.decimal() as i8).map(Datum::Dur)
+        }
         FieldTypeTp::Enum | FieldTypeTp::Set | FieldTypeTp::Bit => Err(box_err!(
             "unflatten field type {} is not supported yet.",
             tp
@@ -248,7 +246,7 @@ pub fn decode_col_value(
     ctx: &EvalContext,
     col: &ColumnInfo,
 ) -> Result<Datum> {
-    let d = datum::decode_datum(data)?;
+    let d = data.read_datum()?;
     unflatten(ctx, d, col)
 }
 
@@ -369,7 +367,7 @@ pub fn cut_row(data: Vec<u8>, cols: &HashSet<i64>) -> Result<RowColsDict> {
         let length = data.len();
         let mut tmp_data: &[u8] = data.as_ref();
         while !tmp_data.is_empty() && meta_map.len() < cols.len() {
-            let id = datum::decode_datum(&mut tmp_data)?.i64();
+            let id = tmp_data.read_datum()?.i64();
             let offset = length - tmp_data.len();
             let (val, rem) = datum::split_datum(tmp_data, false)?;
             if cols.contains(&id) {
@@ -400,7 +398,7 @@ pub fn cut_idx_key(key: Vec<u8>, col_ids: &[i64]) -> Result<(RowColsDict, Option
         if tmp_data.is_empty() {
             None
         } else {
-            Some(datum::decode_datum(&mut tmp_data)?.i64())
+            Some(tmp_data.read_datum()?.i64())
         }
     };
     Ok((RowColsDict::new(meta_map, key), handle))
@@ -414,6 +412,7 @@ mod tests {
 
     use crate::codec::datum::{self, Datum};
     use tikv_util::collections::{HashMap, HashSet};
+    use tikv_util::map;
 
     use super::*;
 
@@ -428,22 +427,29 @@ mod tests {
 
     #[test]
     fn test_index_key_codec() {
-        let tests = vec![Datum::U64(1), Datum::Bytes(b"123".to_vec()), Datum::I64(-1)];
+        let tests = vec![
+            Datum::U64(1),
+            Datum::Bytes(b"123".to_vec()),
+            Datum::I64(-1),
+            Datum::Dur(Duration::parse(b"12:34:56.666", 2).unwrap()),
+        ];
+
+        let mut duration_col = ColumnInfo::default();
+        duration_col
+            .as_mut_accessor()
+            .set_tp(FieldTypeTp::Duration)
+            .set_decimal(2);
+
         let types = vec![
-            new_col_info(FieldTypeTp::LongLong),
-            new_col_info(FieldTypeTp::VarChar),
-            new_col_info(FieldTypeTp::LongLong),
+            FieldTypeTp::LongLong.into(),
+            FieldTypeTp::VarChar.into(),
+            FieldTypeTp::LongLong.into(),
+            duration_col,
         ];
         let buf = datum::encode_key(&tests).unwrap();
         let encoded = encode_index_seek_key(1, 2, &buf);
         let ctx = EvalContext::default();
         assert_eq!(tests, decode_index_key(&ctx, &encoded, &types).unwrap());
-    }
-
-    fn new_col_info(tp: FieldTypeTp) -> ColumnInfo {
-        let mut col_info = ColumnInfo::default();
-        col_info.as_mut_accessor().set_tp(tp);
-        col_info
     }
 
     fn to_hash_map(row: &RowColsDict) -> HashMap<i64, Vec<u8>> {
@@ -472,18 +478,26 @@ mod tests {
 
     #[test]
     fn test_row_codec() {
+        let mut duration_col = ColumnInfo::default();
+        duration_col
+            .as_mut_accessor()
+            .set_tp(FieldTypeTp::Duration)
+            .set_decimal(2);
+
         let mut cols = map![
-            1 => new_col_info(FieldTypeTp::LongLong),
-            2 => new_col_info(FieldTypeTp::VarChar),
-            3 => new_col_info(FieldTypeTp::NewDecimal),
-            5 => new_col_info(FieldTypeTp::JSON)
+            1 => FieldTypeTp::LongLong.into(),
+            2 => FieldTypeTp::VarChar.into(),
+            3 => FieldTypeTp::NewDecimal.into(),
+            5 => FieldTypeTp::JSON.into(),
+            6 => duration_col
         ];
 
         let mut row = map![
             1 => Datum::I64(100),
             2 => Datum::Bytes(b"abc".to_vec()),
             3 => Datum::Dec(10.into()),
-            5 => Datum::Json(r#"{"name": "John"}"#.parse().unwrap())
+            5 => Datum::Json(r#"{"name": "John"}"#.parse().unwrap()),
+            6 => Datum::Dur(Duration::parse(b"23:23:23.666",2 ).unwrap())
         ];
 
         let col_ids: Vec<_> = row.iter().map(|(&id, _)| id).collect();
@@ -507,7 +521,7 @@ mod tests {
         datums = cut_row_as_owned(&bs, &col_id_set);
         assert_eq!(col_encoded, datums);
 
-        cols.insert(4, new_col_info(FieldTypeTp::Float));
+        cols.insert(4, FieldTypeTp::Float.into());
         let r = decode_row(&mut bs.as_slice(), &mut ctx, &cols).unwrap();
         assert_eq!(row, r);
 
@@ -538,17 +552,28 @@ mod tests {
 
     #[test]
     fn test_idx_codec() {
-        let mut col_ids = vec![1, 2, 3];
+        let mut col_ids = vec![1, 2, 3, 4];
+
+        let mut duration_col = ColumnInfo::default();
+        duration_col
+            .as_mut_accessor()
+            .set_tp(FieldTypeTp::Duration)
+            .set_decimal(2);
+
         let col_types = vec![
-            new_col_info(FieldTypeTp::LongLong),
-            new_col_info(FieldTypeTp::VarChar),
-            new_col_info(FieldTypeTp::NewDecimal),
+            FieldTypeTp::LongLong.into(),
+            FieldTypeTp::VarChar.into(),
+            FieldTypeTp::NewDecimal.into(),
+            duration_col,
         ];
+
         let col_values = vec![
             Datum::I64(100),
             Datum::Bytes(b"abc".to_vec()),
             Datum::Dec(10.into()),
+            Datum::Dur(Duration::parse(b"23:23:23.666", 2).unwrap()),
         ];
+
         let ctx = EvalContext::default();
         let mut col_encoded: HashMap<_, _> = col_ids
             .iter()
@@ -572,17 +597,13 @@ mod tests {
         assert_eq!(col_encoded, res.0);
         assert!(res.1.is_none());
 
-        let handle_data = col_encoded.remove(&3).unwrap();
+        let handle_data = col_encoded.remove(&4).unwrap();
         let handle = if handle_data.is_empty() {
             None
         } else {
-            Some(
-                datum::decode_datum(&mut (handle_data.as_ref() as &[u8]))
-                    .unwrap()
-                    .i64(),
-            )
+            Some((handle_data.as_ref() as &[u8]).read_datum().unwrap().i64())
         };
-        col_ids.remove(2);
+        col_ids.remove(3);
         res = cut_idx_key_as_owned(&bs, &col_ids);
         assert_eq!(col_encoded, res.0);
         assert_eq!(res.1, handle);

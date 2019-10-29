@@ -220,7 +220,7 @@ pub struct PollContext<T, C: 'static> {
     pub ready_res: Vec<(Ready, InvokeContext)>,
     pub need_flush_trans: bool,
     pub queued_snapshot: HashSet<u64>,
-    pub lease_time: Option<Timespec>,
+    pub current_time: Option<Timespec>,
 }
 
 impl<T, C> HandleRaftReadyContext for PollContext<T, C> {
@@ -463,7 +463,16 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
         // Only enable the fail point when the store id is equal to 3, which is
         // the id of slow store in tests.
         fail_point!("on_raft_ready", self.poll_ctx.store_id() == 3, |_| {});
-        if self.poll_ctx.need_flush_trans {
+        if !self.pending_proposals.is_empty() {
+            for prop in self.pending_proposals.drain(..) {
+                self.poll_ctx
+                    .apply_router
+                    .schedule_task(prop.region_id, ApplyTask::Proposal(prop));
+            }
+        }
+        if self.poll_ctx.need_flush_trans
+            && (!self.poll_ctx.kv_wb.is_empty() || !self.poll_ctx.raft_wb.is_empty())
+        {
             self.poll_ctx.trans.flush();
             self.poll_ctx.need_flush_trans = false;
         }
@@ -537,11 +546,6 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
             .append_log
             .observe(duration_to_sec(dur) as f64);
 
-        if self.poll_ctx.need_flush_trans {
-            self.poll_ctx.trans.flush();
-            self.poll_ctx.need_flush_trans = false;
-        }
-
         slow_log!(
             self.timer,
             "{} handle {} pending peers include {} ready, {} entries, {} messages and {} \
@@ -562,7 +566,9 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm, StoreFsm> for RaftPoller<T,
         self.poll_ctx.pending_count = 0;
         self.poll_ctx.sync_log = false;
         self.poll_ctx.has_ready = false;
-        self.poll_ctx.need_flush_trans = false;
+        if self.pending_proposals.capacity() == 0 {
+            self.pending_proposals = Vec::with_capacity(batch_size);
+        }
         self.timer = SlowTimer::new();
     }
 
@@ -642,14 +648,10 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm, StoreFsm> for RaftPoller<T,
     }
 
     fn end(&mut self, peers: &mut [Box<PeerFsm>]) {
-        self.poll_ctx.lease_time = None;
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);
         }
-        if self.poll_ctx.need_flush_trans {
-            self.poll_ctx.trans.flush();
-            self.poll_ctx.need_flush_trans = false;
-        }
+        self.poll_ctx.current_time = None;
         if !self.poll_ctx.queued_snapshot.is_empty() {
             let mut meta = self.poll_ctx.store_meta.lock().unwrap();
             meta.pending_snapshot_regions
@@ -662,6 +664,13 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm, StoreFsm> for RaftPoller<T,
             .observe(duration_to_sec(self.timer.elapsed()) as f64);
         self.poll_ctx.raft_metrics.flush();
         self.poll_ctx.store_stat.flush();
+    }
+
+    fn pause(&mut self) {
+        if self.poll_ctx.need_flush_trans {
+            self.poll_ctx.trans.flush();
+            self.poll_ctx.need_flush_trans = false;
+        }
     }
 }
 
@@ -892,7 +901,7 @@ where
             ready_res: Vec::new(),
             need_flush_trans: false,
             queued_snapshot: HashSet::default(),
-            lease_time: None,
+            current_time: None,
         };
         RaftPoller {
             tag: format!("[store {}]", ctx.store.get_id()),
@@ -1096,6 +1105,7 @@ impl RaftBatchSystem {
             self.router.clone(),
             Arc::clone(&engines.kv),
             workers.pd_worker.scheduler(),
+            cfg.pd_store_heartbeat_tick_interval.as_secs(),
         );
         box_try!(workers.pd_worker.start(pd_runner));
 
@@ -2054,7 +2064,7 @@ fn is_range_covered<'a, F: Fn(u64) -> &'a metapb::Region>(
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::raftstore::coprocessor::properties::{IndexHandle, IndexHandles, SizeProperties};
+    use crate::raftstore::coprocessor::properties::{RangeOffsets, RangeProperties};
     use crate::storage::kv::CompactedEvent;
     use tikv_util::collections::HashMap;
 
@@ -2062,34 +2072,39 @@ mod tests {
 
     #[test]
     fn test_calc_region_declined_bytes() {
-        let index_handle1 = IndexHandle {
-            size: 4 * 1024,
-            offset: 4 * 1024,
-        };
-        let index_handle2 = IndexHandle {
-            size: 4 * 1024,
-            offset: 8 * 1024,
-        };
-        let index_handle3 = IndexHandle {
-            size: 4 * 1024,
-            offset: 12 * 1024,
-        };
-        let mut index_handles = IndexHandles::new();
-        index_handles.add(b"a".to_vec(), index_handle1);
-        index_handles.add(b"b".to_vec(), index_handle2);
-        index_handles.add(b"c".to_vec(), index_handle3);
-        let size_prop = SizeProperties {
-            total_size: 12 * 1024,
-            index_handles,
+        let prop = RangeProperties {
+            offsets: vec![
+                (
+                    b"a".to_vec(),
+                    RangeOffsets {
+                        size: 4 * 1024,
+                        keys: 1,
+                    },
+                ),
+                (
+                    b"b".to_vec(),
+                    RangeOffsets {
+                        size: 8 * 1024,
+                        keys: 2,
+                    },
+                ),
+                (
+                    b"c".to_vec(),
+                    RangeOffsets {
+                        size: 12 * 1024,
+                        keys: 3,
+                    },
+                ),
+            ],
         };
         let event = CompactedEvent {
             cf: "default".to_owned(),
             output_level: 3,
             total_input_bytes: 12 * 1024,
             total_output_bytes: 0,
-            start_key: size_prop.smallest_key().unwrap(),
-            end_key: size_prop.largest_key().unwrap(),
-            input_props: vec![size_prop.into()],
+            start_key: prop.smallest_key().unwrap(),
+            end_key: prop.largest_key().unwrap(),
+            input_props: vec![prop],
             output_props: vec![],
         };
 

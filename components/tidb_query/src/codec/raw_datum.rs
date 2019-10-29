@@ -2,71 +2,72 @@
 
 //! Decoders to decode into a concrete datum.
 
+use codec::prelude::*;
 use tidb_query_datatype::{FieldTypeAccessor, FieldTypeTp};
-use tikv_util::codec::{bytes, number};
 use tipb::FieldType;
 
 use super::data_type::*;
 use crate::codec::datum;
-use crate::codec::mysql::{DecimalDecoder, Tz};
+use crate::codec::mysql::{DecimalDecoder, JsonDecoder, Tz};
 use crate::codec::{Error, Result};
 
 #[inline]
 fn decode_int(v: &mut &[u8]) -> Result<i64> {
-    number::decode_i64(v)
+    v.read_i64()
         .map_err(|_| Error::InvalidDataType("Failed to decode data as i64".to_owned()))
 }
 
 #[inline]
 fn decode_uint(v: &mut &[u8]) -> Result<u64> {
-    number::decode_u64(v)
+    v.read_u64()
         .map_err(|_| Error::InvalidDataType("Failed to decode data as u64".to_owned()))
 }
 
 #[inline]
 fn decode_var_int(v: &mut &[u8]) -> Result<i64> {
-    number::decode_var_i64(v)
+    v.read_var_i64()
         .map_err(|_| Error::InvalidDataType("Failed to decode data as var_i64".to_owned()))
 }
 
 #[inline]
 fn decode_var_uint(v: &mut &[u8]) -> Result<u64> {
-    number::decode_var_u64(v)
+    v.read_var_u64()
         .map_err(|_| Error::InvalidDataType("Failed to decode data as var_u64".to_owned()))
 }
 
 #[inline]
 fn decode_float(v: &mut &[u8]) -> Result<f64> {
-    number::decode_f64(v)
+    v.read_f64()
         .map_err(|_| Error::InvalidDataType("Failed to decode data as f64".to_owned()))
 }
 
 #[inline]
 fn decode_decimal(v: &mut &[u8]) -> Result<Decimal> {
-    v.decode_decimal()
+    v.read_decimal()
         .map_err(|_| Error::InvalidDataType("Failed to decode data as decimal".to_owned()))
 }
 
 #[inline]
 fn decode_bytes(v: &mut &[u8]) -> Result<Vec<u8>> {
-    bytes::decode_bytes(v, false)
+    v.read_comparable_bytes()
         .map_err(|_| Error::InvalidDataType("Failed to decode data as bytes".to_owned()))
 }
 
 #[inline]
 fn decode_compact_bytes(v: &mut &[u8]) -> Result<Vec<u8>> {
-    bytes::decode_compact_bytes(v)
+    v.read_compact_bytes()
         .map_err(|_| Error::InvalidDataType("Failed to decode data as compact bytes".to_owned()))
 }
 
 #[inline]
 fn decode_json(v: &mut &[u8]) -> Result<Json> {
-    Json::decode(v).map_err(|_| Error::InvalidDataType("Failed to decode data as json".to_owned()))
+    v.read_json()
+        .map_err(|_| Error::InvalidDataType("Failed to decode data as json".to_owned()))
 }
 
 #[inline]
-fn decode_duration_from_i64(v: i64) -> Result<Duration> {
-    Duration::from_nanos(v, 0)
+fn decode_duration_from_i64(v: i64, field_type: &FieldType) -> Result<Duration> {
+    Duration::from_nanos(v, field_type.as_accessor().decimal() as i8)
         .map_err(|_| Error::InvalidDataType("Failed to decode i64 as duration".to_owned()))
 }
 
@@ -199,7 +200,10 @@ pub fn decode_date_time_datum(
     }
 }
 
-pub fn decode_duration_datum(mut raw_datum: &[u8]) -> Result<Option<Duration>> {
+pub fn decode_duration_datum(
+    mut raw_datum: &[u8],
+    field_type: &FieldType,
+) -> Result<Option<Duration>> {
     if raw_datum.is_empty() {
         return Err(Error::InvalidDataType(
             "Failed to decode datum flag".to_owned(),
@@ -212,13 +216,13 @@ pub fn decode_duration_datum(mut raw_datum: &[u8]) -> Result<Option<Duration>> {
         // In index, it's flag is `DURATION`. See TiDB's `encode()`.
         datum::DURATION_FLAG => {
             let v = decode_int(&mut raw_datum)?;
-            let v = decode_duration_from_i64(v)?;
+            let v = decode_duration_from_i64(v, field_type)?;
             Ok(Some(v))
         }
         // In record, it's flag is `VAR_INT`. See TiDB's `flatten()` and `encode()`.
         datum::VAR_INT_FLAG => {
             let v = decode_var_int(&mut raw_datum)?;
-            let v = decode_duration_from_i64(v)?;
+            let v = decode_duration_from_i64(v, field_type)?;
             Ok(Some(v))
         }
         _ => Err(Error::InvalidDataType(format!(
@@ -282,8 +286,8 @@ impl<'a> RawDatumDecoder<DateTime> for &'a [u8] {
 }
 
 impl<'a> RawDatumDecoder<Duration> for &'a [u8] {
-    fn decode(self, _field_type: &FieldType, _time_zone: &Tz) -> Result<Option<Duration>> {
-        decode_duration_datum(self)
+    fn decode(self, field_type: &FieldType, _time_zone: &Tz) -> Result<Option<Duration>> {
+        decode_duration_datum(self, field_type)
     }
 }
 

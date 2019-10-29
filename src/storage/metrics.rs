@@ -11,6 +11,8 @@ make_static_metric! {
         cleanup,
         rollback,
         pessimistic_rollback,
+        txn_heart_beat,
+        check_txn_status,
         scan_lock,
         resolve_lock,
         resolve_lock_lite,
