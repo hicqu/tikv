@@ -25,6 +25,16 @@ pub trait Iterator {
     fn prev(&mut self) -> Result<bool>;
     fn next(&mut self) -> Result<bool>;
 
+    fn scan<F>(&mut self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        let mut remained = self.valid()?;
+        while remained {
+            remained = f(it.key(), it.value())? && it.next()?;
+        }
+    }
+        
     /// Only be called when `self.valid() == Ok(true)`.
     fn key(&self) -> &[u8];
     /// Only be called when `self.valid() == Ok(true)`.
@@ -54,7 +64,8 @@ pub trait Iterable {
         let start = KeyBuilder::from_slice(start_key, DATA_KEY_PREFIX_LEN, 0);
         let end = KeyBuilder::from_slice(end_key, DATA_KEY_PREFIX_LEN, 0);
         let iter_opt = IterOptions::new(Some(start), Some(end), fill_cache);
-        scan_impl(self.iterator_opt(iter_opt)?, start_key, f)
+        let mut iter = self.iterator_opt(iter_opt)?;
+        iter.scan(f)
     }
 
     // like `scan`, only on a specific column family.
@@ -72,17 +83,19 @@ pub trait Iterable {
         let start = KeyBuilder::from_slice(start_key, DATA_KEY_PREFIX_LEN, 0);
         let end = KeyBuilder::from_slice(end_key, DATA_KEY_PREFIX_LEN, 0);
         let iter_opt = IterOptions::new(Some(start), Some(end), fill_cache);
-        scan_impl(self.iterator_cf_opt(cf, iter_opt)?, start_key, f)
+        let mut iter = self.iterator_opt(iter_opt)?;
+        iter.scan(f)
     }
 
     // Seek the first key >= given key, if not found, return None.
-    fn seek(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    fn seek(&self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
         let mut iter = self.iterator()?;
         if iter.seek(SeekKey::Key(key))? {
-            let (k, v) = (iter.key().to_vec(), iter.value().to_vec());
-            return Ok(Some((k, v)));
+            return Ok(Some((iter.key(), iter.value())));
         }
         Ok(None)
+    }
+    fn seek(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     }
 
     // Seek the first key >= given key, if not found, return None.
