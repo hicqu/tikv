@@ -356,6 +356,45 @@ fn test_read_after_cleanup_range_for_snap() {
     rx1.recv_timeout(Duration::from_secs(5)).unwrap();
 }
 
+#[test]
+fn test_replica_read_become_leader_with_read() {
+    let mut cluster = new_node_cluster(0, 2);
+
+    configure_for_lease_read(&mut cluster, Some(50), Some(30));
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+    cluster.run();
+
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+
+    let region = pd_client.get_region(b"k1").unwrap();
+
+    let peer_on_store1 = find_peer(&region, 1).unwrap().to_owned();
+    let peer_on_store2 = find_peer(&region, 2).unwrap().to_owned();
+
+    cluster.must_transfer_leader(region.get_id(), peer_on_store1);
+
+    let filter = Box::new(
+        RegionPacketFilter::new(1, 2)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgReadIndexResp)
+            .when(Arc::new(AtomicBool::new(true)))
+    );
+    cluster.sim.wl().add_recv_filter(2, filter);
+
+    let resp1_ch = async_read_on_peer(
+        &mut cluster,
+        peer_on_store2.clone(),
+        region.clone(),
+        b"k2",
+        true,
+        true,
+    );
+
+    cluster.must_transfer_leader(region.get_id(), peer_on_store2);
+}
+
 fn must_truncated_to(engine: Arc<DB>, region_id: u64, index: u64) {
     for _ in 1..300 {
         let apply_state: RaftApplyState = engine
