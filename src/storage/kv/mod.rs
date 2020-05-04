@@ -13,7 +13,7 @@ use std::{error, ptr, result};
 
 use engine_rocks::RocksTablePropertiesCollection;
 use engine_traits::IterOptions;
-use engine_traits::{CfName, CF_DEFAULT};
+use engine_traits::{CfName, DeleteStrategy, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::errorpb::Error as ErrorHeader;
 use kvproto::kvrpcpb::Context;
 use txn_types::{Key, Value};
@@ -26,6 +26,7 @@ pub use self::stats::{
     CfStatistics, FlowStatistics, FlowStatsReporter, Statistics, StatisticsSummary,
 };
 use into_other::IntoOther;
+use tikv_util::time::Instant;
 
 pub const SEEK_BOUND: u64 = 8;
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
@@ -118,6 +119,84 @@ pub trait Engine: Send + Clone + 'static {
         _end: &[u8],
     ) -> Result<RocksTablePropertiesCollection> {
         Err(box_err!("no user properties"))
+    }
+
+    fn delete_files_in_range_cf(
+        &self,
+        _cf: &str,
+        _start_key: &[u8],
+        _end_key: &[u8],
+    ) -> Result<()> {
+        Err(box_err!("not support delete files in range cf"))
+    }
+
+    fn delete_all_in_range_cf(
+        &self,
+        _cf: &str,
+        _strategy: DeleteStrategy,
+        _start_key: &[u8],
+        _end_key: &[u8],
+    ) -> Result<()> {
+        Err(box_err!("not support delete all in range cf"))
+    }
+
+    fn unsafe_destroy_range(&self, sst_dir: String, start: &Key, end: &Key) -> Result<()> {
+        self.unsafe_destroy_range_impl(sst_dir, start, end)
+    }
+
+    fn unsafe_destroy_range_impl(
+        &self,
+        sst_path: String,
+        start_key: &Key,
+        end_key: &Key,
+    ) -> Result<()> {
+        let start_data_key = keys::data_key(start_key.as_encoded());
+        let end_data_key = keys::data_end_key(end_key.as_encoded());
+        let cfs = &[CF_LOCK, CF_DEFAULT, CF_WRITE];
+        // First, call delete_files_in_range to free as much disk space as possible
+        let delete_files_start_time = Instant::now();
+        for cf in cfs {
+            self.delete_files_in_range_cf(cf, &start_data_key, &end_data_key)
+                .map_err(|e| {
+                    let e: Error = box_err!(e);
+                    warn!(
+                        "unsafe destroy range failed at delete_files_in_range_cf"; "err" => ?e
+                    );
+                    e
+                })?;
+        }
+
+        info!(
+            "unsafe destroy range finished deleting files in range";
+            "start_key" => %start_key, "end_key" => %end_key, "cost_time" => ?delete_files_start_time.elapsed()
+        );
+
+        // Then, delete all remaining keys in the range.
+        let cleanup_all_start_time = Instant::now();
+        for cf in cfs {
+            let cf_strategy = if *cf == CF_LOCK {
+                DeleteStrategy::DeleteByKey
+            } else {
+                DeleteStrategy::DeleteByWriter {
+                    sst_path: sst_path.clone() + cf,
+                }
+            };
+            self.delete_all_in_range_cf(cf, cf_strategy, &start_data_key, &end_data_key)
+                .map_err(|e| {
+                    let e: Error = box_err!(e);
+                    warn!(
+                        "unsafe destroy range failed at delete_all_in_range_cf"; "err" => ?e
+                    );
+                    e
+                })?;
+        }
+
+        let cleanup_all_time_cost = cleanup_all_start_time.elapsed();
+        info!(
+            "unsafe destroy range finished cleaning up all";
+            "start_key" => %start_key, "end_key" => %end_key, "cost_time" => ?cleanup_all_time_cost,
+        );
+        Ok(())
     }
 }
 

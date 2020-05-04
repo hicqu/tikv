@@ -61,6 +61,7 @@ use tikv_util::config::VersionTrack;
 use tikv_util::{
     check_environment_variables,
     config::ensure_dir_exist,
+    file::TempFileManager,
     security::SecurityManager,
     sys::sys_quota::SysQuota,
     time::Monitor,
@@ -125,6 +126,7 @@ struct TiKVServer {
     coprocessor_host: Option<CoprocessorHost<RocksEngine>>,
     to_stop: Vec<Box<dyn Stop>>,
     lock_files: Vec<File>,
+    tempfile_mgr: Arc<TempFileManager>,
 }
 
 struct Engines {
@@ -169,11 +171,14 @@ impl TiKVServer {
         let mut coprocessor_host = Some(CoprocessorHost::new(router.clone()));
         let region_info_accessor = RegionInfoAccessor::new(coprocessor_host.as_mut().unwrap());
         region_info_accessor.start();
+        let path = store_path.join("temp_file_dir_for_ingest");
+        let tempfile_mgr = Arc::new(TempFileManager::new(path));
 
         TiKVServer {
             config,
             cfg_controller: Some(cfg_controller),
             security_mgr,
+            tempfile_mgr,
             pd_client,
             router,
             system: Some(system),
@@ -395,8 +400,8 @@ impl TiKVServer {
         let engines = self.engines.as_ref().unwrap();
         let mut gc_worker = GcWorker::new(
             engines.engine.clone(),
+            self.tempfile_mgr.clone(),
             Some(engines.engines.kv.c().clone()),
-            Some(engines.raft_router.clone()),
             Some(self.region_info_accessor.clone()),
             self.config.gc.clone(),
         );
@@ -556,6 +561,7 @@ impl TiKVServer {
         );
 
         let auto_split_controller = AutoSplitController::new(split_config_manager);
+        let tempfile_mgr = self.tempfile_mgr.clone();
 
         let mut node = Node::new(
             self.system.take().unwrap(),
@@ -569,6 +575,7 @@ impl TiKVServer {
             engines.engines.clone(),
             server.transport(),
             snap_mgr,
+            tempfile_mgr,
             pd_worker,
             engines.store_meta.clone(),
             coprocessor_host,

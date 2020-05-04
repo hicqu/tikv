@@ -1,6 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::f64::INFINITY;
+use std::path::Path;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 use tikv::config::{ConfigController, Module, TiKvConfig};
@@ -25,7 +26,8 @@ fn setup_cfg_controller(
     cfg: TiKvConfig,
 ) -> (GcWorker<tikv::storage::kv::RocksEngine>, ConfigController) {
     let engine = TestEngineBuilder::new().build().unwrap();
-    let mut gc_worker = GcWorker::new(engine, None, None, None, cfg.gc.clone());
+    let data_dir = Path::new("./");
+    let mut gc_worker = GcWorker::new(engine, data_dir.to_path_buf(), None, None, cfg.gc.clone());
     gc_worker.start().unwrap();
 
     let cfg_controller = ConfigController::new(cfg);

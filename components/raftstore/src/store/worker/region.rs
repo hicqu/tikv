@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use std::u64;
 
 use engine_rocks::RocksEngine;
-use engine_traits::CF_RAFT;
+use engine_traits::{DeleteStrategy, CF_LOCK, CF_RAFT};
 use engine_traits::{KvEngine, KvEngines, Mutable};
 use kvproto::raft_serverpb::{PeerState, RaftApplyState, RegionLocalState};
 use raft::eraftpb::Snapshot as RaftSnapshot;
@@ -33,6 +33,7 @@ use tikv_util::timer::Timer;
 use tikv_util::worker::{Runnable, RunnableWithTimer};
 
 use super::metrics::*;
+use tikv_util::file::TempFileManager;
 
 const GENERATE_POOL_SIZE: usize = 2;
 
@@ -214,6 +215,7 @@ where
     engines: KvEngines<EK, ER>,
     batch_size: usize,
     mgr: SnapManager<EK>,
+    tempfile_mgr: Arc<TempFileManager>,
     use_delete_range: bool,
     clean_stale_peer_delay: Duration,
     pending_delete_ranges: PendingDeleteRanges,
@@ -312,10 +314,7 @@ where
         let end_key = keys::enc_end_key(&region);
         check_abort(&abort)?;
         self.cleanup_overlap_ranges(&start_key, &end_key);
-        box_try!(self
-            .engines
-            .kv
-            .delete_all_in_range(&start_key, &end_key, self.use_delete_range));
+        self.delete_all_in_range(&start_key, &end_key)?;
         check_abort(&abort)?;
         fail_point!("apply_snap_cleanup_range");
 
@@ -422,11 +421,7 @@ where
                 return;
             }
         }
-        if let Err(e) =
-            self.engines
-                .kv
-                .delete_all_in_range(start_key, end_key, self.use_delete_range)
-        {
+        if let Err(e) = self.delete_all_in_range(start_key, end_key) {
             error!(
                 "failed to delete data in range";
                 "region_id" => region_id,
@@ -533,6 +528,22 @@ where
         }
         false
     }
+
+    fn delete_all_in_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<()> {
+        for cf in self.engines.kv.cf_names() {
+            let strategy = if self.use_delete_range && cf != CF_LOCK {
+                DeleteStrategy::DeleteByRange
+            } else {
+                let sst_path = self.tempfile_mgr.allocate_new_file_name();
+                DeleteStrategy::DeleteByWriter { sst_path }
+            };
+            box_try!(self
+                .engines
+                .kv
+                .delete_all_in_range_cf(cf, strategy, &start_key, &end_key));
+        }
+        Ok(())
+    }
 }
 
 pub struct Runner<EK, ER, R>
@@ -556,6 +567,7 @@ where
     pub fn new(
         engines: KvEngines<EK, ER>,
         mgr: SnapManager<EK>,
+        tempfile_mgr: Arc<TempFileManager>,
         batch_size: usize,
         use_delete_range: bool,
         clean_stale_peer_delay: Duration,
@@ -570,6 +582,7 @@ where
             ctx: SnapContext {
                 engines,
                 mgr,
+                tempfile_mgr,
                 batch_size,
                 use_delete_range,
                 clean_stale_peer_delay,

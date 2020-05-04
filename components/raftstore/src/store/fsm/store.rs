@@ -68,6 +68,7 @@ use pd_client::PdClient;
 use sst_importer::SSTImporter;
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::config::{Tracker, VersionTrack};
+use tikv_util::file::TempFileManager;
 use tikv_util::mpsc::{self, LooseBoundedSender, Receiver};
 use tikv_util::time::{duration_to_sec, Instant as TiInstant};
 use tikv_util::timer::SteadyTimer;
@@ -756,6 +757,7 @@ pub struct RaftPollerBuilder<T, C> {
     store_meta: Arc<Mutex<StoreMeta>>,
     future_poller: ThreadPoolSender,
     snap_mgr: SnapManager<RocksEngine>,
+    tempfile_mgr: Arc<TempFileManager>,
     pub coprocessor_host: CoprocessorHost<RocksEngine>,
     trans: T,
     pd_client: Arc<C>,
@@ -1030,6 +1032,7 @@ impl RaftBatchSystem {
         trans: T,
         pd_client: Arc<C>,
         mgr: SnapManager<RocksEngine>,
+        tempfile_mgr: Arc<TempFileManager>,
         pd_worker: FutureWorker<PdTask<RocksEngine>>,
         store_meta: Arc<Mutex<StoreMeta>>,
         mut coprocessor_host: CoprocessorHost<RocksEngine>,
@@ -1081,6 +1084,7 @@ impl RaftBatchSystem {
             store_meta,
             applying_snap_count: Arc::new(AtomicUsize::new(0)),
             future_poller: workers.future_poller.sender().clone(),
+            tempfile_mgr,
         };
         let region_peers = builder.init()?;
         let engine = builder.engines.kv.clone();
@@ -1114,6 +1118,7 @@ impl RaftBatchSystem {
         auto_split_controller: AutoSplitController,
     ) -> Result<()> {
         builder.snap_mgr.init()?;
+        let tempfile_mgr = builder.tempfile_mgr.clone();
 
         let engines = builder.engines.clone();
         let snap_mgr = builder.snap_mgr.clone();
@@ -1173,6 +1178,7 @@ impl RaftBatchSystem {
         let region_runner = RegionRunner::new(
             engines.clone(),
             snap_mgr,
+            tempfile_mgr,
             cfg.snap_apply_batch_size.0 as usize,
             cfg.use_delete_range,
             cfg.clean_stale_peer_delay.0,

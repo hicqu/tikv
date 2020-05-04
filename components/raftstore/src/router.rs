@@ -37,7 +37,9 @@ where
         )
     }
 
-    fn broadcast_unreachable(&self, store_id: u64);
+    fn send_store(&self, _msg: StoreMsg) -> RaftStoreResult<()> {
+        Ok(())
+    }
 
     /// Reports the sending snapshot status to the peer of the Region.
     fn report_snapshot_status(
@@ -81,8 +83,6 @@ where
         Ok(())
     }
 
-    fn broadcast_unreachable(&self, _: u64) {}
-
     fn casual_send(&self, _: u64, _: CasualMessage<E>) -> RaftStoreResult<()> {
         Ok(())
     }
@@ -111,15 +111,6 @@ where
             router,
             local_reader,
         }
-    }
-
-    pub fn send_store(&self, msg: StoreMsg) -> RaftStoreResult<()> {
-        self.router.send_control(msg).map_err(|e| {
-            RaftStoreError::Transport(match e {
-                TrySendError::Full(_) => DiscardReason::Full,
-                TrySendError::Disconnected(_) => DiscardReason::Disconnected,
-            })
-        })
     }
 }
 
@@ -174,9 +165,12 @@ where
             .map_err(|e| handle_send_error(region_id, e))
     }
 
-    fn broadcast_unreachable(&self, store_id: u64) {
-        let _ = self
-            .router
-            .send_control(StoreMsg::StoreUnreachable { store_id });
+    fn send_store(&self, msg: StoreMsg) -> RaftStoreResult<()> {
+        self.router.send_control(msg).map_err(|e| {
+            RaftStoreError::Transport(match e {
+                TrySendError::Full(_) => DiscardReason::Full,
+                TrySendError::Disconnected(_) => DiscardReason::Disconnected,
+            })
+        })
     }
 }

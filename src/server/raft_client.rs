@@ -18,6 +18,7 @@ use grpcio::{
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::tikvpb::{BatchRaftMessage, TikvClient};
 use raftstore::router::RaftStoreRouter;
+use raftstore::store::msg::StoreMsg;
 use tikv_util::collections::{HashMap, HashMapEntry};
 use tikv_util::mpsc::batch::{self, BatchCollector, Sender as BatchSender};
 use tikv_util::security::SecurityManager;
@@ -121,7 +122,7 @@ impl Conn {
                     REPORT_FAILURE_MSG_COUNTER
                         .with_label_values(&["unreachable", &*store_id.to_string()])
                         .inc();
-                    router.broadcast_unreachable(store_id);
+                    let _ = router.send_store(StoreMsg::StoreUnreachable { store_id });
                 })
                 .map(|_| ()),
         );

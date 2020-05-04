@@ -13,7 +13,7 @@ use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
 
 use raftstore::router::RaftStoreRouter;
-use raftstore::store::{Callback, CasualMessage, SignificantMsg, Transport};
+use raftstore::store::{Callback, CasualMessage, SignificantMsg, StoreMsg, Transport};
 use raftstore::{DiscardReason, Error, Result};
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::{Either, HandyRwLock};
@@ -199,8 +199,8 @@ impl<C: RaftStoreRouter<RocksEngine>> RaftStoreRouter<RocksEngine> for SimulateT
         self.ch.casual_send(region_id, msg)
     }
 
-    fn broadcast_unreachable(&self, store_id: u64) {
-        self.ch.broadcast_unreachable(store_id)
+    fn send_store(&self, msg: StoreMsg) {
+        self.ch.send_store(msg)
     }
 
     fn significant_send(&self, region_id: u64, msg: SignificantMsg) -> Result<()> {

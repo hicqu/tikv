@@ -12,7 +12,7 @@ use engine::rocks::util::CFOptions;
 use engine::rocks::{ColumnFamilyOptions, DBIterator, SeekKey as DBSeekKey, DB};
 use engine::Engines;
 use engine_rocks::{Compat, RocksEngineIterator};
-use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
+use engine_traits::{CfName, DeleteStrategy, MiscExt, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use engine_traits::{IterOptions, Iterable, Iterator, Mutable, Peekable, SeekKey, WriteBatchExt};
 use kvproto::kvrpcpb::Context;
 use tempfile::{Builder, TempDir};
@@ -284,6 +284,28 @@ impl Engine for RocksEngine {
         }
         box_try!(self.sched.schedule(Task::Snapshot(cb)));
         Ok(())
+    }
+
+    fn delete_all_in_range_cf(
+        &self,
+        cf: &str,
+        strategy: DeleteStrategy,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> Result<()> {
+        self.engines
+            .kv
+            .c()
+            .delete_all_in_range_cf(cf, strategy, start_key, end_key)
+            .map_err(|e| e.into())
+    }
+
+    fn delete_files_in_range_cf(&self, cf: &str, start_key: &[u8], end_key: &[u8]) -> Result<()> {
+        self.engines
+            .kv
+            .c()
+            .delete_files_in_range_cf(cf, start_key, end_key, false)
+            .map_err(|e| e.into())
     }
 }
 

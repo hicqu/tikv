@@ -345,7 +345,7 @@ mod tests {
             Ok(())
         }
 
-        fn broadcast_unreachable(&self, _: u64) {
+        fn send_store(&self, msg: StoreMsg) {
             let _ = self.tx.send(1);
         }
     }

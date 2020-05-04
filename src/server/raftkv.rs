@@ -1,16 +1,17 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use engine_rocks::{RocksEngine, RocksSnapshot, RocksTablePropertiesCollection};
-use engine_traits::CfName;
 use engine_traits::IterOptions;
-use engine_traits::CF_DEFAULT;
-use engine_traits::{Peekable, TablePropertiesExt};
+use engine_traits::{CfName, DeleteStrategy};
+use engine_traits::{Iterable, MiscExt, Peekable, TablePropertiesExt};
+use engine_traits::{CF_DEFAULT, CF_LOCK, CF_RAFT};
 use kvproto::errorpb;
 use kvproto::kvrpcpb::Context;
 use kvproto::raft_cmdpb::{
     CmdType, DeleteRangeRequest, DeleteRequest, PutRequest, RaftCmdRequest, RaftCmdResponse,
     RaftRequestHeader, Request, Response,
 };
+use kvproto::raft_serverpb::RegionLocalState;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io::Error as IoError;
 use std::result;
@@ -25,6 +26,7 @@ use crate::storage::kv::{
 use crate::storage::{self, kv};
 use raftstore::errors::Error as RaftServerError;
 use raftstore::router::RaftStoreRouter;
+use raftstore::store::msg::StoreMsg;
 use raftstore::store::{Callback as StoreCallback, ReadResponse, WriteResponse};
 use raftstore::store::{RegionIterator, RegionSnapshot};
 use tikv_util::time::Instant;
@@ -398,6 +400,91 @@ impl<S: RaftStoreRouter<RocksEngine>> Engine for RaftKv<S> {
         self.engine
             .get_range_properties_cf(cf, &start, &end)
             .map_err(|e| e.into())
+    }
+
+    fn delete_all_in_range_cf(
+        &self,
+        cf: &str,
+        strategy: DeleteStrategy,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> kv::Result<()> {
+        self.engine
+            .delete_all_in_range_cf(cf, strategy, start_key, end_key)
+            .map_err(|e| e.into())
+    }
+
+    fn delete_files_in_range_cf(
+        &self,
+        cf: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> kv::Result<()> {
+        let mut region_ranges = vec![];
+        let start_data_key = start_key.to_vec();
+        let end_data_key = end_key.to_vec();
+        if cf != CF_LOCK {
+            let ret = self
+                .engine
+                .scan_cf(
+                    CF_RAFT,
+                    keys::REGION_META_MIN_KEY,
+                    keys::REGION_META_MAX_KEY,
+                    false,
+                    |key, value| {
+                        let (_, suffix) = box_try!(keys::decode_region_meta_key(key));
+                        if suffix != keys::REGION_STATE_SUFFIX {
+                            return Ok(true);
+                        }
+                        let local_state = protobuf::parse_from_bytes::<RegionLocalState>(value)?;
+                        let region = local_state.get_region();
+                        let key = keys::enc_end_key(region);
+                        if key > start_data_key && key < end_data_key {
+                            region_ranges.push(key);
+                        }
+                        Ok(true)
+                    },
+                )
+                .map_err(|e| e.into());
+            if ret.is_err() {
+                return ret;
+            }
+        }
+        region_ranges.sort();
+        const DELETE_REGION_LIMIT: usize = 8;
+        let l = region_ranges.len() / DELETE_REGION_LIMIT;
+        for i in 1..l {
+            // Ignore error because we will delete it again.
+            let _ = self.engine.delete_files_in_range_cf(
+                cf,
+                start_key,
+                &region_ranges[i * DELETE_REGION_LIMIT],
+                false,
+            );
+        }
+        info!(
+                "unsafe destroy range finished deleting regions in range";
+                "region_count" => region_ranges.len()
+        );
+        self.engine
+            .delete_files_in_range_cf(cf, start_key, end_key, false)
+            .map_err(|e| e.into())
+    }
+
+    fn unsafe_destroy_range(&self, sst_path: String, start: &Key, end: &Key) -> kv::Result<()> {
+        self.unsafe_destroy_range_impl(sst_path, start, end)?;
+        self.router
+            .send_store(StoreMsg::ClearRegionSizeInRange {
+                start_key: start.as_encoded().to_vec(),
+                end_key: end.as_encoded().to_vec(),
+            })
+            .unwrap_or_else(|e| {
+                warn!(
+                    "unsafe destroy range: failed sending ClearRegionSizeInRange";
+                    "err" => ?e
+                );
+            });
+        Ok(())
     }
 }
 

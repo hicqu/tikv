@@ -7,7 +7,7 @@ use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::raft_serverpb::RaftMessage;
 use raftstore::errors::{Error as RaftStoreError, Result as RaftStoreResult};
 use raftstore::router::{handle_send_error, RaftStoreRouter};
-use raftstore::store::msg::{Callback, CasualMessage, PeerMsg, SignificantMsg};
+use raftstore::store::msg::{Callback, CasualMessage, PeerMsg, SignificantMsg, StoreMsg};
 use tikv_util::collections::HashMap;
 use tikv_util::mpsc::{loose_bounded, LooseBoundedSender, Receiver};
 
@@ -57,7 +57,7 @@ impl RaftStoreRouter<RocksEngine> for MockRaftStoreRouter {
     fn send_command(&self, _: RaftCmdRequest, _: Callback<RocksSnapshot>) -> RaftStoreResult<()> {
         unimplemented!()
     }
-    fn broadcast_unreachable(&self, _: u64) {
+    fn send_store(&self, _: StoreMsg) {
         unimplemented!()
     }
 }

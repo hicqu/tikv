@@ -5,11 +5,11 @@ use std::fmt::{self, Display, Formatter};
 use std::mem;
 use std::sync::mpsc;
 use std::sync::{atomic, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use engine_rocks::{RocksEngine, RocksSnapshot};
-use engine_traits::{MiscExt, TablePropertiesExt};
-use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_traits::TablePropertiesExt;
+use engine_traits::CF_WRITE;
 use futures::Future;
 use kvproto::kvrpcpb::{Context, IsolationLevel, LockInfo};
 use kvproto::metapb;
@@ -24,10 +24,9 @@ use crate::storage::mvcc::{
 };
 use pd_client::PdClient;
 use raftstore::coprocessor::{CoprocessorHost, RegionInfoAccessor, RegionInfoProvider};
-use raftstore::router::ServerRaftStoreRouter;
-use raftstore::store::msg::StoreMsg;
 use raftstore::store::RegionSnapshot;
 use tikv_util::config::{Tracker, VersionTrack};
+use tikv_util::file::TempFileManager;
 use tikv_util::time::{duration_to_sec, Limiter, SlowTimer};
 use tikv_util::worker::{
     FutureRunnable, FutureScheduler, FutureWorker, Stopped as FutureWorkerStopped,
@@ -137,7 +136,6 @@ impl Display for GcTask {
 struct GcRunner<E: Engine> {
     engine: E,
     local_storage: Option<RocksEngine>,
-    raft_store_router: Option<ServerRaftStoreRouter<RocksEngine>>,
     region_info_accessor: Option<RegionInfoAccessor>,
 
     /// Used to limit the write flow of GC.
@@ -145,6 +143,7 @@ struct GcRunner<E: Engine> {
 
     cfg: GcConfig,
     cfg_tracker: Tracker<GcConfig>,
+    temp_file_manager: Arc<TempFileManager>,
 
     stats: Statistics,
 }
@@ -152,9 +151,9 @@ struct GcRunner<E: Engine> {
 impl<E: Engine> GcRunner<E> {
     pub fn new(
         engine: E,
-        local_storage: Option<RocksEngine>,
-        raft_store_router: Option<ServerRaftStoreRouter<RocksEngine>>,
+        temp_file_manager: Arc<TempFileManager>,
         cfg_tracker: Tracker<GcConfig>,
+        local_storage: Option<RocksEngine>,
         region_info_accessor: Option<RegionInfoAccessor>,
         cfg: GcConfig,
     ) -> Self {
@@ -166,11 +165,11 @@ impl<E: Engine> GcRunner<E> {
         Self {
             engine,
             local_storage,
-            raft_store_router,
             region_info_accessor,
             limiter,
             cfg,
             cfg_tracker,
+            temp_file_manager,
             stats: Statistics::default(),
         }
     }
@@ -403,85 +402,10 @@ impl<E: Engine> GcRunner<E> {
     }
 
     fn unsafe_destroy_range(&self, _: &Context, start_key: &Key, end_key: &Key) -> Result<()> {
-        info!(
-            "unsafe destroy range started";
-            "start_key" => %start_key, "end_key" => %end_key
-        );
-
-        // TODO: Refine usage of errors
-
-        let local_storage = self.local_storage.as_ref().ok_or_else(|| {
-            let e: Error = box_err!("unsafe destroy range not supported: local_storage not set");
-            warn!("unsafe destroy range failed"; "err" => ?e);
-            e
-        })?;
-
-        // Convert keys to RocksDB layer form
-        // TODO: Logic coupled with raftstore's implementation. Maybe better design is to do it in
-        // somewhere of the same layer with apply_worker.
-        let start_data_key = keys::data_key(start_key.as_encoded());
-        let end_data_key = keys::data_end_key(end_key.as_encoded());
-
-        let cfs = &[CF_LOCK, CF_DEFAULT, CF_WRITE];
-
-        // First, call delete_files_in_range to free as much disk space as possible
-        let delete_files_start_time = Instant::now();
-        for cf in cfs {
-            local_storage
-                .delete_files_in_range_cf(cf, &start_data_key, &end_data_key, false)
-                .map_err(|e| {
-                    let e: Error = box_err!(e);
-                    warn!(
-                        "unsafe destroy range failed at delete_files_in_range_cf"; "err" => ?e
-                    );
-                    e
-                })?;
-        }
-
-        info!(
-            "unsafe destroy range finished deleting files in range";
-            "start_key" => %start_key, "end_key" => %end_key, "cost_time" => ?delete_files_start_time.elapsed()
-        );
-
-        // Then, delete all remaining keys in the range.
-        let cleanup_all_start_time = Instant::now();
-        for cf in cfs {
-            // TODO: set use_delete_range with config here.
-            local_storage
-                .delete_all_in_range_cf(cf, &start_data_key, &end_data_key, false)
-                .map_err(|e| {
-                    let e: Error = box_err!(e);
-                    warn!(
-                        "unsafe destroy range failed at delete_all_in_range_cf"; "err" => ?e
-                    );
-                    e
-                })?;
-        }
-
-        let cleanup_all_time_cost = cleanup_all_start_time.elapsed();
-
-        if let Some(router) = self.raft_store_router.as_ref() {
-            router
-                .send_store(StoreMsg::ClearRegionSizeInRange {
-                    start_key: start_key.as_encoded().to_vec(),
-                    end_key: end_key.as_encoded().to_vec(),
-                })
-                .unwrap_or_else(|e| {
-                    // Warn and ignore it.
-                    warn!(
-                        "unsafe destroy range: failed sending ClearRegionSizeInRange";
-                        "err" => ?e
-                    );
-                });
-        } else {
-            warn!("unsafe destroy range: can't clear region size information: raft_store_router not set");
-        }
-
-        info!(
-            "unsafe destroy range finished cleaning up all";
-            "start_key" => %start_key, "end_key" => %end_key, "cost_time" => ?cleanup_all_time_cost,
-        );
-        Ok(())
+        let sst_dir = self.temp_file_manager.allocate_new_file_name();
+        self.engine
+            .unsafe_destroy_range(sst_dir, start_key, end_key)
+            .map_err(|e| e.into())
     }
 
     fn handle_physical_scan_lock(
@@ -657,8 +581,7 @@ pub struct GcWorker<E: Engine> {
     engine: E,
     /// `local_storage` represent the underlying RocksDB of the `engine`.
     local_storage: Option<RocksEngine>,
-    /// `raft_store_router` is useful to signal raftstore clean region size informations.
-    raft_store_router: Option<ServerRaftStoreRouter<RocksEngine>>,
+
     /// Access the region's meta before getting snapshot, which will wake hibernating regions up.
     /// This is useful to do the `need_gc` check without waking hibernatin regions up.
     /// This is not set for tests.
@@ -678,6 +601,7 @@ pub struct GcWorker<E: Engine> {
     applied_lock_collector: Option<Arc<AppliedLockCollector>>,
 
     gc_manager_handle: Arc<Mutex<Option<GcManagerHandle>>>,
+    temp_file_manager: Arc<TempFileManager>,
 }
 
 impl<E: Engine> Clone for GcWorker<E> {
@@ -688,7 +612,6 @@ impl<E: Engine> Clone for GcWorker<E> {
         Self {
             engine: self.engine.clone(),
             local_storage: self.local_storage.clone(),
-            raft_store_router: self.raft_store_router.clone(),
             config_manager: self.config_manager.clone(),
             region_info_accessor: self.region_info_accessor.clone(),
             scheduled_tasks: self.scheduled_tasks.clone(),
@@ -697,6 +620,7 @@ impl<E: Engine> Clone for GcWorker<E> {
             worker_scheduler: self.worker_scheduler.clone(),
             applied_lock_collector: self.applied_lock_collector.clone(),
             gc_manager_handle: self.gc_manager_handle.clone(),
+            temp_file_manager: self.temp_file_manager.clone(),
         }
     }
 }
@@ -720,8 +644,8 @@ impl<E: Engine> Drop for GcWorker<E> {
 impl<E: Engine> GcWorker<E> {
     pub fn new(
         engine: E,
+        temp_file_manager: Arc<TempFileManager>,
         local_storage: Option<RocksEngine>,
-        raft_store_router: Option<ServerRaftStoreRouter<RocksEngine>>,
         region_info_accessor: Option<RegionInfoAccessor>,
         cfg: GcConfig,
     ) -> GcWorker<E> {
@@ -730,7 +654,7 @@ impl<E: Engine> GcWorker<E> {
         GcWorker {
             engine,
             local_storage,
-            raft_store_router,
+            temp_file_manager,
             config_manager: GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg))),
             region_info_accessor,
             scheduled_tasks: Arc::new(atomic::AtomicUsize::new(0)),
@@ -756,12 +680,12 @@ impl<E: Engine> GcWorker<E> {
     pub fn start(&mut self) -> Result<()> {
         let runner = GcRunner::new(
             self.engine.clone(),
-            self.local_storage.take(),
-            self.raft_store_router.take(),
+            self.temp_file_manager.clone(),
             self.config_manager
                 .0
                 .clone()
                 .tracker("gc-worker".to_owned()),
+            self.local_storage.take(),
             self.region_info_accessor.take(),
             self.config_manager.value().clone(),
         );
@@ -928,6 +852,7 @@ mod tests {
     use kvproto::metapb;
     use std::collections::BTreeMap;
     use std::sync::mpsc::channel;
+    use tempfile::TempDir;
     use tikv_util::codec::number::NumberEncoder;
     use tikv_util::future::paired_future_callback;
     use txn_types::Mutation;
@@ -1021,6 +946,9 @@ mod tests {
         end_key: &[u8],
     ) -> Result<()> {
         // Return Result from this function so we can use the `wait_op` macro here.
+        let tmp_dir = TempDir::new().unwrap();
+        let dir_path = tmp_dir.path().to_path_buf();
+        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
 
         let engine = TestEngineBuilder::new().build().unwrap();
         let storage = TestStorageBuilder::from_engine(engine.clone())
@@ -1029,8 +957,8 @@ mod tests {
         let db = engine.get_rocksdb();
         let mut gc_worker = GcWorker::new(
             engine,
+            tmp_mgr,
             Some(db.c().clone()),
-            None,
             None,
             GcConfig::default(),
         );
@@ -1185,6 +1113,9 @@ mod tests {
 
     #[test]
     fn test_physical_scan_lock() {
+        let tmp_dir = TempDir::new().unwrap();
+        let dir_path = tmp_dir.path().to_path_buf();
+
         let engine = TestEngineBuilder::new().build().unwrap();
         let db = engine.get_rocksdb();
         let prefixed_engine = PrefixedEngine(engine);
@@ -1193,8 +1124,8 @@ mod tests {
             .unwrap();
         let mut gc_worker = GcWorker::new(
             prefixed_engine,
+            dir_path,
             Some(db.c().clone()),
-            None,
             None,
             GcConfig::default(),
         );
