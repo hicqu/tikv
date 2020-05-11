@@ -100,15 +100,41 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                     .set_cf(cf)
                     .set_in_memory(true);
                 let mut sst_writer = builder.build(sst_path.as_str())?;
+                let mut data = vec![];
+                let mut use_sst_writer = false;
                 while it_valid {
-                    sst_writer.delete(it.key())?;
+                    if use_sst_writer {
+                        sst_writer.delete(it.key())?;
+                    } else {
+                        data.push(it.key().to_vec());
+                        if data.len() > MAX_DELETE_BATCH_SIZE * 8 {
+                            for key in data.iter() {
+                                sst_writer.delete(key)?;
+                            }
+                            data.clear();
+                            use_sst_writer = true;
+                        }
+                    }
                     it_valid = it.next()?;
                 }
-                sst_writer.finish()?;
-                let handle = self.cf_handle(cf)?;
-                let mut opt = Self::IngestExternalFileOptions::new();
-                opt.move_files(true);
-                return self.ingest_external_file_cf(handle, &opt, &[sst_path.as_str()]);
+                if use_sst_writer {
+                    sst_writer.finish()?;
+                    let handle = self.cf_handle(cf)?;
+                    let mut opt = Self::IngestExternalFileOptions::new();
+                    opt.move_files(true);
+                    return self.ingest_external_file_cf(handle, &opt, &[sst_path.as_str()]);
+                } else {
+                    for key in data.iter() {
+                        wb.delete_cf(cf, key)?;
+                        if wb.count() >= MAX_DELETE_BATCH_SIZE {
+                            self.write(&wb)?;
+                            wb.clear();
+                        }
+                    }
+                    if wb.count() > 0 {
+                        self.write(&wb)?;
+                    }
+                }
             }
         }
         Ok(())

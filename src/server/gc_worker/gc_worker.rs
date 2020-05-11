@@ -1115,6 +1115,7 @@ mod tests {
     fn test_physical_scan_lock() {
         let tmp_dir = TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_path_buf();
+        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
 
         let engine = TestEngineBuilder::new().build().unwrap();
         let db = engine.get_rocksdb();
@@ -1122,9 +1123,10 @@ mod tests {
         let storage = TestStorageBuilder::from_engine(prefixed_engine.clone())
             .build()
             .unwrap();
+
         let mut gc_worker = GcWorker::new(
             prefixed_engine,
-            dir_path,
+            tmp_mgr,
             Some(db.c().clone()),
             None,
             GcConfig::default(),

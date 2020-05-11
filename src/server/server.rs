@@ -292,6 +292,8 @@ mod tests {
     use engine_rocks::{RocksEngine, RocksSnapshot};
     use kvproto::raft_cmdpb::RaftCmdRequest;
     use kvproto::raft_serverpb::RaftMessage;
+    use tempfile::TempDir;
+    use tikv_util::file::TempFileManager;
     use tikv_util::security::SecurityConfig;
 
     #[derive(Clone)]
@@ -345,8 +347,9 @@ mod tests {
             Ok(())
         }
 
-        fn send_store(&self, msg: StoreMsg) {
+        fn send_store(&self, _msg: StoreMsg) -> RaftStoreResult<()> {
             let _ = self.tx.send(1);
+            Ok(())
         }
     }
 
@@ -367,10 +370,17 @@ mod tests {
     fn test_peer_resolve() {
         let mut cfg = Config::default();
         cfg.addr = "127.0.0.1:0".to_owned();
-
+        let tmp_dir = TempDir::new().unwrap();
+        let dir_path = tmp_dir.path().to_path_buf();
+        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
         let storage = TestStorageBuilder::new().build().unwrap();
-        let mut gc_worker =
-            GcWorker::new(storage.get_engine(), None, None, None, Default::default());
+        let mut gc_worker = GcWorker::new(
+            storage.get_engine(),
+            tmp_mgr,
+            None,
+            None,
+            Default::default(),
+        );
         gc_worker.start().unwrap();
 
         let (tx, rx) = mpsc::channel();

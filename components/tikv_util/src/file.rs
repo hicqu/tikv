@@ -167,7 +167,7 @@ impl TempFileManager {
             }
         }
         for f in deletes {
-            fs::remove_file(f);
+            let _ = fs::remove_file(f);
         }
     }
 }
