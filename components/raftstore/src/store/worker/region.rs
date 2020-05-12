@@ -829,7 +829,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let dir_path = temp_dir.path().join("tmp_dir");
-        let tmp_mgr = Arc::new(TempFileManager::new(dir_path.to_path_buf()));
+        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
 
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_level_zero_slowdown_writes_trigger(5);
