@@ -29,6 +29,7 @@ use tikv::server::Node;
 use tikv::server::Result as ServerResult;
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::config::VersionTrack;
+use tikv_util::file::TempFileManager;
 use tikv_util::worker::{FutureWorker, Worker};
 
 pub struct ChannelTransportCore {
@@ -209,7 +210,14 @@ impl Simulator for NodeCluster {
             let &(ref snap_mgr, _) = &trans.snap_paths[&node_id];
             (snap_mgr.clone(), None)
         };
-
+        let tmp_mgr = {
+            let tmp_dir = Builder::new()
+                .prefix("test_cluster_tmp_mgr")
+                .tempdir()
+                .unwrap();
+            let dir_path = tmp_dir.path().to_path_buf();
+            Arc::new(TempFileManager::new(dir_path))
+        };
         // Create coprocessor.
         let mut coprocessor_host = CoprocessorHost::new(router.clone());
 
@@ -252,6 +260,7 @@ impl Simulator for NodeCluster {
             engines.clone(),
             simulate_trans.clone(),
             snap_mgr.clone(),
+            tmp_mgr.clone(),
             pd_worker,
             store_meta,
             coprocessor_host,

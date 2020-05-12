@@ -4275,6 +4275,7 @@ dependencies = [
  "futures 0.1.29",
  "kvproto",
  "raftstore",
+ "tempfile",
  "test_raftstore",
  "tikv",
  "tikv_util",

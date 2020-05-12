@@ -199,7 +199,7 @@ impl<C: RaftStoreRouter<RocksEngine>> RaftStoreRouter<RocksEngine> for SimulateT
         self.ch.casual_send(region_id, msg)
     }
 
-    fn send_store(&self, msg: StoreMsg) {
+    fn send_store(&self, msg: StoreMsg) -> Result<()> {
         self.ch.send_store(msg)
     }
 

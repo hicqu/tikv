@@ -13,7 +13,7 @@ use engine::Engines;
 use engine_rocks::RocksEngine;
 use engine_rocks::{Compat, RocksSnapshot, RocksSstWriterBuilder};
 use engine_traits::{
-    CompactExt, MiscExt, SstWriter, SstWriterBuilder, ALL_CFS, CF_DEFAULT, CF_WRITE,
+    CompactExt, DeleteStrategy, MiscExt, SstWriter, SstWriterBuilder, ALL_CFS, CF_DEFAULT, CF_WRITE,
 };
 use keys::data_key;
 use kvproto::metapb::{Peer, Region};
@@ -314,9 +314,9 @@ fn test_delete_files_in_range_for_titan() {
         .kv
         .c()
         .delete_all_in_range(
+            DeleteStrategy::DeleteByKey,
             &data_key(Key::from_raw(b"a").as_encoded()),
             &data_key(Key::from_raw(b"b").as_encoded()),
-            false,
         )
         .unwrap();
 

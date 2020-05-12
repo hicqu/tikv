@@ -39,6 +39,7 @@ use tikv::server::{
 use tikv::storage;
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::config::VersionTrack;
+use tikv_util::file::TempFileManager;
 use tikv_util::security::SecurityManager;
 use tikv_util::worker::{FutureWorker, Worker};
 
@@ -134,6 +135,14 @@ impl Simulator for ServerCluster {
             let p = self.snap_paths[&node_id].path().to_str().unwrap();
             (p.to_owned(), None)
         };
+        let tmp_mgr = {
+            let tmp_dir = Builder::new()
+                .prefix("test_cluster_tmp_mgr")
+                .tempdir()
+                .unwrap();
+            let dir_path = tmp_dir.path().to_path_buf();
+            Arc::new(TempFileManager::new(dir_path))
+        };
 
         // Now we cache the store address, so here we should re-use last
         // listening address for the same store.
@@ -172,8 +181,8 @@ impl Simulator for ServerCluster {
 
         let mut gc_worker = GcWorker::new(
             engine.clone(),
+            tmp_mgr.clone(),
             Some(engines.kv.c().clone()),
-            Some(raft_router.clone()),
             Some(region_info_accessor.clone()),
             cfg.gc.clone(),
         );
@@ -302,6 +311,7 @@ impl Simulator for ServerCluster {
             engines,
             simulate_trans.clone(),
             snap_mgr,
+            tmp_mgr,
             pd_worker,
             store_meta,
             coprocessor_host,

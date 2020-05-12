@@ -20,6 +20,7 @@ use engine_traits::ALL_CFS;
 use pd_client::PdClient;
 use tempfile::TempDir;
 use tikv_util::config::VersionTrack;
+use tikv_util::file::TempFileManager;
 use tikv_util::worker::{FutureWorker, Worker};
 
 #[derive(Clone)]
@@ -79,6 +80,10 @@ fn start_raftstore(
             .to_string();
         SnapManager::new(p, Some(raft_router.clone()))
     };
+    let tmp_mgr = {
+        let p = dir.path().join("temp-file-dir");
+        Arc::new(TempFileManager::new(p))
+    };
     let store_meta = Arc::new(Mutex::new(StoreMeta::new(0)));
     let cfg_track = Arc::new(VersionTrack::new(cfg.raft_store.clone()));
     let cfg_controller = ConfigController::new(cfg);
@@ -96,6 +101,7 @@ fn start_raftstore(
             MockTransport,
             Arc::new(MockPdClient),
             snap_mgr,
+            tmp_mgr,
             pd_worker,
             store_meta,
             host,

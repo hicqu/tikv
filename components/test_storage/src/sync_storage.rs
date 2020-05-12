@@ -4,6 +4,8 @@ use futures::Future;
 
 use kvproto::kvrpcpb::{Context, LockInfo};
 use raftstore::coprocessor::RegionInfoProvider;
+use std::sync::Arc;
+use tempfile::Builder;
 use tikv::server::gc_worker::{AutoGcConfig, GcConfig, GcSafePointProvider, GcWorker};
 use tikv::storage::config::Config;
 use tikv::storage::kv::RocksEngine;
@@ -12,6 +14,7 @@ use tikv::storage::{
     txn::commands, Engine, Result, Storage, TestEngineBuilder, TestStorageBuilder, TxnStatus,
 };
 use tikv_util::collections::HashMap;
+use tikv_util::file::TempFileManager;
 use txn_types::{Key, KvPair, Mutation, TimeStamp, Value};
 
 /// A builder to build a `SyncTestStorage`.
@@ -57,9 +60,17 @@ impl<E: Engine> SyncTestStorageBuilder<E> {
         if let Some(config) = self.config.take() {
             builder = builder.config(config);
         }
+        let tmp_mgr = {
+            let tmp_dir = Builder::new()
+                .prefix("test_cluster_tmp_mgr")
+                .tempdir()
+                .unwrap();
+            let dir_path = tmp_dir.path().to_path_buf();
+            Arc::new(TempFileManager::new(dir_path))
+        };
         let mut gc_worker = GcWorker::new(
             self.engine,
-            None,
+            tmp_mgr,
             None,
             None,
             self.gc_config.unwrap_or_default(),

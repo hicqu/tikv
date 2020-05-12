@@ -25,6 +25,7 @@ use test_raftstore::*;
 use tikv::coprocessor::REQ_TYPE_DAG;
 use tikv::import::SSTImporter;
 use tikv::storage::mvcc::{Lock, LockType, TimeStamp};
+use tikv_util::file::TempFileManager;
 use tikv_util::worker::{FutureWorker, Worker};
 use tikv_util::HandyRwLock;
 use txn_types::Key;
@@ -922,6 +923,14 @@ fn test_double_run_node() {
         let dir = Path::new(engines.kv.path()).join("import-sst");
         Arc::new(SSTImporter::new(dir, None).unwrap())
     };
+    let tmp_mgr = {
+        let tmp_dir = Builder::new()
+            .prefix("test_cluster_tmp_mgr")
+            .tempdir()
+            .unwrap();
+        let dir_path = tmp_dir.path().to_path_buf();
+        Arc::new(TempFileManager::new(dir_path))
+    };
 
     let store_meta = Arc::new(Mutex::new(StoreMeta::new(20)));
     let e = node
@@ -929,6 +938,7 @@ fn test_double_run_node() {
             engines,
             simulate_trans,
             snap_mgr,
+            tmp_mgr,
             pd_worker,
             store_meta,
             coprocessor_host,
