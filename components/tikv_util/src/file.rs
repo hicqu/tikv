@@ -142,11 +142,11 @@ impl TempFileManager {
         let mut core = self.core.lock().unwrap();
         core.file_timestamp = std::cmp::max(now.sec as u64, core.file_timestamp + 1);
         let filename = TEMP_FILE_PREFIX.to_owned() + &core.file_timestamp.to_string() + "_";
-        return core.dir.join(filename).to_str().unwrap().to_string();
+        core.dir.join(filename).to_str().unwrap().to_string()
     }
 
     pub fn clear_timeout_file(&self, timeout: Duration) {
-        let _ = self.core.lock().unwrap();
+        let _guard = self.core.lock().unwrap();
         let paths = fs::read_dir("./").unwrap();
         let now = monotonic_raw_now();
         let mut deletes = vec![];

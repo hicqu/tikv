@@ -260,7 +260,7 @@ impl Simulator for NodeCluster {
             engines.clone(),
             simulate_trans.clone(),
             snap_mgr.clone(),
-            tmp_mgr.clone(),
+            tmp_mgr,
             pd_worker,
             store_meta,
             coprocessor_host,
