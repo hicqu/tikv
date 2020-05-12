@@ -739,6 +739,7 @@ mod tests {
     use kvproto::raft_serverpb::{PeerState, RaftApplyState, RegionLocalState};
     use raft::eraftpb::Entry;
     use tempfile::Builder;
+    use tikv_util::file::TempFileManager;
     use tikv_util::time;
     use tikv_util::timer::Timer;
     use tikv_util::worker::Worker;
@@ -827,6 +828,9 @@ mod tests {
             .prefix("test_pending_applies")
             .tempdir()
             .unwrap();
+        let dir_path = temp_dir.path().join("tmp_dir").to_path_buf();
+        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
+
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_level_zero_slowdown_writes_trigger(5);
         cf_opts.set_disable_auto_compactions(true);
@@ -875,6 +879,7 @@ mod tests {
         let runner = RegionRunner::new(
             engines.c(),
             mgr,
+            tmp_mgr,
             0,
             true,
             Duration::from_secs(0),
