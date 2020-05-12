@@ -215,8 +215,8 @@ impl Simulator for NodeCluster {
                 .prefix("test_cluster_tmp_mgr")
                 .tempdir()
                 .unwrap();
-            let dir_path = tmp_dir.path().to_path_buf();
-            Arc::new(TempFileManager::new(dir_path))
+            let dir_path = tmp_dir.path();
+            Arc::new(TempFileManager::new(dir_path.to_path_buf()))
         };
         // Create coprocessor.
         let mut coprocessor_host = CoprocessorHost::new(router.clone());
