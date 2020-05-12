@@ -18,7 +18,7 @@ use engine_traits::{ALL_CFS, CF_DEFAULT};
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::{
     cmd_resp, util, Callback, CasualMessage, RaftCommand, ReadResponse, RegionSnapshot,
-    SignificantMsg, WriteResponse,
+    SignificantMsg, StoreMsg, WriteResponse,
 };
 use raftstore::Result;
 use tikv::server::raftkv::{CmdRes, RaftKv};
@@ -81,7 +81,9 @@ impl RaftStoreRouter<RocksEngine> for SyncBenchRouter {
         Ok(())
     }
 
-    fn broadcast_unreachable(&self, _: u64) {}
+    fn send_store(&self, _: StoreMsg) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn new_engine() -> (TempDir, Arc<DB>) {

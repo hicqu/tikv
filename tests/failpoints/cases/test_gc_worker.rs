@@ -1,4 +1,5 @@
 use std::sync::mpsc::channel;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -7,11 +8,23 @@ use test_storage::new_raft_engine;
 use tikv::server::gc_worker::{GcWorker, GC_MAX_EXECUTING_TASKS};
 use tikv::storage;
 
+use tempfile::Builder;
+use tikv_util::file::TempFileManager;
+
 #[test]
 fn test_gcworker_busy() {
     let snapshot_fp = "raftkv_async_snapshot";
     let (_cluster, engine, ctx) = new_raft_engine(3, "");
-    let mut gc_worker = GcWorker::new(engine, None, None, None, Default::default());
+    let tmp_mgr = {
+        let tmp_dir = Builder::new()
+            .prefix("test_cluster_tmp_mgr")
+            .tempdir()
+            .unwrap();
+        let dir_path = tmp_dir.path().to_path_buf();
+        Arc::new(TempFileManager::new(dir_path))
+    };
+
+    let mut gc_worker = GcWorker::new(engine, tmp_mgr, None, None, Default::default());
     gc_worker.start().unwrap();
 
     fail::cfg(snapshot_fp, "pause").unwrap();
