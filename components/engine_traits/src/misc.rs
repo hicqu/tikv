@@ -19,6 +19,12 @@ use tikv_util::keybuilder::KeyBuilder;
 
 pub const MAX_DELETE_BATCH_SIZE: usize = 256;
 
+#[cfg(test)]
+const MAX_DELETE_COUNT_BY_KEY: usize = 4;
+
+#[cfg(not(test))]
+const MAX_DELETE_COUNT_BY_KEY: usize = 2048;
+
 #[derive(Clone)]
 pub enum DeleteStrategy {
     DeleteByKey,
@@ -43,13 +49,18 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
         include_end: bool,
     ) -> Result<()>;
 
-    fn delete_all_in_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<()> {
+    fn delete_all_in_range(
+        &self,
+        strategy: DeleteStrategy,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> Result<()> {
         if start_key >= end_key {
             return Ok(());
         }
 
         for cf in self.cf_names() {
-            self.delete_all_in_range_cf(cf, DeleteStrategy::DeleteByKey, start_key, end_key)?;
+            self.delete_all_in_range_cf(cf, strategy.clone(), start_key, end_key)?;
         }
 
         Ok(())
@@ -95,10 +106,7 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                 }
             }
             DeleteStrategy::DeleteByWriter { sst_path } => {
-                let builder = Self::SstWriterBuilder::new()
-                    .set_db(self)
-                    .set_cf(cf)
-                    .set_in_memory(true);
+                let builder = Self::SstWriterBuilder::new().set_db(self).set_cf(cf);
                 let mut sst_writer = builder.build(sst_path.as_str())?;
                 let mut data = vec![];
                 let mut use_sst_writer = false;
@@ -107,7 +115,7 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                         sst_writer.delete(it.key())?;
                     } else {
                         data.push(it.key().to_vec());
-                        if data.len() > MAX_DELETE_BATCH_SIZE * 8 {
+                        if data.len() > MAX_DELETE_COUNT_BY_KEY {
                             for key in data.iter() {
                                 sst_writer.delete(key)?;
                             }
