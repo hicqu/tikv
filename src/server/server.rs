@@ -292,9 +292,9 @@ mod tests {
     use engine_rocks::{RocksEngine, RocksSnapshot};
     use kvproto::raft_cmdpb::RaftCmdRequest;
     use kvproto::raft_serverpb::RaftMessage;
+    use security::SecurityConfig;
     use tempfile::TempDir;
     use tikv_util::file::TempFileManager;
-    use security::SecurityConfig;
 
     #[derive(Clone)]
     struct MockResolver {
