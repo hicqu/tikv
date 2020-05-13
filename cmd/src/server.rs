@@ -312,6 +312,10 @@ impl TiKVServer {
             );
         }
 
+        if let Err(e) = self.tempfile_mgr.init() {
+            fatal!("initial tempfile manager failed, err: {:?}", e);
+        }
+
         // We truncate a big file to make sure that both raftdb and kvdb of TiKV have enough space to compaction when TiKV recover. This file is created in data_dir rather than db_path, because we must not increase store size of db_path.
         tikv_util::reserve_space_for_recover(
             &self.config.storage.data_dir,

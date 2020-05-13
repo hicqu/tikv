@@ -6,7 +6,6 @@ use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::time::Duration;
 use openssl::error::ErrorStack;
 use openssl::hash::{self, Hasher, MessageDigest};
 
@@ -137,17 +136,11 @@ impl TempFileManager {
         }
     }
 
-    pub fn allocate_new_file_name(&self) -> String {
-        let now = monotonic_raw_now();
-        let mut core = self.core.lock().unwrap();
-        core.file_timestamp = std::cmp::max(now.sec as u64, core.file_timestamp + 1);
-        let filename = TEMP_FILE_PREFIX.to_owned() + &core.file_timestamp.to_string() + "_";
-        core.dir.join(filename).to_str().unwrap().to_string()
-    }
-
-    pub fn clear_timeout_file(&self, timeout: Duration) {
-        let _guard = self.core.lock().unwrap();
-        let paths = fs::read_dir("./").unwrap();
+    pub fn init(&self) -> io::Result<()> {
+        let timeout = 60;
+        let core = self.core.lock().unwrap();
+        create_dir_if_not_exist(core.dir.as_path())?;
+        let paths = fs::read_dir("./")?;
         let now = monotonic_raw_now();
         let mut deletes = vec![];
 
@@ -158,7 +151,7 @@ impl TempFileManager {
                     let entries: Vec<&str> = filename.split('_').collect();
                     if entries.len() >= 2 {
                         if let Ok(create_time) = entries[1].to_string().parse::<u64>() {
-                            if timeout.as_secs() + create_time < now.sec as u64 {
+                            if timeout + create_time < now.sec as u64 {
                                 deletes.push(f);
                             }
                         }
@@ -167,8 +160,17 @@ impl TempFileManager {
             }
         }
         for f in deletes {
-            let _ = fs::remove_file(f);
+            fs::remove_file(f)?;
         }
+        Ok(())
+    }
+
+    pub fn allocate_new_file_name(&self) -> String {
+        let now = monotonic_raw_now();
+        let mut core = self.core.lock().unwrap();
+        core.file_timestamp = std::cmp::max(now.sec as u64, core.file_timestamp + 1);
+        let filename = TEMP_FILE_PREFIX.to_owned() + &core.file_timestamp.to_string() + "_";
+        core.dir.join(filename).to_str().unwrap().to_string()
     }
 }
 
