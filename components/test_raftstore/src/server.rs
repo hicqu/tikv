@@ -71,6 +71,7 @@ pub struct ServerCluster {
     pub pending_services: HashMap<u64, PendingServices>,
     pub coprocessor_hooks: HashMap<u64, CopHooks>,
     snap_paths: HashMap<u64, TempDir>,
+    tmp_mgrs: HashMap<u64, (Arc<TempFileManager>, TempDir)>,
     pd_client: Arc<TestPdClient>,
     raft_client: RaftClient<RaftStoreBlackHole>,
 }
@@ -100,6 +101,7 @@ impl ServerCluster {
             region_info_accessors: HashMap::default(),
             importers: HashMap::default(),
             snap_paths: HashMap::default(),
+            tmp_mgrs: HashMap::default(),
             pending_services: HashMap::default(),
             coprocessor_hooks: HashMap::default(),
             raft_client,
@@ -135,15 +137,20 @@ impl Simulator for ServerCluster {
             let p = self.snap_paths[&node_id].path().to_str().unwrap();
             (p.to_owned(), None)
         };
-        let tmp_mgr = {
-            let tmp_dir = Builder::new()
-                .prefix("test_cluster_tmp_mgr")
-                .tempdir()
-                .unwrap();
-            let dir_path = tmp_dir.path();
-            Arc::new(TempFileManager::new(dir_path.to_path_buf()))
-        };
-
+        let tmp_mgr = self
+            .tmp_mgrs
+            .entry(node_id)
+            .or_insert_with(|| {
+                let tmp_dir = Builder::new()
+                    .prefix("test_cluster_tmp_mgr")
+                    .tempdir()
+                    .unwrap();
+                let dir_path = tmp_dir.path();
+                let mgr = Arc::new(TempFileManager::new(dir_path.to_path_buf()));
+                (mgr, tmp_dir)
+            })
+            .0
+            .clone();
         // Now we cache the store address, so here we should re-use last
         // listening address for the same store.
         if let Some(addr) = self.addrs.get(&node_id) {

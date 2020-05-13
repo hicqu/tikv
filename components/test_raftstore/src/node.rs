@@ -34,6 +34,7 @@ use tikv_util::worker::{FutureWorker, Worker};
 
 pub struct ChannelTransportCore {
     snap_paths: HashMap<u64, (SnapManager<RocksEngine>, TempDir)>,
+    tmp_mgrs: HashMap<u64, (Arc<TempFileManager>, TempDir)>,
     routers: HashMap<u64, SimulateTransport<ServerRaftStoreRouter<RocksEngine>>>,
 }
 
@@ -48,6 +49,7 @@ impl ChannelTransport {
             core: Arc::new(Mutex::new(ChannelTransportCore {
                 snap_paths: HashMap::default(),
                 routers: HashMap::default(),
+                tmp_mgrs: HashMap::default(),
             })),
         }
     }
@@ -210,14 +212,25 @@ impl Simulator for NodeCluster {
             let &(ref snap_mgr, _) = &trans.snap_paths[&node_id];
             (snap_mgr.clone(), None)
         };
-        let tmp_mgr = {
-            let tmp_dir = Builder::new()
-                .prefix("test_cluster_tmp_mgr")
-                .tempdir()
-                .unwrap();
-            let dir_path = tmp_dir.path();
-            Arc::new(TempFileManager::new(dir_path.to_path_buf()))
-        };
+        let tmp_mgr = self
+            .trans
+            .core
+            .lock()
+            .unwrap()
+            .tmp_mgrs
+            .entry(node_id)
+            .or_insert_with(|| {
+                let tmp_dir = Builder::new()
+                    .prefix("test_cluster_tmp_mgr")
+                    .tempdir()
+                    .unwrap();
+                let dir_path = tmp_dir.path();
+                let mgr = Arc::new(TempFileManager::new(dir_path.to_path_buf()));
+                (mgr, tmp_dir)
+            })
+            .0
+            .clone();
+
         // Create coprocessor.
         let mut coprocessor_host = CoprocessorHost::new(router.clone());
 
