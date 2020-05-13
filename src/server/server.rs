@@ -21,7 +21,7 @@ use crate::storage::{Engine, Storage};
 use engine_rocks::RocksEngine;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::SnapManager;
-use tikv_util::security::SecurityManager;
+use security::SecurityManager;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
 use tikv_util::worker::Worker;
 use tikv_util::Either;
@@ -294,7 +294,7 @@ mod tests {
     use kvproto::raft_serverpb::RaftMessage;
     use tempfile::TempDir;
     use tikv_util::file::TempFileManager;
-    use tikv_util::security::SecurityConfig;
+    use security::SecurityConfig;
 
     #[derive(Clone)]
     struct MockResolver {

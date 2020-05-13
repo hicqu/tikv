@@ -22,6 +22,7 @@ use raftstore::store::fsm::store::{StoreMeta, PENDING_VOTES_CAP};
 use raftstore::store::fsm::{ApplyRouter, RaftBatchSystem, RaftRouter};
 use raftstore::store::{AutoSplitController, Callback, LocalReader, SnapManager, SplitCheckRunner};
 use raftstore::Result;
+use security::SecurityManager;
 use tikv::config::{ConfigController, TiKvConfig};
 use tikv::coprocessor;
 use tikv::import::{ImportSSTService, SSTImporter};
@@ -40,7 +41,6 @@ use tikv::storage;
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::config::VersionTrack;
 use tikv_util::file::TempFileManager;
-use tikv_util::security::SecurityManager;
 use tikv_util::worker::{FutureWorker, Worker};
 
 type SimulateStoreTransport = SimulateTransport<ServerRaftStoreRouter<RocksEngine>>;

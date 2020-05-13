@@ -860,7 +860,7 @@ mod tests {
                 engine.kv.flush_cf(cf, true).unwrap();
                 // check level 0 files
                 assert_eq!(
-                    rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+                    engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
                     u64::from(i) + 1
                 );
             }
@@ -975,7 +975,7 @@ mod tests {
         // snapshot will not ingest cause already write stall
         gen_and_apply_snap(1);
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             6
         );
 
@@ -986,7 +986,7 @@ mod tests {
             .compact_files_in_range(None, None, None)
             .unwrap();
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             0
         );
 
@@ -996,7 +996,7 @@ mod tests {
         // note that when ingest sst, it may flush memtable if overlap,
         // so here will two level 0 files.
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             2
         );
 
@@ -1004,24 +1004,24 @@ mod tests {
         gen_and_apply_snap(2);
         wait_apply_finish(2);
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             4
         );
 
         // snapshot will not ingest cause it may cause write stall
         gen_and_apply_snap(3);
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             4
         );
         gen_and_apply_snap(4);
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             4
         );
         gen_and_apply_snap(5);
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             4
         );
 
@@ -1032,7 +1032,7 @@ mod tests {
             .compact_files_in_range(None, None, None)
             .unwrap();
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             0
         );
 
@@ -1042,7 +1042,7 @@ mod tests {
         // before two pending apply tasks should be finished and snapshots are ingested
         // and one still in pending.
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             4
         );
 
@@ -1053,14 +1053,14 @@ mod tests {
             .compact_files_in_range(None, None, None)
             .unwrap();
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             0
         );
         wait_apply_finish(5);
 
         // the last one pending task finished
         assert_eq!(
-            rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
+            engine_rocks::util::get_cf_num_files_at_level(&engine.kv, cf, 0).unwrap(),
             2
         );
     }
