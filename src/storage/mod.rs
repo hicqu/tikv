@@ -23,8 +23,8 @@ mod types;
 pub use self::{
     errors::{get_error_kind_from_header, get_tag_from_header, Error, ErrorHeaderKind, ErrorInner},
     kv::{
-        CfStatistics, Cursor, Engine, FlowStatistics, FlowStatsReporter, Iterator, RocksEngine,
-        ScanMode, Snapshot, Statistics, TestEngineBuilder,
+        CbContext, CfStatistics, Cursor, Engine, FlowStatistics, FlowStatsReporter, Iterator,
+        RocksEngine, ScanMode, Snapshot, Statistics, TestEngineBuilder,
     },
     read_pool::{build_read_pool, build_read_pool_for_test},
     txn::{ProcessResult, Scanner, SnapshotStore, Store},
@@ -35,7 +35,7 @@ use crate::read_pool::{ReadPool, ReadPoolHandle};
 use crate::storage::metrics::CommandKind;
 use crate::storage::{
     config::Config,
-    kv::{with_tls_engine, Error as EngineError, ErrorInner as EngineErrorInner, Modify},
+    kv::{with_tls_engine, Modify},
     lock_manager::{DummyLockManager, LockManager},
     metrics::*,
     txn::{
@@ -186,19 +186,10 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         self.engine.clone()
     }
 
-    /// Get a snapshot of `engine`.
     fn snapshot(engine: &E, ctx: &Context) -> impl std::future::Future<Output = Result<E::Snap>> {
-        let (callback, future) = tikv_util::future::paired_std_future_callback();
-        let val = engine.async_snapshot(ctx, callback);
-        // make engine not cross yield point
-        async move {
-            val?; // propagate error
-            let (_ctx, result) = future
-                .map_err(|cancel| EngineError::from(EngineErrorInner::Other(box_err!(cancel))))
-                .await?;
-            // map storage::kv::Error -> storage::txn::Error -> storage::Error
-            result.map_err(txn::Error::from).map_err(Error::from)
-        }
+        kv::snapshot(engine, ctx)
+            .map_err(txn::Error::from)
+            .map_err(Error::from)
     }
 
     #[inline]
@@ -1362,48 +1353,28 @@ impl<E: Engine, L: LockManager> TestStorageBuilder<E, L> {
     }
 }
 
-#[cfg(test)]
-mod tests {
+pub mod test_util {
     use super::*;
-
-    use crate::config::TitanDBConfig;
-    use crate::storage::{
-        config::BlockCacheConfig,
-        lock_manager::{Lock, WaitTimeout},
-        mvcc::{Error as MvccError, ErrorInner as MvccErrorInner},
-        txn::{commands, Error as TxnError, ErrorInner as TxnErrorInner},
-    };
-    use engine::rocks::util::CFOptions;
-    use engine_traits::{CF_LOCK, CF_RAFT, CF_WRITE};
-    use futures03::executor::block_on;
-    use kvproto::kvrpcpb::{CommandPri, LockInfo};
+    use crate::storage::txn::commands;
     use std::{
         fmt::Debug,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            mpsc::{channel, Sender},
-            Arc,
-        },
-        time::Duration,
+        sync::mpsc::{channel, Sender},
     };
-    use tikv_util::collections::HashMap;
-    use tikv_util::config::ReadableSize;
-    use txn_types::Mutation;
 
-    fn expect_none(x: Result<Option<Value>>) {
+    pub fn expect_none(x: Result<Option<Value>>) {
         assert_eq!(x.unwrap(), None);
     }
 
-    fn expect_value(v: Vec<u8>, x: Result<Option<Value>>) {
+    pub fn expect_value(v: Vec<u8>, x: Result<Option<Value>>) {
         assert_eq!(x.unwrap().unwrap(), v);
     }
 
-    fn expect_multi_values(v: Vec<Option<KvPair>>, x: Result<Vec<Result<KvPair>>>) {
+    pub fn expect_multi_values(v: Vec<Option<KvPair>>, x: Result<Vec<Result<KvPair>>>) {
         let x: Vec<Option<KvPair>> = x.unwrap().into_iter().map(Result::ok).collect();
         assert_eq!(x, v);
     }
 
-    fn expect_error<T, F>(err_matcher: F, x: Result<T>)
+    pub fn expect_error<T, F>(err_matcher: F, x: Result<T>)
     where
         F: FnOnce(Error) + Send + 'static,
     {
@@ -1413,14 +1384,14 @@ mod tests {
         }
     }
 
-    fn expect_ok_callback<T: Debug>(done: Sender<i32>, id: i32) -> Callback<T> {
+    pub fn expect_ok_callback<T: Debug>(done: Sender<i32>, id: i32) -> Callback<T> {
         Box::new(move |x: Result<T>| {
             x.unwrap();
             done.send(id).unwrap();
         })
     }
 
-    fn expect_fail_callback<T, F>(done: Sender<i32>, id: i32, err_matcher: F) -> Callback<T>
+    pub fn expect_fail_callback<T, F>(done: Sender<i32>, id: i32, err_matcher: F) -> Callback<T>
     where
         F: FnOnce(Error) + Send + 'static,
     {
@@ -1430,7 +1401,7 @@ mod tests {
         })
     }
 
-    fn expect_too_busy_callback<T>(done: Sender<i32>, id: i32) -> Callback<T> {
+    pub fn expect_too_busy_callback<T>(done: Sender<i32>, id: i32) -> Callback<T> {
         Box::new(move |x: Result<T>| {
             expect_error(
                 |err| match err {
@@ -1443,7 +1414,7 @@ mod tests {
         })
     }
 
-    fn expect_value_callback<T: PartialEq + Debug + Send + 'static>(
+    pub fn expect_value_callback<T: PartialEq + Debug + Send + 'static>(
         done: Sender<i32>,
         id: i32,
         value: T,
@@ -1453,6 +1424,89 @@ mod tests {
             done.send(id).unwrap();
         })
     }
+
+    pub fn expect_pessimistic_lock_res_callback(
+        done: Sender<i32>,
+        pessimistic_lock_res: PessimisticLockRes,
+    ) -> Callback<Result<PessimisticLockRes>> {
+        Box::new(move |res: Result<Result<PessimisticLockRes>>| {
+            assert_eq!(res.unwrap().unwrap(), pessimistic_lock_res);
+            done.send(0).unwrap();
+        })
+    }
+
+    type PessimisticLockCommand = TypedCommand<Result<PessimisticLockRes>>;
+    pub fn new_acquire_pessimistic_lock_command(
+        keys: Vec<(Key, bool)>,
+        start_ts: impl Into<TimeStamp>,
+        for_update_ts: impl Into<TimeStamp>,
+        return_values: bool,
+    ) -> PessimisticLockCommand {
+        let primary = keys[0].0.clone().to_raw().unwrap();
+        let for_update_ts: TimeStamp = for_update_ts.into();
+        commands::AcquirePessimisticLock::new(
+            keys,
+            primary,
+            start_ts.into(),
+            3000,
+            false,
+            for_update_ts,
+            None,
+            return_values,
+            for_update_ts.next(),
+            Context::default(),
+        )
+    }
+
+    pub fn delete_pessimistic_lock<E: Engine, L: LockManager>(
+        storage: &Storage<E, L>,
+        key: Key,
+        start_ts: u64,
+        for_update_ts: u64,
+    ) {
+        let (tx, rx) = channel();
+        storage
+            .sched_txn_command(
+                commands::PessimisticRollback::new(
+                    vec![key],
+                    start_ts.into(),
+                    for_update_ts.into(),
+                    Context::default(),
+                ),
+                expect_ok_callback(tx, 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_util::*, *};
+
+    use crate::config::TitanDBConfig;
+    use crate::storage::{
+        config::BlockCacheConfig,
+        kv::{Error as EngineError, ErrorInner as EngineErrorInner},
+        lock_manager::{Lock, WaitTimeout},
+        mvcc::{Error as MvccError, ErrorInner as MvccErrorInner},
+        txn::{commands, Error as TxnError, ErrorInner as TxnErrorInner},
+    };
+    use engine::rocks::util::CFOptions;
+    use engine_traits::{CF_LOCK, CF_RAFT, CF_WRITE};
+    use futures03::executor::block_on;
+    use kvproto::kvrpcpb::{CommandPri, LockInfo};
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc::{channel, Sender},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tikv_util::collections::HashMap;
+    use tikv_util::config::ReadableSize;
+    use txn_types::Mutation;
 
     #[test]
     fn test_get_put() {
@@ -4300,61 +4354,7 @@ mod tests {
         assert_eq!(cmd.ts, None);
     }
 
-    type PessimisticLockCommand = TypedCommand<Result<PessimisticLockRes>>;
-    fn new_acquire_pessimistic_lock_command(
-        keys: Vec<(Key, bool)>,
-        start_ts: impl Into<TimeStamp>,
-        for_update_ts: impl Into<TimeStamp>,
-        return_values: bool,
-    ) -> PessimisticLockCommand {
-        let primary = keys[0].0.clone().to_raw().unwrap();
-        let for_update_ts: TimeStamp = for_update_ts.into();
-        commands::AcquirePessimisticLock::new(
-            keys,
-            primary,
-            start_ts.into(),
-            3000,
-            false,
-            for_update_ts,
-            None,
-            return_values,
-            for_update_ts.next(),
-            Context::default(),
-        )
-    }
-
     fn test_pessimistic_lock_impl(pipelined_pessimistic_lock: bool) {
-        fn delete_pessimistic_lock<E: Engine, L: LockManager>(
-            storage: &Storage<E, L>,
-            key: Key,
-            start_ts: u64,
-            for_update_ts: u64,
-        ) {
-            let (tx, rx) = channel();
-            storage
-                .sched_txn_command(
-                    commands::PessimisticRollback::new(
-                        vec![key],
-                        start_ts.into(),
-                        for_update_ts.into(),
-                        Context::default(),
-                    ),
-                    expect_ok_callback(tx, 0),
-                )
-                .unwrap();
-            rx.recv().unwrap();
-        }
-
-        fn expect_pessimistic_lock_res_callback(
-            done: Sender<i32>,
-            pessimistic_lock_res: PessimisticLockRes,
-        ) -> Callback<Result<PessimisticLockRes>> {
-            Box::new(move |res: Result<Result<PessimisticLockRes>>| {
-                assert_eq!(res.unwrap().unwrap(), pessimistic_lock_res);
-                done.send(0).unwrap();
-            })
-        }
-
         let storage = TestStorageBuilder::new()
             .set_lock_mgr(DummyLockManager {})
             .set_pipelined_pessimistic_lock(pipelined_pessimistic_lock)

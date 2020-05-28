@@ -11,7 +11,7 @@
 use crate::{setup::*, signal_handler};
 use encryption::DataKeyManager;
 use engine::rocks;
-use engine_rocks::{encryption::get_env, Compat, RocksEngine};
+use engine_rocks::{encryption::get_env, Compat, RocksEngine, RocksSnapshot};
 use engine_traits::{KvEngines, MetricsFlusher};
 use fs2::FileExt;
 use futures_cpupool::Builder;
@@ -114,7 +114,7 @@ struct TiKVServer {
     cfg_controller: Option<ConfigController>,
     security_mgr: Arc<SecurityManager>,
     pd_client: Arc<RpcClient>,
-    router: RaftRouter<RocksEngine>,
+    router: RaftRouter<RocksSnapshot>,
     system: Option<RaftBatchSystem>,
     resolver: resolve::PdStoreAddrResolver,
     state: Arc<Mutex<GlobalReplicationState>>,
@@ -779,12 +779,21 @@ impl TiKVServer {
         let status_enabled =
             self.config.metric.address.is_empty() && !self.config.server.status_addr.is_empty();
         if status_enabled {
-            let mut status_server = Box::new(StatusServer::new(
+            let mut status_server = match StatusServer::new(
                 self.config.server.status_thread_pool_size,
                 Some(self.pd_client.clone()),
                 self.cfg_controller.take().unwrap(),
                 self.router.clone(),
-            ));
+            ) {
+                Ok(status_server) => Box::new(status_server),
+                Err(e) => {
+                    error!(
+                        "failed to start runtime for status service";
+                        "err" => %e
+                    );
+                    return;
+                }
+            };
             // Start the status server.
             if let Err(e) = status_server.start(
                 self.config.server.status_addr.clone(),

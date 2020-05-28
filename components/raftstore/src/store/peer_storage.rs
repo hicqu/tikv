@@ -96,7 +96,7 @@ pub fn last_index(state: &RaftLocalState) -> u64 {
     state.get_last_index()
 }
 
-const ENTRY_MEM_SIZE: usize = std::mem::size_of::<Entry>();
+pub const ENTRY_MEM_SIZE: usize = std::mem::size_of::<Entry>();
 
 struct EntryCache {
     cache: VecDeque<Entry>,
@@ -1281,6 +1281,10 @@ where
             region_id: self.get_region_id(),
             status,
         };
+
+        // Don't schedule the snapshot to region worker.
+        fail_point!("skip_schedule_applying_snapshot", |_| {});
+
         // TODO: gracefully remove region instead.
         if let Err(e) = self.region_sched.schedule(task) {
             info!(
@@ -2024,7 +2028,6 @@ mod tests {
             tmp_mgr,
             0,
             true,
-            Duration::from_secs(0),
             CoprocessorHost::<RocksEngine>::default(),
             router,
         );
@@ -2345,7 +2348,6 @@ mod tests {
             tmp_mgr,
             0,
             true,
-            Duration::from_secs(0),
             CoprocessorHost::<RocksEngine>::default(),
             router,
         );

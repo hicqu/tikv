@@ -27,13 +27,13 @@ use super::{
     Result, ScanMode, Snapshot,
 };
 
-pub use engine_rocks::RocksSyncSnapshot as RocksSnapshot;
+pub use engine_rocks::RocksSnapshot;
 
 const TEMP_DIR: &str = "";
 
 enum Task {
     Write(Vec<Modify>, Callback<()>),
-    Snapshot(Callback<RocksSnapshot>),
+    Snapshot(Callback<Arc<RocksSnapshot>>),
     Pause(Duration),
 }
 
@@ -53,10 +53,7 @@ impl Runnable<Task> for Runner {
     fn run(&mut self, t: Task) {
         match t {
             Task::Write(modifies, cb) => cb((CbContext::new(), write_modifies(&self.0, modifies))),
-            Task::Snapshot(cb) => cb((
-                CbContext::new(),
-                Ok(RocksSnapshot::new(Arc::clone(&self.0.kv))),
-            )),
+            Task::Snapshot(cb) => cb((CbContext::new(), Ok(Arc::new(self.0.kv.c().snapshot())))),
             Task::Pause(dur) => std::thread::sleep(dur),
         }
     }
@@ -211,6 +208,8 @@ impl TestEngineBuilder {
 }
 
 fn write_modifies(engine: &Engines, modifies: Vec<Modify>) -> Result<()> {
+    fail_point!("rockskv_write_modifies", |_| Err(box_err!("write failed")));
+
     let mut wb = engine.kv.c().write_batch();
     for rev in modifies {
         let res = match rev {
@@ -257,9 +256,11 @@ fn write_modifies(engine: &Engines, modifies: Vec<Modify>) -> Result<()> {
 }
 
 impl Engine for RocksEngine {
-    type Snap = RocksSnapshot;
+    type Snap = Arc<RocksSnapshot>;
 
     fn async_write(&self, _: &Context, modifies: Vec<Modify>, cb: Callback<()>) -> Result<()> {
+        fail_point!("rockskv_async_write", |_| Err(box_err!("write failed")));
+
         if modifies.is_empty() {
             return Err(Error::from(ErrorInner::EmptyRequest));
         }
@@ -309,7 +310,7 @@ impl Engine for RocksEngine {
     }
 }
 
-impl Snapshot for RocksSnapshot {
+impl Snapshot for Arc<RocksSnapshot> {
     type Iter = RocksEngineIterator;
 
     fn get(&self, key: &Key) -> Result<Option<Value>> {
