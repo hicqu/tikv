@@ -69,7 +69,6 @@ use pd_client::PdClient;
 use sst_importer::SSTImporter;
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::config::{Tracker, VersionTrack};
-use tikv_util::file::TempFileManager;
 use tikv_util::mpsc::{self, LooseBoundedSender, Receiver};
 use tikv_util::time::{duration_to_sec, Instant as TiInstant};
 use tikv_util::timer::SteadyTimer;
@@ -261,6 +260,7 @@ pub struct PollContext<T, C: 'static> {
     pub queued_snapshot: HashSet<u64>,
     pub current_time: Option<Timespec>,
     pub perf_context_statistics: PerfContextStatistics,
+    pub node_start_time: Option<Instant>,
 }
 
 impl<T, C> HandleRaftReadyContext<RocksWriteBatch, RocksWriteBatch> for PollContext<T, C> {
@@ -293,6 +293,20 @@ impl<T, C> PollContext<T, C> {
     #[inline]
     pub fn store_id(&self) -> u64 {
         self.store.get_id()
+    }
+
+    /// Timeout is calculated from TiKV start, the node should not become
+    /// hibernated if it still within the hibernate timeout, see
+    /// https://github.com/tikv/tikv/issues/7747
+    pub fn is_hibernate_timeout(&mut self) -> bool {
+        let timeout = match self.node_start_time {
+            Some(t) => t.elapsed() >= self.cfg.hibernate_timeout.0,
+            None => return true,
+        };
+        if timeout {
+            self.node_start_time = None;
+        }
+        timeout
     }
 }
 
@@ -762,7 +776,6 @@ pub struct RaftPollerBuilder<T, C> {
     store_meta: Arc<Mutex<StoreMeta>>,
     future_poller: ThreadPoolSender,
     snap_mgr: SnapManager<RocksEngine>,
-    tempfile_mgr: Arc<TempFileManager>,
     pub coprocessor_host: CoprocessorHost<RocksEngine>,
     trans: T,
     pd_client: Arc<C>,
@@ -983,6 +996,7 @@ where
             queued_snapshot: HashSet::default(),
             current_time: None,
             perf_context_statistics: PerfContextStatistics::new(self.cfg.value().perf_level),
+            node_start_time: Some(Instant::now()),
         };
         let tag = format!("[store {}]", ctx.store.get_id());
         RaftPoller {
@@ -1036,7 +1050,6 @@ impl RaftBatchSystem {
         trans: T,
         pd_client: Arc<C>,
         mgr: SnapManager<RocksEngine>,
-        tempfile_mgr: Arc<TempFileManager>,
         pd_worker: FutureWorker<PdTask<RocksEngine>>,
         store_meta: Arc<Mutex<StoreMeta>>,
         mut coprocessor_host: CoprocessorHost<RocksEngine>,
@@ -1088,7 +1101,6 @@ impl RaftBatchSystem {
             store_meta,
             applying_snap_count: Arc::new(AtomicUsize::new(0)),
             future_poller: workers.future_poller.sender().clone(),
-            tempfile_mgr,
         };
         let region_peers = builder.init()?;
         let engine = builder.engines.kv.clone();
@@ -1122,7 +1134,6 @@ impl RaftBatchSystem {
         auto_split_controller: AutoSplitController,
     ) -> Result<()> {
         builder.snap_mgr.init()?;
-        let tempfile_mgr = builder.tempfile_mgr.clone();
 
         let engines = builder.engines.clone();
         let snap_mgr = builder.snap_mgr.clone();
@@ -1182,7 +1193,6 @@ impl RaftBatchSystem {
         let region_runner = RegionRunner::new(
             engines.clone(),
             snap_mgr,
-            tempfile_mgr,
             cfg.snap_apply_batch_size.0 as usize,
             cfg.use_delete_range,
             workers.coprocessor_host.clone(),
@@ -1277,6 +1287,7 @@ impl<'a, T: Transport, C: PdClient> StoreFsmDelegate<'a, T, C> {
         let from_epoch = msg.get_region_epoch();
         let msg_type = msg.get_message().get_msg_type();
         let from_store_id = msg.get_from_peer().get_store_id();
+        let to_peer_id = msg.get_to_peer().get_id();
 
         // Check if the target peer is tombstone.
         let state_key = keys::region_state_key(region_id);
@@ -1342,6 +1353,7 @@ impl<'a, T: Transport, C: PdClient> StoreFsmDelegate<'a, T, C> {
         }
         // The region in this peer is already destroyed
         if util::is_epoch_stale(from_epoch, region_epoch) {
+            self.ctx.raft_metrics.message_dropped.region_tombstone_peer += 1;
             info!(
                 "tombstone peer receives a stale message";
                 "region_id" => region_id,
@@ -1383,17 +1395,24 @@ impl<'a, T: Transport, C: PdClient> StoreFsmDelegate<'a, T, C> {
 
             return Ok(true);
         }
-
-        if from_epoch.get_conf_ver() == region_epoch.get_conf_ver() {
-            self.ctx.raft_metrics.message_dropped.region_tombstone_peer += 1;
-            return Err(box_err!(
-                "tombstone peer [epoch: {:?}] receive an invalid \
-                 message {:?}, ignore it",
-                region_epoch,
-                msg_type
-            ));
+        // A tombstone peer may not apply the conf change log which removes itself.
+        // In this case, the local epoch is stale and the local peer can be found from region.
+        // We can compare the local peer id with to_peer_id to verify whether it is correct to create a new peer.
+        if let Some(local_peer_id) =
+            util::find_peer(region, self.ctx.store_id()).map(|r| r.get_id())
+        {
+            if to_peer_id <= local_peer_id {
+                self.ctx.raft_metrics.message_dropped.region_tombstone_peer += 1;
+                info!(
+                    "tombstone peer receives a stale message, local_peer_id >= to_peer_id in msg";
+                    "region_id" => region_id,
+                    "local_peer_id" => local_peer_id,
+                    "to_peer_id" => to_peer_id,
+                    "msg_type" => ?msg_type
+                );
+                return Ok(true);
+            }
         }
-
         Ok(false)
     }
 

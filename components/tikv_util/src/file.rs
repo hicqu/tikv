@@ -1,9 +1,8 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::time::monotonic_raw_now;
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use openssl::error::ErrorStack;
@@ -111,67 +110,6 @@ pub fn sha256(input: &[u8]) -> Result<Vec<u8>, ErrorStack> {
 pub struct Sha256Reader<R> {
     reader: R,
     hasher: Arc<Mutex<Hasher>>,
-}
-
-struct TempFileManagerCore {
-    file_timestamp: u64,
-    dir: PathBuf,
-}
-
-pub struct TempFileManager {
-    core: Mutex<TempFileManagerCore>,
-}
-
-const TEMP_FILE_PREFIX: &str = "temp_";
-
-impl TempFileManager {
-    pub fn new(dir: PathBuf) -> TempFileManager {
-        let now = monotonic_raw_now();
-        let core = TempFileManagerCore {
-            file_timestamp: now.sec as u64,
-            dir,
-        };
-        TempFileManager {
-            core: Mutex::new(core),
-        }
-    }
-
-    pub fn init(&self) -> io::Result<()> {
-        let timeout = 60;
-        let core = self.core.lock().unwrap();
-        create_dir_if_not_exist(core.dir.as_path())?;
-        let paths = fs::read_dir("./")?;
-        let now = monotonic_raw_now();
-        let mut deletes = vec![];
-
-        for p in paths {
-            let f = p.unwrap().path();
-            if let Some(filename) = f.to_str() {
-                if filename.starts_with(TEMP_FILE_PREFIX) {
-                    let entries: Vec<&str> = filename.split('_').collect();
-                    if entries.len() >= 2 {
-                        if let Ok(create_time) = entries[1].to_string().parse::<u64>() {
-                            if timeout + create_time < now.sec as u64 {
-                                deletes.push(f);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for f in deletes {
-            fs::remove_file(f)?;
-        }
-        Ok(())
-    }
-
-    pub fn allocate_new_file_name(&self) -> String {
-        let now = monotonic_raw_now();
-        let mut core = self.core.lock().unwrap();
-        core.file_timestamp = std::cmp::max(now.sec as u64, core.file_timestamp + 1);
-        let filename = TEMP_FILE_PREFIX.to_owned() + &core.file_timestamp.to_string() + "_";
-        core.dir.join(filename).to_str().unwrap().to_string()
-    }
 }
 
 impl<R> Sha256Reader<R> {

@@ -26,7 +26,6 @@ use raftstore::store::AutoSplitController;
 use raftstore::store::{self, initial_region, Config as StoreConfig, SnapManager, Transport};
 use raftstore::store::{GlobalReplicationState, PdTask, SplitCheckTask};
 use tikv_util::config::VersionTrack;
-use tikv_util::file::TempFileManager;
 use tikv_util::worker::FutureWorker;
 use tikv_util::worker::Worker;
 
@@ -81,8 +80,12 @@ where
         } else {
             store.set_address(cfg.advertise_addr.clone())
         }
+        if cfg.advertise_status_addr.is_empty() {
+            store.set_status_address(cfg.status_addr.clone());
+        } else {
+            store.set_status_address(cfg.advertise_status_addr.clone())
+        }
         store.set_version(env!("CARGO_PKG_VERSION").to_string());
-        store.set_status_address(cfg.status_addr.clone());
 
         if let Ok(path) = std::env::current_exe() {
             if let Some(path) = path.parent() {
@@ -126,7 +129,6 @@ where
         engines: Engines,
         trans: T,
         snap_mgr: SnapManager<RocksEngine>,
-        tempfile_mgr: Arc<TempFileManager>,
         pd_worker: FutureWorker<PdTask<RocksEngine>>,
         store_meta: Arc<Mutex<StoreMeta>>,
         coprocessor_host: CoprocessorHost<RocksEngine>,
@@ -168,7 +170,6 @@ where
             engines,
             trans,
             snap_mgr,
-            tempfile_mgr,
             pd_worker,
             store_meta,
             coprocessor_host,
@@ -362,7 +363,6 @@ where
         engines: Engines,
         trans: T,
         snap_mgr: SnapManager<RocksEngine>,
-        tempfile_mgr: Arc<TempFileManager>,
         pd_worker: FutureWorker<PdTask<RocksEngine>>,
         store_meta: Arc<Mutex<StoreMeta>>,
         coprocessor_host: CoprocessorHost<RocksEngine>,
@@ -389,7 +389,6 @@ where
             trans,
             pd_client,
             snap_mgr,
-            tempfile_mgr,
             pd_worker,
             store_meta,
             coprocessor_host,

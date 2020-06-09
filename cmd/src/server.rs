@@ -10,7 +10,6 @@
 
 use crate::{setup::*, signal_handler};
 use encryption::DataKeyManager;
-use engine::rocks;
 use engine_rocks::{encryption::get_env, Compat, RocksEngine, RocksSnapshot};
 use engine_traits::{KvEngines, MetricsFlusher};
 use fs2::FileExt;
@@ -62,7 +61,6 @@ use tikv_util::config::VersionTrack;
 use tikv_util::{
     check_environment_variables,
     config::ensure_dir_exist,
-    file::TempFileManager,
     sys::sys_quota::SysQuota,
     time::Monitor,
     worker::{FutureWorker, Worker},
@@ -126,7 +124,6 @@ struct TiKVServer {
     coprocessor_host: Option<CoprocessorHost<RocksEngine>>,
     to_stop: Vec<Box<dyn Stop>>,
     lock_files: Vec<File>,
-    tempfile_mgr: Arc<TempFileManager>,
 }
 
 struct Engines {
@@ -171,14 +168,11 @@ impl TiKVServer {
         let mut coprocessor_host = Some(CoprocessorHost::new(router.clone()));
         let region_info_accessor = RegionInfoAccessor::new(coprocessor_host.as_mut().unwrap());
         region_info_accessor.start();
-        let path = store_path.join("temp_file_dir_for_ingest");
-        let tempfile_mgr = Arc::new(TempFileManager::new(path));
 
         TiKVServer {
             config,
             cfg_controller: Some(cfg_controller),
             security_mgr,
-            tempfile_mgr,
             pd_client,
             router,
             system: Some(system),
@@ -312,10 +306,6 @@ impl TiKVServer {
             );
         }
 
-        if let Err(e) = self.tempfile_mgr.init() {
-            fatal!("initial tempfile manager failed, err: {:?}", e);
-        }
-
         // We truncate a big file to make sure that both raftdb and kvdb of TiKV have enough space to compaction when TiKV recover. This file is created in data_dir rather than db_path, because we must not increase store size of db_path.
         tikv_util::reserve_space_for_recover(
             &self.config.storage.data_dir,
@@ -347,7 +337,7 @@ impl TiKVServer {
         let mut raft_db_opts = self.config.raftdb.build_opt();
         raft_db_opts.set_env(env.clone());
         let raft_db_cf_opts = self.config.raftdb.build_cf_opts(&block_cache);
-        let raft_engine = rocks::util::new_engine_opt(
+        let raft_engine = engine_rocks::raw_util::new_engine_opt(
             raft_db_path.to_str().unwrap(),
             raft_db_opts,
             raft_db_cf_opts,
@@ -362,9 +352,12 @@ impl TiKVServer {
         let db_path = self
             .store_path
             .join(Path::new(storage::config::DEFAULT_ROCKSDB_SUB_DIR));
-        let kv_engine =
-            rocks::util::new_engine_opt(db_path.to_str().unwrap(), kv_db_opts, kv_cfs_opts)
-                .unwrap_or_else(|s| fatal!("failed to create kv engine: {}", s));
+        let kv_engine = engine_rocks::raw_util::new_engine_opt(
+            db_path.to_str().unwrap(),
+            kv_db_opts,
+            kv_cfs_opts,
+        )
+        .unwrap_or_else(|s| fatal!("failed to create kv engine: {}", s));
 
         let engines = engine::Engines::new(
             Arc::new(kv_engine),
@@ -406,8 +399,8 @@ impl TiKVServer {
         let engines = self.engines.as_ref().unwrap();
         let mut gc_worker = GcWorker::new(
             engines.engine.clone(),
-            self.tempfile_mgr.clone(),
             Some(engines.engines.kv.c().clone()),
+            Some(engines.raft_router.clone()),
             Some(self.region_info_accessor.clone()),
             self.config.gc.clone(),
         );
@@ -567,7 +560,6 @@ impl TiKVServer {
         );
 
         let auto_split_controller = AutoSplitController::new(split_config_manager);
-        let tempfile_mgr = self.tempfile_mgr.clone();
 
         let mut node = Node::new(
             self.system.take().unwrap(),
@@ -581,7 +573,6 @@ impl TiKVServer {
             engines.engines.clone(),
             server.transport(),
             snap_mgr,
-            tempfile_mgr,
             pd_worker,
             engines.store_meta.clone(),
             coprocessor_host,
@@ -797,6 +788,7 @@ impl TiKVServer {
             // Start the status server.
             if let Err(e) = status_server.start(
                 self.config.server.status_addr.clone(),
+                self.config.server.advertise_status_addr.clone(),
                 &self.config.security,
             ) {
                 error!(

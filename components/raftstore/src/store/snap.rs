@@ -46,6 +46,7 @@ use crate::store::metrics::{
 };
 use crate::store::peer_storage::JOB_STATUS_CANCELLING;
 use openssl::symm::{Cipher, Crypter, Mode};
+use prometheus::core::AtomicU64;
 
 #[path = "snap/io.rs"]
 pub mod snap_io;
@@ -63,6 +64,7 @@ pub const SNAPSHOT_VERSION: u64 = 2;
 const SNAP_GEN_PREFIX: &str = "gen";
 /// Name prefix for the received snapshot file.
 const SNAP_REV_PREFIX: &str = "rev";
+const DEL_RANGE_PREFIX: &str = "del";
 
 const TMP_FILE_SUFFIX: &str = ".tmp";
 const SST_FILE_SUFFIX: &str = ".sst";
@@ -1095,6 +1097,7 @@ struct SnapManagerCore {
     registry: Arc<RwLock<HashMap<SnapKey, Vec<SnapEntry>>>>,
     limiter: Limiter,
     snap_size: Arc<AtomicU64>,
+    temp_sst_id: Arc<AtomicU64>,
     encryption_key_manager: Option<Arc<DataKeyManager>>,
 }
 
@@ -1198,6 +1201,10 @@ impl<E: KvEngine> SnapManager<E> {
                     None => return None,
                     Some(n) => n,
                 };
+                if name.starts_with(DEL_RANGE_PREFIX) {
+                    // This is a temp file to store delete keys and ingest them into Engine.
+                    return None;
+                }
                 let is_sending = name.starts_with(SNAP_GEN_PREFIX);
                 let numbers: Vec<u64> = name.split('.').next().map_or_else(
                     || vec![],
@@ -1226,6 +1233,13 @@ impl<E: KvEngine> SnapManager<E> {
         v.sort();
         v.dedup();
         Ok(v)
+    }
+
+    pub fn get_temp_path_for_ingest(&self) -> String {
+        let sst_id = self.core.temp_sst_id.fetch_add(1, Ordering::SeqCst);
+        let filename = format!("{}_{}.sst.{}", DEL_RANGE_PREFIX, sst_id, TMP_FILE_SUFFIX);
+        let path = PathBuf::from(self.core.base).join(&filename);
+        path.to_str().unwrap().to_string()
     }
 
     #[inline]
@@ -1519,6 +1533,7 @@ impl SnapManagerBuilder {
                 registry: Arc::new(RwLock::new(map![])),
                 limiter,
                 snap_size: Arc::new(AtomicU64::new(0)),
+                temp_sst_id: Arc::new(AtomicU64::new(0)),
                 encryption_key_manager: self.key_manager,
             },
             router,
