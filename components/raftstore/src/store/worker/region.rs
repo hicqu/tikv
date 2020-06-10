@@ -32,7 +32,6 @@ use tikv_util::timer::Timer;
 use tikv_util::worker::{Runnable, RunnableWithTimer};
 
 use super::metrics::*;
-use tikv_util::file::TempFileManager;
 
 const GENERATE_POOL_SIZE: usize = 2;
 
@@ -222,7 +221,6 @@ where
     engines: KvEngines<EK, ER>,
     batch_size: usize,
     mgr: SnapManager<EK>,
-    tempfile_mgr: Arc<TempFileManager>,
     use_delete_range: bool,
     pending_delete_ranges: PendingDeleteRanges,
     coprocessor_host: CoprocessorHost<RocksEngine>,
@@ -552,7 +550,7 @@ where
             let strategy = if self.use_delete_range && cf != CF_LOCK {
                 DeleteStrategy::DeleteByRange
             } else {
-                let sst_path = self.tempfile_mgr.allocate_new_file_name();
+                let sst_path = self.mgr.get_temp_path_for_ingest();
                 DeleteStrategy::DeleteByWriter { sst_path }
             };
             box_try!(self
@@ -585,7 +583,6 @@ where
     pub fn new(
         engines: KvEngines<EK, ER>,
         mgr: SnapManager<EK>,
-        tempfile_mgr: Arc<TempFileManager>,
         batch_size: usize,
         use_delete_range: bool,
         coprocessor_host: CoprocessorHost<RocksEngine>,
@@ -599,7 +596,6 @@ where
             ctx: SnapContext {
                 engines,
                 mgr,
-                tempfile_mgr,
                 batch_size,
                 use_delete_range,
                 pending_delete_ranges: PendingDeleteRanges::default(),
@@ -752,7 +748,6 @@ mod tests {
     use kvproto::raft_serverpb::{PeerState, RaftApplyState, RegionLocalState};
     use raft::eraftpb::Entry;
     use tempfile::Builder;
-    use tikv_util::file::TempFileManager;
     use tikv_util::time;
     use tikv_util::timer::Timer;
     use tikv_util::worker::Worker;
@@ -894,8 +889,6 @@ mod tests {
             .tempdir()
             .unwrap();
         let dir_path = temp_dir.path().join("tmp_dir");
-        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
-        tmp_mgr.init().unwrap();
 
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_level_zero_slowdown_writes_trigger(5);
@@ -945,7 +938,6 @@ mod tests {
         let runner = RegionRunner::new(
             engines.c(),
             mgr,
-            tmp_mgr,
             0,
             true,
             CoprocessorHost::<RocksEngine>::default(),

@@ -141,8 +141,8 @@ pub trait Engine: Send + Clone + 'static {
         Err(box_err!("not support delete all in range cf"))
     }
 
-    fn unsafe_destroy_range(&self, sst_dir: String, start: &Key, end: &Key) -> Result<()> {
-        self.unsafe_destroy_range_impl(sst_dir, start, end)
+    fn unsafe_destroy_range(&self, sst_path: String, start_key: &Key, end_key: &Key) -> Result<()> {
+        self.unsafe_destroy_range_impl(sst_path, start_key, end_key)
     }
 
     fn unsafe_destroy_range_impl(

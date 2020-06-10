@@ -24,9 +24,8 @@ use crate::storage::mvcc::{
 };
 use pd_client::PdClient;
 use raftstore::coprocessor::{CoprocessorHost, RegionInfoAccessor, RegionInfoProvider};
-use raftstore::store::RegionSnapshot;
+use raftstore::store::{RegionSnapshot, SnapManager};
 use tikv_util::config::{Tracker, VersionTrack};
-use tikv_util::file::TempFileManager;
 use tikv_util::time::{duration_to_sec, Limiter, SlowTimer};
 use tikv_util::worker::{
     FutureRunnable, FutureScheduler, FutureWorker, Stopped as FutureWorkerStopped,
@@ -143,7 +142,9 @@ struct GcRunner<E: Engine> {
 
     cfg: GcConfig,
     cfg_tracker: Tracker<GcConfig>,
-    temp_file_manager: Arc<TempFileManager>,
+
+    /// Create and manage temp sst created for inserting deleted keys.
+    snap_mgr: SnapManager<E>,
 
     stats: Statistics,
 }
@@ -151,7 +152,7 @@ struct GcRunner<E: Engine> {
 impl<E: Engine> GcRunner<E> {
     pub fn new(
         engine: E,
-        temp_file_manager: Arc<TempFileManager>,
+        snap_mgr: SnapManager<E>,
         cfg_tracker: Tracker<GcConfig>,
         local_storage: Option<RocksEngine>,
         region_info_accessor: Option<RegionInfoAccessor>,
@@ -169,7 +170,7 @@ impl<E: Engine> GcRunner<E> {
             limiter,
             cfg,
             cfg_tracker,
-            temp_file_manager,
+            snap_mgr,
             stats: Statistics::default(),
         }
     }
@@ -402,9 +403,9 @@ impl<E: Engine> GcRunner<E> {
     }
 
     fn unsafe_destroy_range(&self, _: &Context, start_key: &Key, end_key: &Key) -> Result<()> {
-        let sst_dir = self.temp_file_manager.allocate_new_file_name();
+        let sst_path = self.snap_mgr.get_temp_path_for_ingest();
         self.engine
-            .unsafe_destroy_range(sst_dir, start_key, end_key)
+            .unsafe_destroy_range(sst_path, start_key, end_key)
             .map_err(|e| e.into())
     }
 
@@ -601,7 +602,9 @@ pub struct GcWorker<E: Engine> {
     applied_lock_collector: Option<Arc<AppliedLockCollector>>,
 
     gc_manager_handle: Arc<Mutex<Option<GcManagerHandle>>>,
-    temp_file_manager: Arc<TempFileManager>,
+
+    /// Create and manage temp sst created for inserting deleted keys.
+    snap_mgr: SnapManager<E>,
 }
 
 impl<E: Engine> Clone for GcWorker<E> {
@@ -620,7 +623,7 @@ impl<E: Engine> Clone for GcWorker<E> {
             worker_scheduler: self.worker_scheduler.clone(),
             applied_lock_collector: self.applied_lock_collector.clone(),
             gc_manager_handle: self.gc_manager_handle.clone(),
-            temp_file_manager: self.temp_file_manager.clone(),
+            snap_mgr: self.snap_mgr.clone(),
         }
     }
 }
@@ -644,7 +647,7 @@ impl<E: Engine> Drop for GcWorker<E> {
 impl<E: Engine> GcWorker<E> {
     pub fn new(
         engine: E,
-        temp_file_manager: Arc<TempFileManager>,
+        snap_mgr: SnapManager<E>,
         local_storage: Option<RocksEngine>,
         region_info_accessor: Option<RegionInfoAccessor>,
         cfg: GcConfig,
@@ -654,7 +657,7 @@ impl<E: Engine> GcWorker<E> {
         GcWorker {
             engine,
             local_storage,
-            temp_file_manager,
+            snap_mgr,
             config_manager: GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg))),
             region_info_accessor,
             scheduled_tasks: Arc::new(atomic::AtomicUsize::new(0)),
@@ -680,7 +683,7 @@ impl<E: Engine> GcWorker<E> {
     pub fn start(&mut self) -> Result<()> {
         let runner = GcRunner::new(
             self.engine.clone(),
-            self.temp_file_manager.clone(),
+            self.snap_mgr.clone(),
             self.config_manager
                 .0
                 .clone()
@@ -856,6 +859,7 @@ mod tests {
     use tikv_util::codec::number::NumberEncoder;
     use tikv_util::future::paired_future_callback;
     use txn_types::Mutation;
+    use raftstore::store::SnapManagerBuilder;
 
     /// A wrapper of engine that adds the 'z' prefix to keys internally.
     /// For test engines, they writes keys into db directly, but in production a 'z' prefix will be
@@ -948,7 +952,8 @@ mod tests {
         // Return Result from this function so we can use the `wait_op` macro here.
         let tmp_dir = TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_path_buf();
-        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
+        let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
+        snap_mgr.init().unwrap();
 
         let engine = TestEngineBuilder::new().build().unwrap();
         let storage = TestStorageBuilder::from_engine(engine.clone())
@@ -957,7 +962,7 @@ mod tests {
         let db = engine.get_rocksdb();
         let mut gc_worker = GcWorker::new(
             engine,
-            tmp_mgr,
+            snap_mgr,
             Some(db.c().clone()),
             None,
             GcConfig::default(),
@@ -1115,7 +1120,8 @@ mod tests {
     fn test_physical_scan_lock() {
         let tmp_dir = TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_path_buf();
-        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
+        let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
+        snap_mgr.init().unwrap();
 
         let engine = TestEngineBuilder::new().build().unwrap();
         let db = engine.get_rocksdb();
@@ -1126,7 +1132,7 @@ mod tests {
                 .unwrap();
         let mut gc_worker = GcWorker::new(
             prefixed_engine,
-            tmp_mgr,
+            snap_mgr,
             Some(db.c().clone()),
             None,
             GcConfig::default(),

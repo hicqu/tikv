@@ -294,7 +294,6 @@ mod tests {
     use kvproto::raft_serverpb::RaftMessage;
     use security::SecurityConfig;
     use tempfile::TempDir;
-    use tikv_util::file::TempFileManager;
 
     #[derive(Clone)]
     struct MockResolver {
@@ -372,11 +371,13 @@ mod tests {
         cfg.addr = "127.0.0.1:0".to_owned();
         let tmp_dir = TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_path_buf();
-        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
+        let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
+        snap_mgr.init().unwrap();
+
         let storage = TestStorageBuilder::new().build().unwrap();
         let mut gc_worker = GcWorker::new(
             storage.get_engine(),
-            tmp_mgr,
+            snap_mgr,
             None,
             None,
             Default::default(),

@@ -1682,7 +1682,6 @@ mod tests {
     use std::sync::*;
     use std::time::Duration;
     use tempfile::{Builder, TempDir};
-    use tikv_util::file::TempFileManager;
     use tikv_util::worker::{Scheduler, Worker};
 
     use super::*;
@@ -2015,7 +2014,6 @@ mod tests {
         cs.set_voters(vec![1, 2, 3]);
         let td = Builder::new().prefix("tikv-store-test").tempdir().unwrap();
         let dir_path = td.path().join("tmp_dir");
-        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
         let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap(), None);
         let mut worker = Worker::new("region-worker");
@@ -2025,7 +2023,6 @@ mod tests {
         let runner = RegionRunner::new(
             s.engines.clone(),
             mgr,
-            tmp_mgr,
             0,
             true,
             CoprocessorHost::<RocksEngine>::default(),
@@ -2336,7 +2333,6 @@ mod tests {
         let snap_dir = Builder::new().prefix("snap").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap(), None);
         let dir_path = td1.path().join("tmp_dir");
-        let tmp_mgr = Arc::new(TempFileManager::new(dir_path));
 
         let mut worker = Worker::new("snap-manager");
         let sched = worker.scheduler();
@@ -2345,7 +2341,6 @@ mod tests {
         let runner = RegionRunner::new(
             s1.engines.clone(),
             mgr,
-            tmp_mgr,
             0,
             true,
             CoprocessorHost::<RocksEngine>::default(),

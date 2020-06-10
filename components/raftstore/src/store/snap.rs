@@ -46,7 +46,6 @@ use crate::store::metrics::{
 };
 use crate::store::peer_storage::JOB_STATUS_CANCELLING;
 use openssl::symm::{Cipher, Crypter, Mode};
-use prometheus::core::AtomicU64;
 
 #[path = "snap/io.rs"]
 pub mod snap_io;
