@@ -307,7 +307,6 @@ impl Simulator for ServerCluster {
             engines,
             simulate_trans.clone(),
             snap_mgr,
-            tmp_mgr,
             pd_worker,
             store_meta,
             coprocessor_host,

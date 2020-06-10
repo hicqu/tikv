@@ -2047,7 +2047,6 @@ mod tests {
         let mut cs = ConfState::default();
         cs.set_voters(vec![1, 2, 3]);
         let td = Builder::new().prefix("tikv-store-test").tempdir().unwrap();
-        let dir_path = td.path().join("tmp_dir");
         let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap(), None);
         let mut worker = Worker::new("region-worker");
@@ -2366,7 +2365,6 @@ mod tests {
         let td1 = Builder::new().prefix("tikv-store-test").tempdir().unwrap();
         let snap_dir = Builder::new().prefix("snap").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap(), None);
-        let dir_path = td1.path().join("tmp_dir");
 
         let mut worker = Worker::new("snap-manager");
         let sched = worker.scheduler();

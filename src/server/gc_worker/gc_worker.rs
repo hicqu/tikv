@@ -144,7 +144,7 @@ struct GcRunner<E: Engine> {
     cfg_tracker: Tracker<GcConfig>,
 
     /// Create and manage temp sst created for inserting deleted keys.
-    snap_mgr: SnapManager<E>,
+    snap_mgr: SnapManager<RocksEngine>,
 
     stats: Statistics,
 }
@@ -152,7 +152,7 @@ struct GcRunner<E: Engine> {
 impl<E: Engine> GcRunner<E> {
     pub fn new(
         engine: E,
-        snap_mgr: SnapManager<E>,
+        snap_mgr: SnapManager<RocksEngine>,
         cfg_tracker: Tracker<GcConfig>,
         local_storage: Option<RocksEngine>,
         region_info_accessor: Option<RegionInfoAccessor>,
@@ -604,7 +604,7 @@ pub struct GcWorker<E: Engine> {
     gc_manager_handle: Arc<Mutex<Option<GcManagerHandle>>>,
 
     /// Create and manage temp sst created for inserting deleted keys.
-    snap_mgr: SnapManager<E>,
+    snap_mgr: SnapManager<RocksEngine>,
 }
 
 impl<E: Engine> Clone for GcWorker<E> {
@@ -647,7 +647,7 @@ impl<E: Engine> Drop for GcWorker<E> {
 impl<E: Engine> GcWorker<E> {
     pub fn new(
         engine: E,
-        snap_mgr: SnapManager<E>,
+        snap_mgr: SnapManager<RocksEngine>,
         local_storage: Option<RocksEngine>,
         region_info_accessor: Option<RegionInfoAccessor>,
         cfg: GcConfig,
@@ -853,13 +853,13 @@ mod tests {
     use futures::Future;
     use kvproto::kvrpcpb::Op;
     use kvproto::metapb;
+    use raftstore::store::SnapManagerBuilder;
     use std::collections::BTreeMap;
     use std::sync::mpsc::channel;
     use tempfile::TempDir;
     use tikv_util::codec::number::NumberEncoder;
     use tikv_util::future::paired_future_callback;
     use txn_types::Mutation;
-    use raftstore::store::SnapManagerBuilder;
 
     /// A wrapper of engine that adds the 'z' prefix to keys internally.
     /// For test engines, they writes keys into db directly, but in production a 'z' prefix will be
@@ -951,7 +951,7 @@ mod tests {
     ) -> Result<()> {
         // Return Result from this function so we can use the `wait_op` macro here.
         let tmp_dir = TempDir::new().unwrap();
-        let dir_path = tmp_dir.path().to_path_buf();
+        let dir_path = tmp_dir.path().to_path_buf().to_str().unwrap().to_string();
         let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
         snap_mgr.init().unwrap();
 
@@ -1119,7 +1119,7 @@ mod tests {
     #[test]
     fn test_physical_scan_lock() {
         let tmp_dir = TempDir::new().unwrap();
-        let dir_path = tmp_dir.path().to_path_buf();
+        let dir_path = tmp_dir.path().to_path_buf().to_str().unwrap().to_string();
         let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
         snap_mgr.init().unwrap();
 

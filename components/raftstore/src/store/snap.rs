@@ -1237,7 +1237,7 @@ impl<E: KvEngine> SnapManager<E> {
     pub fn get_temp_path_for_ingest(&self) -> String {
         let sst_id = self.core.temp_sst_id.fetch_add(1, Ordering::SeqCst);
         let filename = format!("{}_{}.sst.{}", DEL_RANGE_PREFIX, sst_id, TMP_FILE_SUFFIX);
-        let path = PathBuf::from(self.core.base).join(&filename);
+        let path = PathBuf::from(&self.core.base).join(&filename);
         path.to_str().unwrap().to_string()
     }
 
@@ -1720,6 +1720,7 @@ pub mod tests {
             registry: Arc::new(RwLock::new(map![])),
             limiter: Limiter::new(INFINITY),
             snap_size: Arc::new(AtomicU64::new(0)),
+            temp_sst_id: Arc::new(AtomicU64::new(0)),
             encryption_key_manager: None,
         }
     }

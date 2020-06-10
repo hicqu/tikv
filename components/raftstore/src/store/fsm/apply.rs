@@ -1468,9 +1468,9 @@ where
                 });
 
             let strategy = if use_delete_range && cf != CF_LOCK {
-                DeleteStrategy::DeleteByKey
-            } else {
                 DeleteStrategy::DeleteByRange
+            } else {
+                DeleteStrategy::DeleteByKey
             };
             // Delete all remaining keys.
             engine

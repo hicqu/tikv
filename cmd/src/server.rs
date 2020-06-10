@@ -19,6 +19,7 @@ use kvproto::{
     debugpb::create_debug, diagnosticspb::create_diagnostics, import_sstpb::create_import_sst,
 };
 use pd_client::{PdClient, RpcClient};
+use raftstore::store::SnapManager;
 use raftstore::{
     coprocessor::{config::SplitCheckConfigManager, CoprocessorHost, RegionInfoAccessor},
     router::ServerRaftStoreRouter,
@@ -90,7 +91,6 @@ pub fn run_tikv(config: TiKvConfig) {
     tikv.check_conflict_addr();
     tikv.init_fs();
     tikv.init_yatp();
-    tikv.init_encryption();
     tikv.init_engines();
     let gc_worker = tikv.init_gc_worker();
     let server_config = tikv.init_servers(&gc_worker);
@@ -111,6 +111,7 @@ struct TiKVServer {
     config: TiKvConfig,
     cfg_controller: Option<ConfigController>,
     security_mgr: Arc<SecurityManager>,
+    snap_mgr: SnapManager<RocksEngine>,
     pd_client: Arc<RpcClient>,
     router: RaftRouter<RocksSnapshot>,
     system: Option<RaftBatchSystem>,
@@ -168,6 +169,23 @@ impl TiKVServer {
         let mut coprocessor_host = Some(CoprocessorHost::new(router.clone()));
         let region_info_accessor = RegionInfoAccessor::new(coprocessor_host.as_mut().unwrap());
         region_info_accessor.start();
+        let encryption_key_manager =
+            DataKeyManager::from_config(&config.security.encryption, &config.storage.data_dir)
+                .unwrap()
+                .map(|key_manager| Arc::new(key_manager));
+        // Create snapshot manager, server.
+        let snap_path = store_path
+            .join(Path::new("snap"))
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bps = i64::try_from(config.server.snap_max_write_bytes_per_sec.0)
+            .unwrap_or_else(|_| fatal!("snap_max_write_bytes_per_sec > i64::max_value"));
+        let snap_mgr = SnapManagerBuilder::default()
+            .max_write_bytes_per_sec(bps)
+            .max_total_size(config.server.snap_max_total_size.0)
+            .encryption_key_manager(encryption_key_manager.clone())
+            .build(snap_path, Some(router.clone()));
 
         TiKVServer {
             config,
@@ -179,13 +197,14 @@ impl TiKVServer {
             resolver,
             state,
             store_path,
-            encryption_key_manager: None,
+            encryption_key_manager,
             engines: None,
             servers: None,
             region_info_accessor,
             coprocessor_host,
             to_stop: vec![Box::new(resolve_worker)],
             lock_files: vec![],
+            snap_mgr,
         }
     }
 
@@ -320,15 +339,6 @@ impl TiKVServer {
         prometheus::register(Box::new(yatp::metrics::MULTILEVEL_LEVEL_ELAPSED.clone())).unwrap();
     }
 
-    fn init_encryption(&mut self) {
-        self.encryption_key_manager = DataKeyManager::from_config(
-            &self.config.security.encryption,
-            &self.config.storage.data_dir,
-        )
-        .unwrap()
-        .map(|key_manager| Arc::new(key_manager));
-    }
-
     fn init_engines(&mut self) {
         let env = get_env(self.encryption_key_manager.clone(), None /*base_env*/).unwrap();
         let block_cache = self.config.storage.block_cache.build_shared_cache();
@@ -399,8 +409,8 @@ impl TiKVServer {
         let engines = self.engines.as_ref().unwrap();
         let mut gc_worker = GcWorker::new(
             engines.engine.clone(),
+            self.snap_mgr.clone(),
             Some(engines.engines.kv.c().clone()),
-            Some(engines.raft_router.clone()),
             Some(self.region_info_accessor.clone()),
             self.config.gc.clone(),
         );
@@ -474,23 +484,6 @@ impl TiKVServer {
         )
         .unwrap_or_else(|e| fatal!("failed to create raft storage: {}", e));
 
-        // Create snapshot manager, server.
-        let snap_path = self
-            .store_path
-            .join(Path::new("snap"))
-            .to_str()
-            .unwrap()
-            .to_owned();
-
-        let bps = i64::try_from(self.config.server.snap_max_write_bytes_per_sec.0)
-            .unwrap_or_else(|_| fatal!("snap_max_write_bytes_per_sec > i64::max_value"));
-
-        let snap_mgr = SnapManagerBuilder::default()
-            .max_write_bytes_per_sec(bps)
-            .max_total_size(self.config.server.snap_max_total_size.0)
-            .encryption_key_manager(self.encryption_key_manager.clone())
-            .build(snap_path, Some(self.router.clone()));
-
         // Create coprocessor endpoint.
         let cop_read_pool_handle = if self.config.readpool.coprocessor.use_unified_pool() {
             unified_read_pool.as_ref().unwrap().handle()
@@ -519,7 +512,7 @@ impl TiKVServer {
             coprocessor::Endpoint::new(&server_config, cop_read_pool_handle),
             engines.raft_router.clone(),
             self.resolver.clone(),
-            snap_mgr.clone(),
+            self.snap_mgr.clone(),
             gc_worker.clone(),
             unified_read_pool,
         )
@@ -572,7 +565,7 @@ impl TiKVServer {
         node.start(
             engines.engines.clone(),
             server.transport(),
-            snap_mgr,
+            self.snap_mgr.clone(),
             pd_worker,
             engines.store_meta.clone(),
             coprocessor_host,

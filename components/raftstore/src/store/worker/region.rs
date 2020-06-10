@@ -749,7 +749,6 @@ mod tests {
     use kvproto::raft_serverpb::{PeerState, RaftApplyState, RegionLocalState};
     use raft::eraftpb::Entry;
     use tempfile::Builder;
-    use tikv_util::time;
     use tikv_util::timer::Timer;
     use tikv_util::worker::Worker;
 

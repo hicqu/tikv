@@ -370,7 +370,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.addr = "127.0.0.1:0".to_owned();
         let tmp_dir = TempDir::new().unwrap();
-        let dir_path = tmp_dir.path().to_path_buf();
+        let dir_path = tmp_dir.path().to_path_buf().to_str().unwrap().to_string();
         let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
         snap_mgr.init().unwrap();
 

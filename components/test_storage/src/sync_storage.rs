@@ -6,7 +6,7 @@ use kvproto::kvrpcpb::{Context, LockInfo};
 use raftstore::coprocessor::RegionInfoProvider;
 use raftstore::store::SnapManagerBuilder;
 use std::sync::Arc;
-use tempfile::Builder;
+use tempfile::{Builder, TempDir};
 use tikv::server::gc_worker::{AutoGcConfig, GcConfig, GcSafePointProvider, GcWorker};
 use tikv::storage::config::Config;
 use tikv::storage::kv::RocksEngine;
@@ -60,11 +60,13 @@ impl<E: Engine> SyncTestStorageBuilder<E> {
         if let Some(config) = self.config.take() {
             builder = builder.config(config);
         }
-        let tmp_dir = Builder::new()
-            .prefix("test_cluster_tmp_mgr")
-            .tempdir()
-            .unwrap();
-        let dir_path = tmp_dir.path();
+        let snap_dir = Arc::new(
+            Builder::new()
+                .prefix("test_cluster_snap_mgr")
+                .tempdir()
+                .unwrap(),
+        );
+        let dir_path = snap_dir.path().to_str().unwrap().to_string();
         let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
         snap_mgr.init().unwrap();
         let mut gc_worker = GcWorker::new(
@@ -78,6 +80,7 @@ impl<E: Engine> SyncTestStorageBuilder<E> {
 
         Ok(SyncTestStorage {
             store: builder.build()?,
+            snap_dir,
             gc_worker,
         })
     }
@@ -89,6 +92,7 @@ impl<E: Engine> SyncTestStorageBuilder<E> {
 #[derive(Clone)]
 pub struct SyncTestStorage<E: Engine> {
     gc_worker: GcWorker<E>,
+    snap_dir: Arc<TempDir>,
     store: Storage<E, DummyLockManager>,
 }
 
