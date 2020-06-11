@@ -1236,7 +1236,10 @@ impl<E: KvEngine> SnapManager<E> {
 
     pub fn get_temp_path_for_ingest(&self) -> String {
         let sst_id = self.core.temp_sst_id.fetch_add(1, Ordering::SeqCst);
-        let filename = format!("{}_{}.sst.{}", DEL_RANGE_PREFIX, sst_id, TMP_FILE_SUFFIX);
+        let filename = format!(
+            "{}_{}{}{}",
+            DEL_RANGE_PREFIX, sst_id, SST_FILE_SUFFIX, TMP_FILE_SUFFIX
+        );
         let path = PathBuf::from(&self.core.base).join(&filename);
         path.to_str().unwrap().to_string()
     }
