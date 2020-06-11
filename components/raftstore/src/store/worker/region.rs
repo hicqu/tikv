@@ -888,7 +888,6 @@ mod tests {
             .prefix("test_pending_applies")
             .tempdir()
             .unwrap();
-        let dir_path = temp_dir.path().join("tmp_dir");
 
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_level_zero_slowdown_writes_trigger(5);

@@ -18,7 +18,6 @@ use test_raftstore::*;
 use tikv::import::SSTImporter;
 use tikv::server::Node;
 use tikv_util::config::VersionTrack;
-use tikv_util::file::TempFileManager;
 use tikv_util::worker::{FutureWorker, Worker};
 
 fn test_bootstrap_idempotent<T: Simulator>(cluster: &mut Cluster<T>) {
@@ -97,20 +96,12 @@ fn test_node_bootstrap_with_prepared_data() {
         let dir = tmp_path.path().join("import-sst");
         Arc::new(SSTImporter::new(dir, None).unwrap())
     };
-    let tmp_mgr = {
-        let tmp_dir = Builder::new()
-            .prefix("test_cluster_tmp_mgr")
-            .tempdir()
-            .unwrap();
-        let dir_path = tmp_dir.path().to_path_buf();
-        Arc::new(TempFileManager::new(dir_path))
-    };
+
     // try to restart this node, will clear the prepare data
     node.start(
         engines,
         simulate_trans,
         snap_mgr,
-        tmp_mgr,
         pd_worker,
         Arc::new(Mutex::new(StoreMeta::new(0))),
         coprocessor_host,

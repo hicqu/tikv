@@ -1,15 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use raftstore::store::SnapManagerBuilder;
 use std::f64::INFINITY;
 use std::path::Path;
-use std::sync::{mpsc::channel, Arc};
+use std::sync::mpsc::channel;
 use std::time::Duration;
 use tikv::config::{ConfigController, Module, TiKvConfig};
 use tikv::server::gc_worker::GcConfig;
 use tikv::server::gc_worker::{GcTask, GcWorker};
 use tikv::storage::kv::TestEngineBuilder;
 use tikv_util::config::ReadableSize;
-use tikv_util::file::TempFileManager;
 use tikv_util::time::Limiter;
 use tikv_util::worker::FutureScheduler;
 
@@ -28,8 +28,11 @@ fn setup_cfg_controller(
 ) -> (GcWorker<tikv::storage::kv::RocksEngine>, ConfigController) {
     let engine = TestEngineBuilder::new().build().unwrap();
     let data_dir = Path::new("./");
-    let tmp_mgr = Arc::new(TempFileManager::new(data_dir.to_path_buf()));
-    let mut gc_worker = GcWorker::new(engine, tmp_mgr, None, None, cfg.gc.clone());
+    let path = data_dir.to_str().unwrap().to_string();
+    let snap_mgr = SnapManagerBuilder::default().build(path, None);
+    snap_mgr.init().unwrap();
+
+    let mut gc_worker = GcWorker::new(engine, snap_mgr, None, None, cfg.gc.clone());
     gc_worker.start().unwrap();
 
     let cfg_controller = ConfigController::new(cfg);
