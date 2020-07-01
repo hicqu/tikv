@@ -381,6 +381,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            Default::default(),
         );
         gc_worker.start().unwrap();
 

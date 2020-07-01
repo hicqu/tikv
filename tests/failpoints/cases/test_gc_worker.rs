@@ -20,7 +20,14 @@ fn test_gcworker_busy() {
     let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
     snap_mgr.init().unwrap();
 
-    let mut gc_worker = GcWorker::new(engine, snap_mgr, None, None, Default::default(), Default::default());
+    let mut gc_worker = GcWorker::new(
+        engine,
+        snap_mgr,
+        None,
+        None,
+        Default::default(),
+        Default::default(),
+    );
     gc_worker.start().unwrap();
 
     fail::cfg(snapshot_fp, "pause").unwrap();

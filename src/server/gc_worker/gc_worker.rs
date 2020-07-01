@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{self, AtomicU64},
     mpsc, Arc, Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use engine_rocks::{RocksEngine, RocksSnapshot};
 use engine_traits::TablePropertiesExt;

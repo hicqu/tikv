@@ -170,15 +170,14 @@ impl Simulator for ServerCluster {
             raft_engine.clone(),
         ));
 
-
-        let engine = RaftKv::new(sim_router.clone(), engines.kv.c().clone());
+        let engine = RaftKv::new(sim_router.clone(), engines.kv.clone());
         let snap_mgr = SnapManagerBuilder::default()
             .encryption_key_manager(key_manager)
             .build(tmp_str, Some(router.clone()));
         let mut gc_worker = GcWorker::new(
             engine.clone(),
             snap_mgr.clone(),
-            Some(engines.kv.c().clone()),
+            Some(engines.kv.clone()),
             Some(region_info_accessor.clone()),
             cfg.gc.clone(),
             Default::default(),

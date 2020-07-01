@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use engine_rocks::raw::{ColumnFamilyOptions, DBIterator, SeekKey as DBSeekKey, DB};
 use engine_rocks::raw_util::CFOptions;
-use engine_traits::{CfName, DeleteStrategy, MiscExt, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use engine_rocks::{RocksEngine as BaseRocksEngine, RocksEngineIterator};
+use engine_traits::{CfName, DeleteStrategy, MiscExt, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use engine_traits::{
     IterOptions, Iterable, Iterator, KvEngine, KvEngines, Mutable, Peekable, SeekKey, WriteBatchExt,
 };
@@ -305,7 +305,6 @@ impl Engine for RocksEngine {
     ) -> Result<()> {
         self.engines
             .kv
-            .c()
             .delete_all_in_range_cf(cf, strategy, start_key, end_key)
             .map_err(|e| e.into())
     }
@@ -313,7 +312,6 @@ impl Engine for RocksEngine {
     fn delete_files_in_range_cf(&self, cf: &str, start_key: &[u8], end_key: &[u8]) -> Result<()> {
         self.engines
             .kv
-            .c()
             .delete_files_in_range_cf(cf, start_key, end_key, false)
             .map_err(|e| e.into())
     }

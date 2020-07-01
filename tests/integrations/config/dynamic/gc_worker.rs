@@ -32,7 +32,14 @@ fn setup_cfg_controller(
     let snap_mgr = SnapManagerBuilder::default().build(path, None);
     snap_mgr.init().unwrap();
 
-    let mut gc_worker = GcWorker::new(engine, snap_mgr, None, None, None, cfg.gc.clone(), Default::default());
+    let mut gc_worker = GcWorker::new(
+        engine,
+        snap_mgr,
+        None,
+        None,
+        cfg.gc.clone(),
+        Default::default(),
+    );
     gc_worker.start().unwrap();
 
     let cfg_controller = ConfigController::new(cfg);

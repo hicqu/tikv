@@ -404,7 +404,7 @@ impl TiKVServer {
         let mut gc_worker = GcWorker::new(
             engines.engine.clone(),
             self.snap_mgr.clone(),
-            Some(engines.engines.kv.c().clone()),
+            Some(engines.engines.kv.clone()),
             Some(self.region_info_accessor.clone()),
             self.config.gc.clone(),
             self.pd_client.cluster_version(),
