@@ -14,12 +14,13 @@ use tempfile::TempDir;
 fn test_gcworker_busy() {
     let snapshot_fp = "raftkv_async_snapshot";
     let (_cluster, engine, ctx) = new_raft_engine(3, "");
+
     let tmp_dir = TempDir::new().unwrap();
     let dir_path = tmp_dir.path().to_path_buf().to_str().unwrap().to_string();
     let snap_mgr = SnapManagerBuilder::default().build(dir_path, None);
     snap_mgr.init().unwrap();
 
-    let mut gc_worker = GcWorker::new(engine, snap_mgr, None, None, Default::default());
+    let mut gc_worker = GcWorker::new(engine, snap_mgr, None, None, Default::default(), Default::default());
     gc_worker.start().unwrap();
 
     fail::cfg(snapshot_fp, "pause").unwrap();
