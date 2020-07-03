@@ -435,6 +435,10 @@ impl<S: RaftStoreRouter<RocksSnapshot>> Engine for RaftKv<S> {
                         }
                         let local_state = protobuf::parse_from_bytes::<RegionLocalState>(value)?;
                         let region = local_state.get_region();
+                        if region.get_peers().is_empty() {
+                            return Ok(true);
+                        }
+
                         let key = keys::enc_end_key(region);
                         if key > start_data_key && key < end_data_key {
                             region_ranges.push(key);
