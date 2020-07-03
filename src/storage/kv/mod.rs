@@ -202,11 +202,14 @@ pub trait Engine: Send + Clone + 'static {
                 DeleteStrategy::DeleteByKey
             } else {
                 DeleteStrategy::DeleteByWriter {
-                    sst_path: sst_path.clone() + cf,
+                    sst_path: sst_path.clone(),
                 }
             };
+            // The file will be removed when error occurs, so we can share the same name.
             self.delete_all_in_range_cf(cf, cf_strategy, &start_data_key, &end_data_key)
                 .map_err(|e| {
+                    // Ignore error because this file may have moved to engine path.
+                    let _ = std::fs::remove_file(sst_path.as_str());
                     let e: Error = box_err!(e);
                     warn!(
                         "unsafe destroy range failed at delete_all_in_range_cf"; "err" => ?e
