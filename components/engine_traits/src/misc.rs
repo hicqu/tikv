@@ -65,49 +65,24 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
     fn delete_all_in_range_cf_by_ingest(
         &self,
         cf: &str,
-        sst_path: &str,
-        opts: IterOptions,
         start_key: &[u8],
+        end_key: &[u8],
+        writer: &mut Self::SstWriter,
     ) -> Result<()> {
-        let mut wb = self.write_batch();
-        let mut data = vec![];
-        let mut sst_writer: Option<Self::SstWriter> = None;
+        let start = KeyBuilder::from_slice(start_key, 0, 0);
+        let end = KeyBuilder::from_slice(end_key, 0, 0);
+        let mut opts = IterOptions::new(Some(start), Some(end), false);
+        if self.is_titan() {
+            // Cause DeleteFilesInRange may expose old blob index keys, setting key only for Titan
+            // to avoid referring to missing blob files.
+            opts.set_key_only(true);
+        }
         let mut it = self.iterator_cf_opt(cf, opts)?;
         let mut it_valid = it.seek(start_key.into())?;
+
         while it_valid {
-            if let Some(writer) = sst_writer.as_mut() {
-                writer.delete(it.key())?;
-            } else {
-                data.push(it.key().to_vec());
-                if data.len() > MAX_DELETE_COUNT_BY_KEY {
-                    let builder = Self::SstWriterBuilder::new().set_db(self).set_cf(cf);
-                    let mut writer = builder.build(sst_path)?;
-                    for key in data.iter() {
-                        writer.delete(key)?;
-                    }
-                    sst_writer = Some(writer);
-                    data.clear();
-                }
-            }
+            writer.delete(it.key())?;
             it_valid = it.next()?;
-        }
-        if let Some(writer) = sst_writer {
-            writer.finish()?;
-            let handle = self.cf_handle(cf)?;
-            let mut opt = Self::IngestExternalFileOptions::new();
-            opt.move_files(true);
-            return self.ingest_external_file_cf(handle, &opt, &[sst_path]);
-        } else {
-            for key in data.iter() {
-                wb.delete_cf(cf, key)?;
-                if wb.count() >= MAX_DELETE_BATCH_SIZE {
-                    self.write(&wb)?;
-                    wb.clear();
-                }
-            }
-            if wb.count() > 0 {
-                self.write(&wb)?;
-            }
         }
         Ok(())
     }
@@ -152,12 +127,43 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                 }
             }
             DeleteStrategy::DeleteByWriter { sst_path } => {
-                if let Err(e) =
-                    self.delete_all_in_range_cf_by_ingest(cf, sst_path.as_str(), opts, start_key)
-                {
-                    // Ignore error because this file may have moved to engine path.
-                    let _ = std::fs::remove_file(sst_path.as_str());
-                    return Err(e);
+                let mut data: Vec<Vec<u8>> = vec![];
+                let mut it = self.iterator_cf_opt(cf, opts)?;
+                let mut it_valid = it.seek(start_key.into())?;
+                while it_valid {
+                    if data.len() > MAX_DELETE_COUNT_BY_KEY {
+                        let builder = Self::SstWriterBuilder::new().set_db(self).set_cf(cf);
+                        let mut writer = builder.build(sst_path.as_str())?;
+                        for key in data.iter() {
+                            writer.delete(key).unwrap();
+                        }
+                        let start_key = it.key().to_vec();
+                        drop(it);
+                        self.delete_all_in_range_cf_by_ingest(
+                            cf,
+                            &start_key,
+                            end_key,
+                            &mut writer,
+                        )?;
+                        writer.finish()?;
+                        let handle = self.cf_handle(cf)?;
+                        let mut opt = Self::IngestExternalFileOptions::new();
+                        opt.move_files(true);
+                        return self.ingest_external_file_cf(handle, &opt, &[sst_path.as_str()]);
+                    }
+                    data.push(it.key().to_vec());
+                    it_valid = it.next()?;
+                }
+                let mut wb = self.write_batch();
+                for key in data.iter() {
+                    wb.delete_cf(cf, key)?;
+                    if wb.count() >= MAX_DELETE_BATCH_SIZE {
+                        self.write(&wb)?;
+                        wb.clear();
+                    }
+                }
+                if wb.count() > 0 {
+                    self.write(&wb)?;
                 }
             }
         }

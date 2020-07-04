@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use std::u64;
 
 use engine_rocks::RocksEngine;
-use engine_traits::{DeleteStrategy, CF_LOCK, CF_RAFT};
-use engine_traits::{KvEngine, KvEngines, Mutable};
+use engine_traits::{DeleteStrategy, CF_LOCK, CF_RAFT, CF_WRITE};
+use engine_traits::{
+    IngestExternalFileOptions, KvEngine, KvEngines, Mutable, SstWriter, SstWriterBuilder,
+};
 use kvproto::raft_serverpb::{PeerState, RaftApplyState, RegionLocalState};
 use raft::eraftpb::Snapshot as RaftSnapshot;
 
@@ -41,7 +43,7 @@ pub const STALE_PEER_CHECK_INTERVAL: u64 = 10_000; // 10000 milliseconds
 // used to periodically check whether schedule pending applies in region runner
 pub const PENDING_APPLY_CHECK_INTERVAL: u64 = 1_000; // 1000 milliseconds
 
-const CLEANUP_MAX_DURATION: Duration = Duration::from_secs(5);
+const CLEANUP_MAX_DURATION: Duration = Duration::from_secs(2);
 
 /// Region related task
 #[derive(Debug)]
@@ -501,16 +503,22 @@ where
         let mut cleaned_range_keys = vec![];
         {
             let now = Instant::now();
-            let ranges: Vec<(u64, &[u8], &[u8])> = self
+            let mut ranges: Vec<(u64, &[u8], &[u8])> = self
                 .pending_delete_ranges
                 .stale_ranges(oldest_sequence)
                 .collect();
-            if ranges.len() > GENERATE_POOL_SIZE * 2 {
+            if ranges.len() > GENERATE_POOL_SIZE * 3 {
+                ranges.sort_by(|a, b| a.1.cmp(&b.1));
                 let mut result = Vec::default();
                 let range_per_thread = ranges.len() / (GENERATE_POOL_SIZE + 1);
                 for i in 0..(GENERATE_POOL_SIZE + 1) {
-                    let mut task_regions = Vec::with_capacity(range_per_thread);
-                    for j in 0..range_per_thread {
+                    let cur_task_size = if i == GENERATE_POOL_SIZE {
+                        ranges.len() - range_per_thread * GENERATE_POOL_SIZE;
+                    } else {
+                        range_per_thread
+                    };
+                    let mut task_regions = Vec::with_capacity(cur_task_size);
+                    for j in 0..cur_task_size {
                         let idx = i * range_per_thread + j;
                         task_regions.push((
                             ranges[idx].0,
@@ -519,14 +527,20 @@ where
                         ));
                     }
                     let sst_path = self.mgr.get_temp_path_for_ingest();
+                    let sst_path_for_share = self.mgr.get_temp_path_for_ingest();
                     if i == GENERATE_POOL_SIZE {
-                        cleaned_range_keys =
-                            cleanup_range(&self.engines.kv, task_regions, sst_path);
+                        cleaned_range_keys = cleanup_range(
+                            &self.engines.kv,
+                            task_regions,
+                            sst_path,
+                            sst_path_for_share,
+                        );
                     } else {
                         let (tx, rx) = channel();
                         let engine = self.engines.kv.clone();
                         self.remote.spawn(async move {
-                            let ret = cleanup_range(&engine, task_regions, sst_path);
+                            let ret =
+                                cleanup_range(&engine, task_regions, sst_path, sst_path_for_share);
                             let _ = tx.send(ret);
                         });
                         result.push(rx);
@@ -683,12 +697,19 @@ where
 
 fn cleanup_range<E: KvEngine>(
     engine: &E,
-    ranges: Vec<(u64, Vec<u8>, Vec<u8>)>,
+    mut ranges: Vec<(u64, Vec<u8>, Vec<u8>)>,
     sst_path: String,
+    share_sst_path: String,
 ) -> Vec<Vec<u8>> {
     let strategy = DeleteStrategy::DeleteByWriter { sst_path };
     let now = Instant::now();
     let mut regions = Vec::with_capacity(ranges.len());
+    ranges.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut last_end = vec![];
+    let builder = E::SstWriterBuilder::new().set_db(engine).set_cf(CF_WRITE);
+    let mut writer = builder.build(share_sst_path.as_str()).unwrap();
+    let mut del_by_ingest = 0;
+
     for (region_id, start_key, end_key) in ranges.into_iter() {
         if let Err(e) = engine.delete_all_files_in_range(&start_key, &end_key) {
             error!(
@@ -702,9 +723,14 @@ fn cleanup_range<E: KvEngine>(
         }
         let mut has_err = false;
         for cf in engine.cf_names() {
-            if let Err(e) =
+            let ret = if cf == CF_WRITE && start_key >= last_end {
+                del_by_ingest += 1;
+                engine.delete_all_in_range_cf_by_ingest(cf, &start_key, &end_key, &mut writer)
+            } else {
                 engine.delete_all_in_range_cf(cf, strategy.clone(), &start_key, &end_key)
-            {
+            };
+
+            if let Err(e) = ret {
                 error!(
                     "failed to delete keys in range";
                     "region_id" => region_id,
@@ -718,13 +744,24 @@ fn cleanup_range<E: KvEngine>(
         if !has_err {
             regions.push(start_key);
         }
+        last_end = end_key;
         let elapsed = now.elapsed();
         if elapsed >= CLEANUP_MAX_DURATION {
             let len = regions.len();
             let elapsed = elapsed.as_millis() as f64 / 1000f64;
-            info!("clean stale ranges, now backoff"; "region_count" => len, "time_takes" => elapsed);
+            info!("clean stale ranges, now backoff"; "region_count" => len, "time_takes" => elapsed, "delete_by_ingest" => del_by_ingest);
             break;
         }
+    }
+    if let Err(e) = writer.finish() {
+        error!("failed to finish writer"; "err" => %e);
+        regions.clear();
+    }
+    let handle = engine.cf_handle(CF_WRITE).unwrap();
+    let mut opt = E::IngestExternalFileOptions::new();
+    opt.move_files(true);
+    if let Err(_) = engine.ingest_external_file_cf(handle, &opt, &[share_sst_path.as_str()]) {
+        regions.clear();
     }
     regions
 }
@@ -832,11 +869,11 @@ mod tests {
 
     use crate::coprocessor::CoprocessorHost;
     use crate::store::peer_storage::JOB_STATUS_PENDING;
-    use crate::store::snap::tests::get_test_db_for_regions;
+    use crate::store::snap::tests::{get_test_db_for_regions, open_test_db};
     use crate::store::worker::RegionRunner;
     use crate::store::{CasualMessage, SnapKey, SnapManager};
     use engine_rocks::raw::ColumnFamilyOptions;
-    use engine_rocks::RocksEngine;
+    use engine_rocks::{Compat, RocksEngine};
     use engine_traits::{
         CFHandleExt, CFNamesExt, CompactExt, MiscExt, Mutable, Peekable, SyncMutable, WriteBatchExt,
     };
@@ -848,6 +885,7 @@ mod tests {
     use tikv_util::timer::Timer;
     use tikv_util::worker::Worker;
 
+    use super::cleanup_range;
     use super::Event;
     use super::PendingDeleteRanges;
     use super::Task;
@@ -1195,5 +1233,64 @@ mod tests {
             engine_rocks::util::get_cf_num_files_at_level(engine.kv.as_inner(), cf, 0).unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn test_cleanup_range_by_ingest() {
+        let temp_dir = Builder::new()
+            .prefix("test_cleanup_range_by_ingest")
+            .tempdir()
+            .unwrap();
+        let path = temp_dir.path();
+        let p1 = path.join("p1").to_str().unwrap().to_string();
+        let p2 = path.join("p2").to_str().unwrap().to_string();
+
+        let mut cf_opts = ColumnFamilyOptions::new();
+        cf_opts.set_level_zero_slowdown_writes_trigger(5);
+        cf_opts.set_disable_auto_compactions(true);
+        let kv_cfs_opts = vec![
+            engine_rocks::raw_util::CFOptions::new("default", cf_opts.clone()),
+            engine_rocks::raw_util::CFOptions::new("write", cf_opts.clone()),
+            engine_rocks::raw_util::CFOptions::new("lock", cf_opts.clone()),
+            engine_rocks::raw_util::CFOptions::new("raft", cf_opts.clone()),
+        ];
+        let db = open_test_db(path.join("kv").as_path(), None, Some(kv_cfs_opts)).unwrap();
+        let engine = db.c().clone();
+        let mut regions = vec![];
+
+        for i in 0..2 {
+            let mut wb = engine.write_batch();
+            let start_idx = (i + 1) * 10000;
+            for cf_name in engine.cf_names() {
+                let key_count = if cf_name == CF_DEFAULT { 3000 } else { 10 };
+                for j in 0..key_count {
+                    let key = (start_idx + j).to_string();
+                    wb.put_cf(cf_name, key.as_bytes(), b"v0").unwrap();
+                }
+            }
+            engine.write(&wb).unwrap();
+            let end_idx = (i + 2) * 10000;
+            regions.push((
+                i as u64 + 1,
+                start_idx.to_string().as_bytes().to_vec(),
+                end_idx.to_string().as_bytes().to_vec(),
+            ));
+        }
+        let ret = cleanup_range(&engine, regions, p1, p2);
+        for i in 0..2 {
+            for cf in engine.cf_names() {
+                let start_idx = (i + 1) * 10000;
+                let key_count = if cf == CF_DEFAULT { 3000 } else { 10 };
+                for j in 0..key_count {
+                    let key = (start_idx + j).to_string();
+                    assert!(
+                        engine.get_value_cf(cf, key.as_bytes()).unwrap().is_none(),
+                        "key {} in cf {} should not exist",
+                        key.as_str(),
+                        cf,
+                    );
+                }
+            }
+        }
     }
 }
