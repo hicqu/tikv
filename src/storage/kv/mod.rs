@@ -160,7 +160,7 @@ pub trait Engine: Send + Clone + 'static {
         _strategy: DeleteStrategy,
         _start_key: &[u8],
         _end_key: &[u8],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         Err(box_err!("not support delete all in range cf"))
     }
 

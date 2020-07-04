@@ -302,7 +302,7 @@ impl Engine for RocksEngine {
         strategy: DeleteStrategy,
         start_key: &[u8],
         end_key: &[u8],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         self.engines
             .kv
             .delete_all_in_range_cf(cf, strategy, start_key, end_key)

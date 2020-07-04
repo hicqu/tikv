@@ -44,6 +44,7 @@ pub const STALE_PEER_CHECK_INTERVAL: u64 = 10_000; // 10000 milliseconds
 pub const PENDING_APPLY_CHECK_INTERVAL: u64 = 1_000; // 1000 milliseconds
 
 const CLEANUP_MAX_DURATION: Duration = Duration::from_secs(2);
+const CLEANUP_MAX_KEY_COUNT: usize = 1_000_000;
 
 /// Region related task
 #[derive(Debug)]
@@ -513,7 +514,7 @@ where
                 let range_per_thread = ranges.len() / (GENERATE_POOL_SIZE + 1);
                 for i in 0..(GENERATE_POOL_SIZE + 1) {
                     let cur_task_size = if i == GENERATE_POOL_SIZE {
-                        ranges.len() - range_per_thread * GENERATE_POOL_SIZE;
+                        ranges.len() - range_per_thread * GENERATE_POOL_SIZE
                     } else {
                         range_per_thread
                     };
@@ -708,7 +709,7 @@ fn cleanup_range<E: KvEngine>(
     let mut last_end = vec![];
     let builder = E::SstWriterBuilder::new().set_db(engine).set_cf(CF_WRITE);
     let mut writer = builder.build(share_sst_path.as_str()).unwrap();
-    let mut del_by_ingest = 0;
+    let mut delete_count = 0;
 
     for (region_id, start_key, end_key) in ranges.into_iter() {
         if let Err(e) = engine.delete_all_files_in_range(&start_key, &end_key) {
@@ -724,34 +725,41 @@ fn cleanup_range<E: KvEngine>(
         let mut has_err = false;
         for cf in engine.cf_names() {
             let ret = if cf == CF_WRITE && start_key >= last_end {
-                del_by_ingest += 1;
                 engine.delete_all_in_range_cf_by_ingest(cf, &start_key, &end_key, &mut writer)
             } else {
                 engine.delete_all_in_range_cf(cf, strategy.clone(), &start_key, &end_key)
             };
 
-            if let Err(e) = ret {
-                error!(
-                    "failed to delete keys in range";
-                    "region_id" => region_id,
-                    "start_key" => log_wrappers::Key(&start_key),
-                    "end_key" => log_wrappers::Key(&end_key),
-                    "err" => %e,
-                );
-                has_err = true;
+            match ret {
+                Ok(count) => {
+                    delete_count += count;
+                }
+                Err(e) => {
+                    error!(
+                        "failed to delete keys in range";
+                        "region_id" => region_id,
+                        "start_key" => log_wrappers::Key(&start_key),
+                        "end_key" => log_wrappers::Key(&end_key),
+                        "err" => %e,
+                    );
+                    has_err = true;
+                }
             }
         }
         if !has_err {
-            regions.push(start_key);
+            regions.push(start_key.clone());
         }
         last_end = end_key;
         let elapsed = now.elapsed();
-        if elapsed >= CLEANUP_MAX_DURATION {
+        if elapsed >= CLEANUP_MAX_DURATION || delete_count >= CLEANUP_MAX_KEY_COUNT {
             let len = regions.len();
             let elapsed = elapsed.as_millis() as f64 / 1000f64;
-            info!("clean stale ranges, now backoff"; "region_count" => len, "time_takes" => elapsed, "delete_by_ingest" => del_by_ingest);
+            info!("clean stale ranges, now backoff"; "region_count" => len, "time_takes" => elapsed, "delete_key_count" => delete_count);
             break;
         }
+    }
+    if delete_count == 0 {
+        return regions;
     }
     if let Err(e) = writer.finish() {
         error!("failed to finish writer"; "err" => %e);
@@ -1258,7 +1266,7 @@ mod tests {
         let engine = db.c().clone();
         let mut regions = vec![];
 
-        for i in 0..2 {
+        for i in 0..4 {
             let mut wb = engine.write_batch();
             let start_idx = (i + 1) * 10000;
             for cf_name in engine.cf_names() {
@@ -1277,7 +1285,8 @@ mod tests {
             ));
         }
         let ret = cleanup_range(&engine, regions, p1, p2);
-        for i in 0..2 {
+        assert_eq!(ret.len(), 4);
+        for i in 0..4 {
             for cf in engine.cf_names() {
                 let start_idx = (i + 1) * 10000;
                 let key_count = if cf == CF_DEFAULT { 3000 } else { 10 };

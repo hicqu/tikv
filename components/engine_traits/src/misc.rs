@@ -68,7 +68,7 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
         start_key: &[u8],
         end_key: &[u8],
         writer: &mut Self::SstWriter,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let start = KeyBuilder::from_slice(start_key, 0, 0);
         let end = KeyBuilder::from_slice(end_key, 0, 0);
         let mut opts = IterOptions::new(Some(start), Some(end), false);
@@ -77,14 +77,16 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
             // to avoid referring to missing blob files.
             opts.set_key_only(true);
         }
+        let mut count = 0;
         let mut it = self.iterator_cf_opt(cf, opts)?;
         let mut it_valid = it.seek(start_key.into())?;
 
         while it_valid {
             writer.delete(it.key())?;
             it_valid = it.next()?;
+            count += 1;
         }
-        Ok(())
+        Ok(count)
     }
 
     fn delete_all_in_range_cf(
@@ -93,7 +95,7 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
         strategy: DeleteStrategy,
         start_key: &[u8],
         end_key: &[u8],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let mut wb = self.write_batch();
         let start = KeyBuilder::from_slice(start_key, 0, 0);
         let end = KeyBuilder::from_slice(end_key, 0, 0);
@@ -103,11 +105,12 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
             // to avoid referring to missing blob files.
             opts.set_key_only(true);
         }
+        let mut count = 0;
 
         match strategy {
             DeleteStrategy::DeleteByRange => {
                 wb.delete_range_cf(cf, start_key, end_key)?;
-                return self.write(&wb);
+                self.write(&wb)?;
             }
             DeleteStrategy::DeleteByKey => {
                 let mut it = self.iterator_cf_opt(cf, opts)?;
@@ -139,7 +142,7 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                         }
                         let start_key = it.key().to_vec();
                         drop(it);
-                        self.delete_all_in_range_cf_by_ingest(
+                        count += self.delete_all_in_range_cf_by_ingest(
                             cf,
                             &start_key,
                             end_key,
@@ -149,14 +152,16 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                         let handle = self.cf_handle(cf)?;
                         let mut opt = Self::IngestExternalFileOptions::new();
                         opt.move_files(true);
-                        return self.ingest_external_file_cf(handle, &opt, &[sst_path.as_str()]);
+                        self.ingest_external_file_cf(handle, &opt, &[sst_path.as_str()])?;
+                        return Ok(count);
                     }
+                    count += 1;
                     data.push(it.key().to_vec());
                     it_valid = it.next()?;
                 }
-                let mut wb = self.write_batch();
                 for key in data.iter() {
                     wb.delete_cf(cf, key)?;
+                    count += 1;
                     if wb.count() >= MAX_DELETE_BATCH_SIZE {
                         self.write(&wb)?;
                         wb.clear();
@@ -167,7 +172,7 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                 }
             }
         }
-        Ok(())
+        return Ok(count);
     }
 
     fn delete_all_files_in_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<()> {

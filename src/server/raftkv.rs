@@ -405,7 +405,7 @@ impl<S: RaftStoreRouter<RocksSnapshot>> Engine for RaftKv<S> {
         strategy: DeleteStrategy,
         start_key: &[u8],
         end_key: &[u8],
-    ) -> kv::Result<()> {
+    ) -> kv::Result<usize> {
         self.engine
             .delete_all_in_range_cf(cf, strategy, start_key, end_key)
             .map_err(|e| e.into())
