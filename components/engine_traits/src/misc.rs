@@ -19,10 +19,6 @@ use tikv_util::keybuilder::KeyBuilder;
 
 pub const MAX_DELETE_BATCH_SIZE: usize = 256;
 
-#[cfg(test)]
-const MAX_DELETE_COUNT_BY_KEY: usize = 4;
-
-#[cfg(not(test))]
 const MAX_DELETE_COUNT_BY_KEY: usize = 2048;
 
 #[derive(Clone)]

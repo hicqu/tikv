@@ -4,7 +4,7 @@ use std::collections::Bound::{Excluded, Included, Unbounded};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{channel, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::u64;
@@ -25,7 +25,7 @@ use crate::store::transport::CasualRouter;
 use crate::store::{
     self, check_abort, ApplyOptions, CasualMessage, SnapEntry, SnapKey, SnapManager,
 };
-use yatp::pool::{Builder, ThreadPool};
+use yatp::pool::{Builder, Remote, ThreadPool};
 use yatp::task::future::TaskCell;
 
 use tikv_util::timer::Timer;
@@ -219,6 +219,7 @@ where
     ER: KvEngine,
 {
     engines: KvEngines<EK, ER>,
+    remote: Remote<TaskCell>,
     batch_size: usize,
     mgr: SnapManager<EK>,
     use_delete_range: bool,
@@ -500,19 +501,62 @@ where
         let mut cleaned_range_keys = vec![];
         {
             let now = Instant::now();
-            for (region_id, start_key, end_key) in
-                self.pending_delete_ranges.stale_ranges(oldest_sequence)
-            {
-                self.cleanup_range(
-                    region_id, start_key, end_key, true, /* use_delete_files */
-                );
-                cleaned_range_keys.push(start_key.to_vec());
-                let elapsed = now.elapsed();
-                if elapsed >= CLEANUP_MAX_DURATION {
-                    let len = cleaned_range_keys.len();
-                    let elapsed = elapsed.as_millis() as f64 / 1000f64;
-                    info!("clean stale ranges, now backoff"; "key_count" => len, "time_takes" => elapsed);
-                    break;
+            let ranges: Vec<(u64, &[u8], &[u8])> = self
+                .pending_delete_ranges
+                .stale_ranges(oldest_sequence)
+                .collect();
+            if ranges.len() > GENERATE_POOL_SIZE * 2 {
+                let mut result = Vec::default();
+                let range_per_thread = ranges.len() / (GENERATE_POOL_SIZE + 1);
+                for i in 0..(GENERATE_POOL_SIZE + 1) {
+                    let mut task_regions = Vec::with_capacity(range_per_thread);
+                    for j in 0..range_per_thread {
+                        let idx = i * range_per_thread + j;
+                        task_regions.push((
+                            ranges[idx].0,
+                            ranges[idx].1.to_vec(),
+                            ranges[idx].2.to_vec(),
+                        ));
+                    }
+                    let sst_path = self.mgr.get_temp_path_for_ingest();
+                    if i == GENERATE_POOL_SIZE {
+                        cleaned_range_keys =
+                            cleanup_range(&self.engines.kv, task_regions, sst_path);
+                    } else {
+                        let (tx, rx) = channel();
+                        let engine = self.engines.kv.clone();
+                        self.remote.spawn(async move {
+                            let ret = cleanup_range(&engine, task_regions, sst_path);
+                            let _ = tx.send(ret);
+                        });
+                        result.push(rx);
+                    }
+                }
+                for r in result.into_iter() {
+                    match r.recv() {
+                        Ok(ret) => {
+                            for r in ret.into_iter() {
+                                cleaned_range_keys.push(r);
+                            }
+                        }
+                        Err(e) => {
+                            error!("run cleanup error, {:?}", e);
+                        }
+                    }
+                }
+            } else {
+                for (region_id, start_key, end_key) in ranges {
+                    self.cleanup_range(
+                        region_id, start_key, end_key, true, /* use_delete_files */
+                    );
+                    cleaned_range_keys.push(start_key.to_vec());
+                    let elapsed = now.elapsed();
+                    if elapsed >= CLEANUP_MAX_DURATION {
+                        let len = cleaned_range_keys.len();
+                        let elapsed = elapsed.as_millis() as f64 / 1000f64;
+                        info!("clean stale ranges, now backoff"; "key_count" => len, "time_takes" => elapsed);
+                        break;
+                    }
                 }
             }
         }
@@ -588,11 +632,12 @@ where
         coprocessor_host: CoprocessorHost<RocksEngine>,
         router: R,
     ) -> Runner<EK, ER, R> {
+        let pool = Builder::new(thd_name!("snap-generator"))
+            .max_thread_count(GENERATE_POOL_SIZE)
+            .build_future_pool();
+        let remote = pool.remote().clone();
         Runner {
-            pool: Builder::new(thd_name!("snap-generator"))
-                .max_thread_count(GENERATE_POOL_SIZE)
-                .build_future_pool(),
-
+            pool,
             ctx: SnapContext {
                 engines,
                 mgr,
@@ -601,6 +646,7 @@ where
                 pending_delete_ranges: PendingDeleteRanges::default(),
                 coprocessor_host,
                 router,
+                remote,
             },
             pending_applies: VecDeque::new(),
         }
@@ -633,6 +679,54 @@ where
             }
         }
     }
+}
+
+fn cleanup_range<E: KvEngine>(
+    engine: &E,
+    ranges: Vec<(u64, Vec<u8>, Vec<u8>)>,
+    sst_path: String,
+) -> Vec<Vec<u8>> {
+    let strategy = DeleteStrategy::DeleteByWriter { sst_path };
+    let now = Instant::now();
+    let mut regions = Vec::with_capacity(ranges.len());
+    for (region_id, start_key, end_key) in ranges.into_iter() {
+        if let Err(e) = engine.delete_all_files_in_range(&start_key, &end_key) {
+            error!(
+                "failed to delete files in range";
+                "region_id" => region_id,
+                "start_key" => log_wrappers::Key(&start_key),
+                "end_key" => log_wrappers::Key(&end_key),
+                "err" => %e,
+            );
+            continue;
+        }
+        let mut has_err = false;
+        for cf in engine.cf_names() {
+            if let Err(e) =
+                engine.delete_all_in_range_cf(cf, strategy.clone(), &start_key, &end_key)
+            {
+                error!(
+                    "failed to delete keys in range";
+                    "region_id" => region_id,
+                    "start_key" => log_wrappers::Key(&start_key),
+                    "end_key" => log_wrappers::Key(&end_key),
+                    "err" => %e,
+                );
+                has_err = true;
+            }
+        }
+        if !has_err {
+            regions.push(start_key);
+        }
+        let elapsed = now.elapsed();
+        if elapsed >= CLEANUP_MAX_DURATION {
+            let len = regions.len();
+            let elapsed = elapsed.as_millis() as f64 / 1000f64;
+            info!("clean stale ranges, now backoff"; "region_count" => len, "time_takes" => elapsed);
+            break;
+        }
+    }
+    regions
 }
 
 impl<EK, ER, R> Runnable<Task<EK::Snapshot>> for Runner<EK, ER, R>
