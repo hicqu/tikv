@@ -47,7 +47,7 @@ impl MiscExt for RocksEngine {
             let slowdown_trigger = options.get_level_zero_slowdown_writes_trigger();
             // Leave enough buffer to tolerate heavy write workload,
             // which may flush some memtables in a short time.
-            if n > u64::from(slowdown_trigger) / 2 {
+            if n + 2 >= u64::from(slowdown_trigger) {
                 return Ok(true);
             }
         }

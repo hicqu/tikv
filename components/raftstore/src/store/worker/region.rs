@@ -606,7 +606,9 @@ where
 
     fn delete_all_in_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<()> {
         for cf in self.engines.kv.cf_names() {
-            let strategy = if self.use_delete_range && cf != CF_LOCK {
+            let strategy = if cf == CF_LOCK {
+                DeleteStrategy::DeleteByKey
+            } else if self.use_delete_range {
                 DeleteStrategy::DeleteByRange
             } else {
                 let sst_path = self.mgr.get_temp_path_for_ingest();
@@ -724,15 +726,28 @@ fn cleanup_range<E: KvEngine>(
         }
         let mut has_err = false;
         for cf in engine.cf_names() {
-            let ret = if cf == CF_WRITE && start_key >= last_end {
+            let mut has_keys = false;
+            if cf == CF_WRITE && start_key > last_end {
+                let _ = engine.scan_cf(cf, &last_end, &start_key, false, |_, _| {
+                    has_keys = true;
+                    Ok(false)
+                });
+            }
+            // If there is some keys between last_end and start_key of this region, we shall put
+            // this region in an independent sst writer to avoid this sst overlap with data which
+            // was not deleted.
+            let ret = if cf == CF_WRITE && !has_keys {
                 engine.delete_all_in_range_cf_by_ingest(cf, &start_key, &end_key, &mut writer)
+            } else if cf == CF_LOCK {
+                engine.delete_all_in_range_cf(cf, DeleteStrategy::DeleteByKey, &start_key, &end_key)
             } else {
                 engine.delete_all_in_range_cf(cf, strategy.clone(), &start_key, &end_key)
             };
-
             match ret {
                 Ok(count) => {
-                    delete_count += count;
+                    if cf == CF_WRITE && !has_keys {
+                        delete_count += count;
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -754,7 +769,7 @@ fn cleanup_range<E: KvEngine>(
         if elapsed >= CLEANUP_MAX_DURATION || delete_count >= CLEANUP_MAX_KEY_COUNT {
             let len = regions.len();
             let elapsed = elapsed.as_millis() as f64 / 1000f64;
-            info!("clean stale ranges, now backoff"; "region_count" => len, "time_takes" => elapsed, "delete_key_count" => delete_count);
+            info!("clean stale ranges, now backoff"; "region_count" => len, "time_takes" => elapsed, "delete_key_by_share_sst" => delete_count);
             break;
         }
     }
@@ -768,7 +783,8 @@ fn cleanup_range<E: KvEngine>(
     let handle = engine.cf_handle(CF_WRITE).unwrap();
     let mut opt = E::IngestExternalFileOptions::new();
     opt.move_files(true);
-    if let Err(_) = engine.ingest_external_file_cf(handle, &opt, &[share_sst_path.as_str()]) {
+    if let Err(e) = engine.ingest_external_file_cf(handle, &opt, &[share_sst_path.as_str()]) {
+        error!("failed to ingest file"; "err" => %e);
         regions.clear();
     }
     regions
@@ -1277,7 +1293,7 @@ mod tests {
                 }
             }
             engine.write(&wb).unwrap();
-            let end_idx = (i + 2) * 10000;
+            let end_idx = (i + 2) * 10000 - 1;
             regions.push((
                 i as u64 + 1,
                 start_idx.to_string().as_bytes().to_vec(),

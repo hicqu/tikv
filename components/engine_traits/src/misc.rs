@@ -92,7 +92,7 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
     fn delete_all_in_range_cf(
         &self,
         cf: &str,
-        strategy: DeleteStrategy,
+        mut strategy: DeleteStrategy,
         start_key: &[u8],
         end_key: &[u8],
     ) -> Result<usize> {
@@ -106,6 +106,9 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
             opts.set_key_only(true);
         }
         let mut count = 0;
+        if self.ingest_maybe_slowdown_writes(cf)? {
+            strategy = DeleteStrategy::DeleteByKey;
+        }
 
         match strategy {
             DeleteStrategy::DeleteByRange => {
