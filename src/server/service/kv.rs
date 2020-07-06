@@ -689,7 +689,13 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, E: Engine, L: LockManager> Tik
         };
 
         if let Err(e) = self.ch.casual_send(region_id, req) {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::RESOURCE_EXHAUSTED);
+            let mut resp = SplitRegionResponse::new();
+            resp.mut_region_error()
+                .mut_region_not_found()
+                .set_region_id(region_id);
+            ctx.spawn(sink.success(resp).map_err(|e| {
+                error!("response split_region RPC fail: {}", e);
+            }));
             return;
         }
 
