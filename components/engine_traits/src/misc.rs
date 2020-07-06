@@ -126,6 +126,7 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                         self.write(&wb)?;
                         wb.clear();
                     }
+                    count += 1;
                     it_valid = it.next()?;
                 }
                 if wb.count() > 0 {
@@ -164,7 +165,6 @@ pub trait MiscExt: Iterable + WriteBatchExt + CFNamesExt + SstExt + ImportExt {
                 }
                 for key in data.iter() {
                     wb.delete_cf(cf, key)?;
-                    count += 1;
                     if wb.count() >= MAX_DELETE_BATCH_SIZE {
                         self.write(&wb)?;
                         wb.clear();

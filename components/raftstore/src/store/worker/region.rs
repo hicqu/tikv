@@ -43,8 +43,8 @@ pub const STALE_PEER_CHECK_INTERVAL: u64 = 10_000; // 10000 milliseconds
 // used to periodically check whether schedule pending applies in region runner
 pub const PENDING_APPLY_CHECK_INTERVAL: u64 = 1_000; // 1000 milliseconds
 
-const CLEANUP_MAX_DURATION: Duration = Duration::from_secs(2);
-const CLEANUP_MAX_KEY_COUNT: usize = 1_000_000;
+const CLEANUP_MAX_DURATION: Duration = Duration::from_secs(1);
+const CLEANUP_MAX_KEY_COUNT: usize = 2_000_000;
 
 /// Region related task
 #[derive(Debug)]
@@ -708,7 +708,6 @@ fn cleanup_range<E: KvEngine>(
     let now = Instant::now();
     let mut regions = Vec::with_capacity(ranges.len());
     ranges.sort_by(|a, b| a.1.cmp(&b.1));
-    let mut last_end = vec![];
     let builder = E::SstWriterBuilder::new().set_db(engine).set_cf(CF_WRITE);
     let mut writer = builder.build(share_sst_path.as_str()).unwrap();
     let mut delete_count = 0;
@@ -726,26 +725,16 @@ fn cleanup_range<E: KvEngine>(
         }
         let mut has_err = false;
         for cf in engine.cf_names() {
-            let mut has_keys = false;
-            if cf == CF_WRITE && start_key > last_end {
-                let _ = engine.scan_cf(cf, &last_end, &start_key, false, |_, _| {
-                    has_keys = true;
-                    Ok(false)
-                });
-            }
-            // If there is some keys between last_end and start_key of this region, we shall put
-            // this region in an independent sst writer to avoid this sst overlap with data which
-            // was not deleted.
-            let ret = if cf == CF_WRITE && !has_keys {
+            let ret = if cf == CF_WRITE {
                 engine.delete_all_in_range_cf_by_ingest(cf, &start_key, &end_key, &mut writer)
-            } else if cf == CF_LOCK {
+            } else if cf == CF_LOCK || cf == CF_RAFT {
                 engine.delete_all_in_range_cf(cf, DeleteStrategy::DeleteByKey, &start_key, &end_key)
             } else {
                 engine.delete_all_in_range_cf(cf, strategy.clone(), &start_key, &end_key)
             };
             match ret {
                 Ok(count) => {
-                    if cf == CF_WRITE && !has_keys {
+                    if cf == CF_WRITE {
                         delete_count += count;
                     }
                 }
@@ -764,7 +753,6 @@ fn cleanup_range<E: KvEngine>(
         if !has_err {
             regions.push(start_key.clone());
         }
-        last_end = end_key;
         let elapsed = now.elapsed();
         if elapsed >= CLEANUP_MAX_DURATION || delete_count >= CLEANUP_MAX_KEY_COUNT {
             let len = regions.len();
