@@ -5,13 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{GcConfig, GcWorkerConfigManager};
-use crate::storage::mvcc::{GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VERSIONS_HISTOGRAM};
+use crate::storage::mvcc::{GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VERSIONS_HISTOGRAM, MvccTxn};
 use engine_rocks::raw::{
     new_compaction_filter_raw, CompactionFilter, CompactionFilterContext, CompactionFilterFactory,
     DBCompactionFilter, DBIterator, ReadOptions, SeekKey, WriteOptions, DB,
 };
 use engine_rocks::{util::get_cf_handle, RocksEngine, RocksWriteBatch};
 use engine_traits::{Mutable, WriteBatch, CF_WRITE};
+use crate::storage::kv::ScanMode;
+use kvproto::kvrpcpb::IsolationLevel;
 use pd_client::ClusterVersion;
 use tikv_util::collections::HashMap;
 use txn_types::{Key, WriteRef, WriteType};
@@ -85,7 +87,6 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
 }
 
 struct WriteCompactionFilter {
-    bottommost_level: bool,
     safe_point: Arc<AtomicU64>,
     db: Arc<DB>,
 
@@ -93,8 +94,10 @@ struct WriteCompactionFilter {
     key_prefix: Vec<u8>,
     remove_older: bool,
 
-    // Record the last MVCC delete mark for each level.
-    leveled_tail_deletes: HashMap<usize, Vec<u8>>,
+    // Indicates whether the target is the bottommost level or not.
+    bottommost_level: bool,
+    // Some keys can cover multiple SST files in one level.
+    sst_boundary_keys: Vec<Vec<u8>>,
 
     // For metrics about (versions, deleted_versions) for every MVCC key.
     versions: usize,
@@ -110,8 +113,9 @@ impl WriteCompactionFilter {
         assert!(safe_point.load(Ordering::Relaxed) > 0);
 
         let wb = RocksWriteBatch::with_capacity(Arc::clone(&db), DEFAULT_DELETE_BATCH_SIZE);
-        WriteCompactionFilter {
-            bottommost_level: context.is_bottommost_level(),
+        println!("creating compaction filter, bottommost_level: {}", context.is_bottommost_level());
+
+        let mut filter = WriteCompactionFilter {
             safe_point,
             db,
 
@@ -119,12 +123,16 @@ impl WriteCompactionFilter {
             key_prefix: vec![],
             remove_older: false,
 
-            leveled_tail_deletes: HashMap::default(),
+            bottommost_level: context.is_bottommost_level(),
+            sst_boundary_keys: vec![],
+
             versions: 0,
             deleted: 0,
             total_versions: 0,
             total_deleted: 0,
-        }
+        };
+        filter.fill_sst_boundary_keys();
+        filter
     }
 
     fn delete_default_key(&mut self, key: &[u8]) {
@@ -147,6 +155,37 @@ impl WriteCompactionFilter {
         }
     }
 
+    fn iter_write_cf(&self) -> DBIterator<Arc<DB>> {
+        let cf_write = get_cf_handle(&self.db, CF_WRITE).unwrap();
+        DBIterator::new_cf(self.db.clone(), cf_write, ReadOptions::default())
+    }
+
+    fn fill_sst_boundary_keys(&mut self) {
+        let mut iter = filter.iter_write_cf();
+        for i in 0..context.num_levels() {
+            let (_level, key) = context.level_end_key(i);
+
+            let (key_prefix, commit_ts) = match Key::split_on_ts_for(key) {
+                Ok((key, ts)) => (key, ts.into_inner()),
+                Err(_) => continue,
+            };
+
+            if iter.seek(SeekKey::Key(key)).unwrap() && iter.next().unwrap() {
+                let next_key_prefix = match Key::split_on_ts_for(key) {
+                    Ok((key, _)) => key,
+                    Err(_) => continue,
+                };
+                if next_key_prefix == key_prefix {
+                    filter.sst_boundary_keys.push(key_prefix.to_owned());
+                }
+            }
+
+            let test_key = Key::from_encoded(key_prefix.to_owned()).into_raw().unwrap();
+            let test_key_str = std::str::from_utf8(&test_key).unwrap();
+            println!("level {} end key: {}.{}", _level, test_key_str, commit_ts);
+        }
+    }
+
     fn switch_key_metrics(&mut self) {
         if self.versions != 0 {
             MVCC_VERSIONS_HISTOGRAM.observe(self.versions as f64);
@@ -163,36 +202,6 @@ impl WriteCompactionFilter {
 
 impl Drop for WriteCompactionFilter {
     fn drop(&mut self) {
-        for (_, seek_key) in std::mem::take(&mut self.leveled_tail_deletes) {
-            // In this compaction, the last MVCC version is deleted. However there could be
-            // still some versions for the key which are not included in this compaction.
-            let cf_handle = get_cf_handle(&self.db, CF_WRITE).unwrap();
-            let mut iter = DBIterator::new_cf(self.db.clone(), cf_handle, ReadOptions::new());
-            // `seek` then `next` because the MVCC delete mark is handled by compaction filter.
-            let mut valid = iter.seek(SeekKey::Key(&seek_key)).unwrap() && iter.next().unwrap();
-            while valid {
-                let (key, value) = (iter.key(), iter.value());
-                let key_prefix = match Key::split_on_ts_for(key) {
-                    Ok((prefix, _)) if !seek_key.starts_with(prefix) => break,
-                    Ok((prefix, _)) => prefix,
-                    Err(_) => break,
-                };
-
-                let write = WriteRef::parse(value).unwrap();
-                let (start_ts, short_value) = (write.start_ts, write.short_value);
-                if short_value.is_none() {
-                    let k = Key::from_encoded_slice(key_prefix).append_ts(start_ts);
-                    self.delete_default_key(k.as_encoded());
-                }
-
-                self.delete_write_key(key);
-                self.versions += 1;
-                self.deleted += 1;
-                valid = iter.next().unwrap();
-            }
-            self.switch_key_metrics();
-        }
-
         if !self.write_batch.is_empty() {
             let mut opts = WriteOptions::new();
             opts.set_sync(true);
@@ -203,29 +212,51 @@ impl Drop for WriteCompactionFilter {
         }
 
         debug!(
-            "Dropping WriteCompactionFilter";
+            "WriteCompactionFilter has filtered all key/value pairs";
             "bottommost_level" => self.bottommost_level,
             "versions" => self.total_versions,
             "deleted" => self.total_deleted,
         );
+
+        let safe_point = self.safe_point.load(Ordering::Relaxed);
+        let engine = RocksEngine::from_db(self.db.clone());
+        let snapshot = Arc::new(engine.snapshot());
+        let mut txn = MvccTxn::for_scan(snapshot, Some(ScanMode::Forward), false, IsolationLevel::SI);
+        for key_prefix in std::mem::take(&mut self.sst_boundary_keys) {
+            let ts = TimeStamp::new(safe_point);
+            while !txn.gc(Key::from_encoded(key_prefix.clone()), ts).unwrap().is_completed {}
+        }
+        
+        let write_size = txn.write_size();
+        let modifies = txn.into_modifies();
+        if !modifies.is_empty() {
+            self.refresh_cfg();
+            self.limiter.blocking_consume(write_size);
+            self.engine.write(ctx, WriteData::from_modifies(modifies))?;
+        }
     }
 }
 
 impl CompactionFilter for WriteCompactionFilter {
     fn filter(
         &mut self,
-        level: usize,
+        _: usize,
         key: &[u8],
         value: &[u8],
         _: &mut Vec<u8>,
         _: &mut bool,
     ) -> bool {
         let safe_point = self.safe_point.load(Ordering::Relaxed);
+
         let (key_prefix, commit_ts) = match Key::split_on_ts_for(key) {
             Ok((key, ts)) => (key, ts.into_inner()),
             // Invalid MVCC keys, don't touch them.
             Err(_) => return false,
         };
+
+        let test_key = Key::from_encoded(key_prefix.to_owned()).into_raw().unwrap();
+        let test_key_str = std::str::from_utf8(&test_key).unwrap();
+        println!("filterring key: {}, commit ts: {}, level: {}", test_key_str, commit_ts, level);
 
         if self.key_prefix != key_prefix {
             self.key_prefix.clear();
@@ -235,6 +266,7 @@ impl CompactionFilter for WriteCompactionFilter {
             // The level's tail delete mark can be removed because
             // the key is not the last one in the level.
             self.leveled_tail_deletes.remove(&level);
+            println!("cleaning leveled_tail_deletes[{}]", level);
         }
 
         self.versions += 1;
@@ -243,30 +275,23 @@ impl CompactionFilter for WriteCompactionFilter {
         }
 
         let mut filtered = self.remove_older;
-        let WriteRef {
-            write_type,
-            start_ts,
-            short_value,
-        } = WriteRef::parse(value).unwrap();
+        let write = WriteRef::parse(value).unwrap();
+
         if !self.remove_older {
             // here `filtered` must be false.
-            match write_type {
+            match write.write_type {
                 WriteType::Rollback | WriteType::Lock => filtered = true,
+                WriteType::Put => self.remove_older = true,
                 WriteType::Delete => {
                     self.remove_older = true;
-                    if self.bottommost_level {
-                        // Handle delete marks if the bottommost level is reached.
-                        filtered = true;
-                        self.leveled_tail_deletes.insert(level, key.to_vec());
-                    }
+                    filtered = self.bottommost_level;
                 }
-                WriteType::Put => self.remove_older = true,
             }
         }
 
         if filtered {
-            if short_value.is_none() {
-                let key = Key::from_encoded_slice(key_prefix).append_ts(start_ts);
+            if write.short_value.is_none() && write.write_type == WriteType::Put {
+                let key = Key::from_encoded_slice(key_prefix).append_ts(write.start_ts);
                 self.delete_default_key(key.as_encoded());
             }
             self.deleted += 1;
@@ -289,17 +314,21 @@ pub fn is_compaction_filter_allowd(cfg_value: &GcConfig, cluster_version: &Clust
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::config::DbConfig;
     use crate::storage::kv::{RocksEngine as StorageRocksEngine, TestEngineBuilder};
-    use crate::storage::mvcc::tests::{must_commit, must_prewrite_delete, must_prewrite_put};
+    use crate::storage::mvcc::tests::{
+        must_commit, must_get_none, must_prewrite_delete, must_prewrite_put,
+    };
+    use engine_rocks::raw::{CompactOptions, DBBottommostLevelCompaction};
     use engine_rocks::RocksEngine;
-    use engine_traits::{CompactExt, Peekable, SyncMutable};
+    use engine_traits::{CompactExt, MiscExt, Peekable, SyncMutable};
     use txn_types::TimeStamp;
 
     pub fn gc_by_compact(engine: &StorageRocksEngine, _: &[u8], safe_point: u64) {
         let engine = RocksEngine::from_db(engine.get_rocksdb());
         // Put a new key-value pair to ensure compaction can be triggered correctly.
         engine.put_cf("write", b"k1", b"v1").unwrap();
-        do_gc_by_compact(&engine, None, None, safe_point);
+        do_gc_by_compact(&engine, None, None, safe_point, None);
     }
 
     fn do_gc_by_compact(
@@ -307,13 +336,26 @@ pub mod tests {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         safe_point: u64,
+        target_level: Option<usize>,
     ) {
         let safe_point = Arc::new(AtomicU64::new(safe_point));
         let cfg = GcWorkerConfigManager(Arc::new(Default::default()));
         cfg.0.update(|v| v.enable_compaction_filter = true);
         let cluster_version = ClusterVersion::new(semver::Version::new(5, 0, 0));
         init_compaction_filter(engine.clone(), safe_point, cfg, cluster_version);
-        engine.compact_range("write", start, end, false, 1).unwrap();
+
+        let db = engine.as_inner();
+        let handle = get_cf_handle(db, CF_WRITE).unwrap();
+
+        let mut compact_opts = CompactOptions::new();
+        compact_opts.set_exclusive_manual_compaction(false);
+        compact_opts.set_max_subcompactions(1);
+        if let Some(target_level) = target_level {
+            compact_opts.set_change_level(true);
+            compact_opts.set_target_level(target_level as i32);
+            // compact_opts.set_bottommost_level_compaction(DBBottommostLevelCompaction::Skip);
+        }
+        db.compact_range_cf_opt(handle, &compact_opts, start, end);
     }
 
     fn rocksdb_level_file_counts(engine: &RocksEngine, cf: &str) -> Vec<usize> {
@@ -339,21 +381,21 @@ pub mod tests {
 
         must_prewrite_put(&engine, b"key", b"value", b"key", 100);
         must_commit(&engine, b"key", 100, 110);
-        do_gc_by_compact(&raw_engine, None, None, 50);
+        do_gc_by_compact(&raw_engine, None, None, 50, None);
         assert_eq!(rocksdb_level_file_counts(&raw_engine, CF_WRITE)[6], 1);
 
         must_prewrite_put(&engine, b"key", b"value", b"key", 120);
         must_commit(&engine, b"key", 120, 130);
         must_prewrite_delete(&engine, b"key", b"key", 140);
         must_commit(&engine, b"key", 140, 140);
-        do_gc_by_compact(&raw_engine, None, Some(&split_key), 50);
+        do_gc_by_compact(&raw_engine, None, Some(&split_key), 50, None);
         assert_eq!(rocksdb_level_file_counts(&raw_engine, CF_WRITE)[6], 2);
 
         // Put more key/value pairs so that 1 file in L0 and 1 file in L6 can be merged.
         must_prewrite_put(&engine, b"kex", b"value", b"kex", 100);
         must_commit(&engine, b"kex", 100, 110);
 
-        do_gc_by_compact(&raw_engine, None, Some(&split_key), 200);
+        do_gc_by_compact(&raw_engine, None, Some(&split_key), 200, None);
 
         // There are still 2 files in L6 because the SST contains key_110 is not touched.
         assert_eq!(rocksdb_level_file_counts(&raw_engine, CF_WRITE)[6], 2);
@@ -365,6 +407,70 @@ pub mod tests {
             .into_encoded();
         let x = raw_engine.get_value_cf(CF_WRITE, &key).unwrap();
         assert!(x.is_none());
+    }
+
+    #[test]
+    fn test_compaction_filter_tail_data_in_internal_levels() {
+        let mut cfg_rocksdb = DbConfig::default();
+        cfg_rocksdb.writecf.dynamic_level_bytes = false;
+        let engine = TestEngineBuilder::new()
+            .build_with_cfg(&cfg_rocksdb)
+            .unwrap();
+        let raw_engine = RocksEngine::from_db(engine.get_rocksdb());
+
+        // So the paradigm of SST files will be:
+        // L6: |AAAAA_100, CCCCC_110|
+        must_prewrite_put(&engine, b"AAAAA", b"value", b"key", 100);
+        must_commit(&engine, b"AAAAA", 100, 101);
+        must_prewrite_put(&engine, b"CCCCC", b"value", b"key", 110);
+        must_commit(&engine, b"CCCCC", 110, 111);
+        do_gc_by_compact(&raw_engine, None, None, 50, Some(6));
+        assert_eq!(rocksdb_level_file_counts(&raw_engine, CF_WRITE)[6], 1);
+
+        // So the paradigm of SST files will be:
+        // L0: |BBBB_100, DDDDD_100|
+        // L6: |AAAAA_100, CCCCC_110|
+        must_prewrite_put(&engine, b"BBBBB", b"value", b"key", 100);
+        must_commit(&engine, b"BBBBB", 100, 101);
+        must_prewrite_put(&engine, b"DDDDD", b"value", b"key", 100);
+        must_commit(&engine, b"DDDDD", 100, 101);
+        raw_engine.flush_cf(CF_WRITE, true).unwrap();
+        assert_eq!(rocksdb_level_file_counts(&raw_engine, CF_WRITE)[0], 1);
+
+        // So the paradigm of SST files will be:
+        // L0: |AAAAA_110, BBBBB_110|, |BBBB_100, DDDDD_100|
+        // L6: |AAAAA_100, CCCCC_110|
+        must_prewrite_put(&engine, b"AAAAA", b"value", b"key", 110);
+        must_commit(&engine, b"AAAAA", 110, 111);
+        must_prewrite_delete(&engine, b"BBBBB", b"BBBBB", 110);
+        must_commit(&engine, b"BBBBB", 110, 111);
+        raw_engine.flush_cf(CF_WRITE, true).unwrap();
+        assert_eq!(rocksdb_level_file_counts(&raw_engine, CF_WRITE)[0], 2);
+
+        // Compact |AAAAA_110, BBBBB_110| at L0 and |AAAA_100, CCCCC_110| at L6.
+        let start = Key::from_raw(b"AAAAA").into_encoded();
+        let end = Key::from_raw(b"AAAAAA").into_encoded();
+        println!("starting the importantest compaction...");
+        do_gc_by_compact(&raw_engine, Some(&start), Some(&end), 200, Some(6));
+
+        let db = raw_engine.as_inner().clone();
+        let cf_write = get_cf_handle(&db, CF_WRITE).unwrap();
+        let mut iter = DBIterator::new_cf(db.clone(), cf_write, ReadOptions::default());
+        let mut valid = iter.seek(SeekKey::Start).unwrap();
+        while valid {
+            let (key_prefix, commit_ts) = match Key::split_on_ts_for(iter.key()) {
+                Ok((key, ts)) => (key.to_owned(), ts.into_inner()),
+                Err(_) => unreachable!(),
+            };
+            let key_prefix = Key::from_encoded(key_prefix).into_raw().unwrap();
+            let key_prefix_str = std::str::from_utf8(&key_prefix).unwrap();
+            println!("key: {}, commit ts: {}", key_prefix_str, commit_ts);
+            valid = iter.next().unwrap();
+        }
+        
+        std::thread::park();
+
+        must_get_none(&engine, b"BBBBB", 101);
     }
 
     #[test]
