@@ -293,6 +293,7 @@ mod tests {
     use kvproto::raft_cmdpb::RaftCmdRequest;
     use kvproto::raft_serverpb::RaftMessage;
     use security::SecurityConfig;
+    use txn_types::TxnExtra;
 
     #[derive(Clone)]
     struct MockResolver {
@@ -335,6 +336,16 @@ mod tests {
             Ok(())
         }
 
+        fn send_command_txn_extra(
+            &self,
+            _: RaftCmdRequest,
+            _: TxnExtra,
+            _: Callback<RocksSnapshot>,
+        ) -> RaftStoreResult<()> {
+            self.tx.send(1).unwrap();
+            Ok(())
+        }
+
         fn significant_send(&self, _: u64, msg: SignificantMsg) -> RaftStoreResult<()> {
             self.significant_msg_sender.send(msg).unwrap();
             Ok(())
@@ -371,8 +382,6 @@ mod tests {
         let storage = TestStorageBuilder::new().build().unwrap();
         let mut gc_worker = GcWorker::new(
             storage.get_engine(),
-            None,
-            None,
             None,
             Default::default(),
             Default::default(),
