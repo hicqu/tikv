@@ -80,10 +80,9 @@ pub struct CompactionGuardGenerator {
 impl SstPartitioner for CompactionGuardGenerator {
     fn should_partition(&self, state: &SstPartitionerState) -> bool {
         let pos = self.pos.get();
-        (state.current_output_file_size >= self.min_output_file_size)
-            && ((state.current_output_file_size >= self.max_output_file_size)
-                || ((pos < self.boundaries.len())
-                    && (self.boundaries[pos].as_slice() <= state.next_key)))
+        state.current_output_file_size >= self.min_output_file_size
+            && pos < self.boundaries.len()
+            && self.boundaries[pos].as_slice() <= state.next_key
     }
 
     fn reset(&self, key: &[u8]) {
