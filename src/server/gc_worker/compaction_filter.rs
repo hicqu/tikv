@@ -276,7 +276,7 @@ pub struct DefaultCompactionFilterFactory;
 impl CompactionFilterFactory for DefaultCompactionFilterFactory {
     fn create_compaction_filter(
         &self,
-        context: &CompactionFilterContext,
+        _context: &CompactionFilterContext,
     ) -> *mut DBCompactionFilter {
         let gc_context_option = GC_CONTEXT.lock().unwrap();
         let gc_context = match *gc_context_option {
