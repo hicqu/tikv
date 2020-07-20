@@ -13,7 +13,7 @@ use engine_rocks::raw::{
 use engine_rocks::{RocksEngine, RocksEngineIterator, RocksWriteBatch};
 use engine_traits::{
     IterOptions, Iterable, Iterator, MiscExt, Mutable, SeekKey, WriteBatch, WriteBatchExt,
-    WriteOptions, CF_WRITE,
+    WriteOptions, CF_WRITE, CF_LOCK, Peekable,
 };
 use pd_client::ClusterVersion;
 use txn_types::{Key, WriteRef, WriteType};
@@ -268,6 +268,137 @@ impl CompactionFilter for WriteCompactionFilter {
         }
 
         filtered
+    }
+}
+
+pub struct DefaultCompactionFilterFactory;
+
+impl CompactionFilterFactory for DefaultCompactionFilterFactory {
+    fn create_compaction_filter(
+        &self,
+        context: &CompactionFilterContext,
+    ) -> *mut DBCompactionFilter {
+        let gc_context_option = GC_CONTEXT.lock().unwrap();
+        let gc_context = match *gc_context_option {
+            Some(ref ctx) => ctx,
+            None => return std::ptr::null_mut(),
+        };
+
+        let safe_point = gc_context.safe_point.load(Ordering::Relaxed);
+        if safe_point == 0 {
+            // Safe point has not been initialized yet.
+            return std::ptr::null_mut();
+        }
+
+        let name = CString::new("default_compaction_filter").unwrap();
+        let db = Arc::clone(&gc_context.db);
+        let filter = Box::new(DefaultCompactionFilter::new(db, safe_point));
+        unsafe { new_compaction_filter_raw(name, filter) }
+    }
+}
+
+pub struct DefaultCompactionFilter {
+    safe_point: u64,
+    engine: RocksEngine,
+
+    key_prefix: Vec<u8>,
+    // Valid transactions for `key_prefix`.
+    valid_transactions: Vec<u64>,
+    is_locked: bool,
+
+    write_iter: RocksEngineIterator,
+
+    // For metrics about (versions, deleted_versions) for every MVCC key.
+    versions: usize,
+    deleted: usize,
+    // Total versions and deleted versions in the compaction.
+    total_versions: usize,
+    total_deleted: usize,
+}
+
+impl DefaultCompactionFilter {
+    fn new(db: Arc<DB>, safe_point: u64) -> Self {
+        // Safe point must have been initialized.
+        assert!(safe_point > 0);
+        let engine = RocksEngine::from_db(db.clone());
+        let write_iter = {
+            // TODO: give lower bound and upper bound to the iterator.
+            let opts = IterOptions::default();
+            engine.iterator_cf_opt(CF_WRITE, opts).unwrap()
+        };
+
+        DefaultCompactionFilter {
+            safe_point,
+            engine,
+            key_prefix: vec![],
+            valid_transactions: vec![],
+            is_locked: false,
+            write_iter,
+            versions: 0,
+            deleted: 0,
+            total_versions: 0,
+            total_deleted: 0,
+        }
+    }
+
+    fn switch_key_metrics(&mut self) {
+        if self.versions != 0 {
+            self.total_versions += self.versions;
+            self.versions = 0;
+        }
+        if self.deleted != 0 {
+            self.total_deleted += self.deleted;
+            self.deleted = 0;
+        }
+    }
+}
+
+impl CompactionFilter for DefaultCompactionFilter {
+    fn filter(
+        &mut self,
+        _start_level: usize,
+        key: &[u8],
+        _value: &[u8],
+        _: &mut Vec<u8>,
+        _: &mut bool,
+    ) -> bool {
+        let (key_prefix, start_ts) = match Key::split_on_ts_for(key) {
+            Ok((key, ts)) => (key, ts.into_inner()),
+            // Invalid MVCC keys, don't touch them.
+            Err(_) => return false,
+        };
+
+        if self.key_prefix != key_prefix {
+            self.key_prefix.clear();
+            self.key_prefix.extend_from_slice(key_prefix);
+            self.valid_transactions.clear();
+            self.switch_key_metrics();
+
+            if self.engine.get_value_cf(CF_LOCK, &self.key_prefix).unwrap().is_some() {
+                self.is_locked = true;
+            } else {
+                let mut valid = self.write_iter.seek(SeekKey::Key(key_prefix)).unwrap();
+                while valid {
+                    let (key, value) = (self.write_iter.key(), self.write_iter.value());
+                    if !key.starts_with(key_prefix) {
+                        // All versions in write cf are scaned.
+                        break;
+                    }
+                    let write = WriteRef::parse(value).unwrap();
+                    self.valid_transactions.push(write.start_ts.into_inner());
+                    valid = self.write_iter.next().unwrap();
+                }
+                self.valid_transactions.sort();
+            }
+        }
+
+        self.versions += 1;
+        if start_ts > self.safe_point || self.is_locked {
+            return false;
+        }
+
+        // The version can be filtered if it's not in valid transactions.
+        self.valid_transactions.binary_search(&start_ts).is_err()
     }
 }
 
