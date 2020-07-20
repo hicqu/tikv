@@ -12,8 +12,8 @@ use engine_rocks::raw::{
 };
 use engine_rocks::{RocksEngine, RocksEngineIterator, RocksWriteBatch};
 use engine_traits::{
-    IterOptions, Iterable, Iterator, MiscExt, Mutable, SeekKey, WriteBatch, WriteBatchExt,
-    WriteOptions, CF_WRITE, CF_LOCK, Peekable,
+    IterOptions, Iterable, Iterator, MiscExt, Mutable, Peekable, SeekKey, WriteBatch,
+    WriteBatchExt, WriteOptions, CF_LOCK, CF_WRITE,
 };
 use pd_client::ClusterVersion;
 use txn_types::{Key, WriteRef, WriteType};
@@ -161,9 +161,9 @@ impl WriteCompactionFilter {
         self.write_iter = Some(iter);
     }
 
-    fn delete_default_key(&mut self, key: &[u8]) {
-        self.write_batch.delete(key).unwrap();
-        self.flush_pending_writes_if_need();
+    fn delete_default_key(&mut self, _key: &[u8]) {
+        // self.write_batch.delete(key).unwrap();
+        // self.flush_pending_writes_if_need();
     }
 
     fn delete_write_key(&mut self, key: &[u8]) {
@@ -374,7 +374,12 @@ impl CompactionFilter for DefaultCompactionFilter {
             self.valid_transactions.clear();
             self.switch_key_metrics();
 
-            if self.engine.get_value_cf(CF_LOCK, &self.key_prefix).unwrap().is_some() {
+            if self
+                .engine
+                .get_value_cf(CF_LOCK, &self.key_prefix)
+                .unwrap()
+                .is_some()
+            {
                 self.is_locked = true;
             } else {
                 let mut valid = self.write_iter.seek(SeekKey::Key(key_prefix)).unwrap();
@@ -398,7 +403,21 @@ impl CompactionFilter for DefaultCompactionFilter {
         }
 
         // The version can be filtered if it's not in valid transactions.
-        self.valid_transactions.binary_search(&start_ts).is_err()
+        if self.valid_transactions.binary_search(&start_ts).is_err() {
+            self.deleted += 1;
+            return true;
+        }
+        false
+    }
+}
+
+impl Drop for DefaultCompactionFilter {
+    fn drop(&mut self) {
+        info!(
+            "DefaultCompactionFilter has filtered all key/value pairs";
+            "versions" => self.total_versions,
+            "deleted" => self.total_deleted,
+        );
     }
 }
 
