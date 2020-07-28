@@ -181,12 +181,12 @@ impl WriteCompactionFilter {
     }
 
     fn switch_key_metrics(&mut self) {
-        if self.versions != 0 {
+        if self.versions > 0 {
             MVCC_VERSIONS_HISTOGRAM.observe(self.versions as f64);
             self.total_versions += self.versions;
             self.versions = 0;
         }
-        if self.deleted != 0 {
+        if self.deleted > 0 {
             GC_DELETE_VERSIONS_HISTOGRAM.observe(self.deleted as f64);
             self.total_deleted += self.deleted;
             self.deleted = 0;
@@ -236,11 +236,11 @@ impl CompactionFilter for WriteCompactionFilter {
             self.switch_key_metrics();
         }
 
-        self.versions += 1;
         if commit_ts > self.safe_point {
             return false;
         }
 
+        self.versions += 1;
         let mut filtered = self.remove_older;
         let write = WriteRef::parse(value).unwrap();
 
