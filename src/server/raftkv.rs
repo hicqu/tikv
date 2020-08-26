@@ -1,5 +1,11 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::cell::RefCell;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::io::Error as IoError;
+use std::result;
+use std::{sync::atomic::Ordering, time::Duration};
+
 use engine_rocks::{RocksEngine, RocksSnapshot, RocksTablePropertiesCollection};
 use engine_traits::CfName;
 use engine_traits::CF_DEFAULT;
@@ -10,10 +16,12 @@ use kvproto::raft_cmdpb::{
     RaftRequestHeader, Request, Response,
 };
 use kvproto::{errorpb, metapb};
-use std::fmt::{self, Debug, Display, Formatter};
-use std::io::Error as IoError;
-use std::result;
-use std::{sync::atomic::Ordering, time::Duration};
+use raftstore::errors::Error as RaftServerError;
+use raftstore::router::RaftStoreRouter;
+use raftstore::store::{Callback as StoreCallback, LocalReader, ReadResponse, WriteResponse};
+use raftstore::store::{RegionIterator, RegionSnapshot};
+use tikv_util::time::Instant;
+use tikv_util::time::ThreadReadId;
 use txn_types::{Key, TxnExtra, Value};
 
 use super::metrics::*;
@@ -23,12 +31,6 @@ use crate::storage::kv::{
     Snapshot as EngineSnapshot, WriteData,
 };
 use crate::storage::{self, kv};
-use raftstore::errors::Error as RaftServerError;
-use raftstore::router::RaftStoreRouter;
-use raftstore::store::{Callback as StoreCallback, ReadResponse, WriteResponse};
-use raftstore::store::{RegionIterator, RegionSnapshot};
-use tikv_util::time::Instant;
-use tikv_util::time::ThreadReadId;
 
 quick_error! {
     #[derive(Debug)]
@@ -107,6 +109,7 @@ impl From<RaftServerError> for KvError {
 #[derive(Clone)]
 pub struct RaftKv<S: RaftStoreRouter<RocksEngine> + 'static> {
     router: S,
+    local_reader: RefCell<LocalReader<S, RocksEngine>>,
     engine: RocksEngine,
 }
 
@@ -164,8 +167,17 @@ fn on_read_result(
 
 impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
     /// Create a RaftKv using specified configuration.
-    pub fn new(router: S, engine: RocksEngine) -> RaftKv<S> {
-        RaftKv { router, engine }
+    pub fn new(
+        router: S,
+        local_reader: LocalReader<S, RocksEngine>,
+        engine: RocksEngine,
+    ) -> RaftKv<S> {
+        let local_reader = RefCell::new(local_reader);
+        RaftKv {
+            router,
+            local_reader,
+            engine,
+        }
     }
 
     fn new_request_header(&self, ctx: &Context) -> RaftRequestHeader {
@@ -192,16 +204,15 @@ impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
         let mut cmd = RaftCmdRequest::default();
         cmd.set_header(header);
         cmd.set_requests(vec![req].into());
-        self.router
-            .read(
-                read_id,
-                cmd,
-                StoreCallback::Read(Box::new(move |resp| {
-                    let (cb_ctx, res) = on_read_result(resp, 1);
-                    cb((cb_ctx, res.map_err(Error::into)));
-                })),
-            )
-            .map_err(From::from)
+        self.local_reader.borrow_mut().read(
+            read_id,
+            cmd,
+            StoreCallback::Read(Box::new(move |resp| {
+                let (cb_ctx, res) = on_read_result(resp, 1);
+                cb((cb_ctx, res.map_err(Error::into)));
+            })),
+        );
+        Ok(())
     }
 
     fn exec_write_requests(
@@ -430,7 +441,7 @@ impl<S: RaftStoreRouter<RocksEngine>> Engine for RaftKv<S> {
     }
 
     fn release_snapshot(&self) {
-        self.router.release_snapshot_cache();
+        self.local_reader.borrow_mut().release_snapshot_cache();
     }
 
     fn get_properties_cf(

@@ -24,7 +24,6 @@ use kvproto::{
 use pd_client::{PdClient, RpcClient};
 use raftstore::{
     coprocessor::{config::SplitCheckConfigManager, CoprocessorHost, RegionInfoAccessor},
-    router::ServerRaftStoreRouter,
     store::{
         config::RaftstoreConfigManager,
         fsm,
@@ -134,13 +133,13 @@ struct TiKVServer {
 struct TiKVEngines {
     engines: Engines<RocksEngine, RocksEngine>,
     store_meta: Arc<Mutex<StoreMeta>>,
-    engine: RaftKv<ServerRaftStoreRouter<RocksEngine, RocksEngine>>,
-    raft_router: ServerRaftStoreRouter<RocksEngine, RocksEngine>,
+    engine: RaftKv<RaftRouter<RocksEngine, RocksEngine>>,
+    raft_router: RaftRouter<RocksEngine, RocksEngine>,
 }
 
 struct Servers {
     lock_mgr: LockManager,
-    server: Server<ServerRaftStoreRouter<RocksEngine, RocksEngine>, resolve::PdStoreAddrResolver>,
+    server: Server<RaftRouter<RocksEngine, RocksEngine>, resolve::PdStoreAddrResolver>,
     node: Node<RpcClient>,
     importer: Arc<SSTImporter>,
     cdc_scheduler: tikv_util::worker::Scheduler<cdc::Task>,
@@ -405,9 +404,6 @@ impl TiKVServer {
             block_cache.is_some(),
         );
         let store_meta = Arc::new(Mutex::new(StoreMeta::new(PENDING_VOTES_CAP)));
-        let local_reader =
-            LocalReader::new(engines.kv.clone(), store_meta.clone(), self.router.clone());
-        let raft_router = ServerRaftStoreRouter::new(self.router.clone(), local_reader);
 
         let cfg_controller = self.cfg_controller.as_mut().unwrap();
         cfg_controller.register(
@@ -434,19 +430,19 @@ impl TiKVServer {
             )),
         );
 
-        let engine = RaftKv::new(raft_router.clone(), engines.kv.clone());
+        let local_reader =
+            LocalReader::new(engines.kv.clone(), store_meta.clone(), self.router.clone());
+        let engine = RaftKv::new(self.router.clone(), local_reader, engines.kv.clone());
 
         self.engines = Some(TiKVEngines {
             engines,
             store_meta,
             engine,
-            raft_router,
+            raft_router: self.router.clone(),
         });
     }
 
-    fn init_gc_worker(
-        &mut self,
-    ) -> GcWorker<RaftKv<ServerRaftStoreRouter<RocksEngine, RocksEngine>>> {
+    fn init_gc_worker(&mut self) -> GcWorker<RaftKv<RaftRouter<RocksEngine, RocksEngine>>> {
         let engines = self.engines.as_ref().unwrap();
         let mut gc_worker = GcWorker::new(
             engines.engine.clone(),
@@ -466,7 +462,7 @@ impl TiKVServer {
 
     fn init_servers(
         &mut self,
-        gc_worker: &GcWorker<RaftKv<ServerRaftStoreRouter<RocksEngine, RocksEngine>>>,
+        gc_worker: &GcWorker<RaftKv<RaftRouter<RocksEngine, RocksEngine>>>,
     ) -> Arc<ServerConfig> {
         let cfg_controller = self.cfg_controller.as_mut().unwrap();
         cfg_controller.register(

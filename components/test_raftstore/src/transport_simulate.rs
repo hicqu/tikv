@@ -5,15 +5,19 @@ use std::sync::atomic::*;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use std::cell::RefCell;
 use std::{mem, thread, time, usize};
 
+use crossbeam::channel::TrySendError;
 use engine_rocks::{RocksEngine, RocksSnapshot};
 use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
-
 use raftstore::router::RaftStoreRouter;
-use raftstore::store::{Callback, CasualMessage, SignificantMsg, Transport};
+use raftstore::store::{
+    Callback, CasualMessage, CasualRouter, ProposalRouter, RaftCommand, SignificantMsg, StoreMsg,
+    StoreRouter, Transport, LocalReader,
+};
 use raftstore::{DiscardReason, Error, Result};
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::time::ThreadReadId;
@@ -122,16 +126,18 @@ impl Filter for DelayFilter {
 }
 
 #[derive(Clone)]
-pub struct SimulateTransport<C> {
+pub struct SimulateTransport<C: RaftStoreRouter<RocksEngine>> {
     filters: Arc<RwLock<Vec<Box<dyn Filter>>>>,
     ch: C,
+    local_reader: RefCell<LocalReader<C, RocksEngine>>,
 }
 
-impl<C> SimulateTransport<C> {
-    pub fn new(ch: C) -> SimulateTransport<C> {
+impl<C: RaftStoreRouter<RocksEngine>> SimulateTransport<C> {
+    pub fn new(ch: C, local_reader: LocalReader<C, RocksEngine>) -> SimulateTransport<C> {
         SimulateTransport {
             filters: Arc::new(RwLock::new(vec![])),
             ch,
+            local_reader: RefCell::new(local_reader),
         }
     }
 
@@ -177,7 +183,7 @@ where
     res
 }
 
-impl<C: Transport> Transport for SimulateTransport<C> {
+impl<C: RaftStoreRouter<RocksEngine>> Transport for SimulateTransport<C> {
     fn send(&mut self, m: RaftMessage) -> Result<()> {
         let ch = &mut self.ch;
         filter_send(&self.filters, m, |m| ch.send(m))
@@ -188,39 +194,30 @@ impl<C: Transport> Transport for SimulateTransport<C> {
     }
 }
 
+impl<C: RaftStoreRouter<RocksEngine>> StoreRouter for SimulateTransport<C> {
+    fn send(&self, msg: StoreMsg) -> Result<()> {
+        StoreRouter::send(&self.ch, msg)
+    }
+}
+
+impl<C: RaftStoreRouter<RocksEngine>> ProposalRouter<RocksSnapshot> for SimulateTransport<C> {
+    fn send(
+        &self,
+        cmd: RaftCommand<RocksSnapshot>,
+    ) -> std::result::Result<(), TrySendError<RaftCommand<RocksSnapshot>>> {
+        ProposalRouter::<RocksSnapshot>::send(&self.ch, cmd)
+    }
+}
+
+impl<C: RaftStoreRouter<RocksEngine>> CasualRouter<RocksEngine> for SimulateTransport<C> {
+    fn send(&self, region_id: u64, msg: CasualMessage<RocksEngine>) -> Result<()> {
+        CasualRouter::<RocksEngine>::send(&self.ch, region_id, msg)
+    }
+}
+
 impl<C: RaftStoreRouter<RocksEngine>> RaftStoreRouter<RocksEngine> for SimulateTransport<C> {
     fn send_raft_msg(&self, msg: RaftMessage) -> Result<()> {
         filter_send(&self.filters, msg, |m| self.ch.send_raft_msg(m))
-    }
-
-    fn send_command(&self, req: RaftCmdRequest, cb: Callback<RocksSnapshot>) -> Result<()> {
-        self.ch.send_command(req, cb)
-    }
-
-    fn read(
-        &self,
-        read_id: Option<ThreadReadId>,
-        req: RaftCmdRequest,
-        cb: Callback<RocksSnapshot>,
-    ) -> Result<()> {
-        self.ch.read(read_id, req, cb)
-    }
-
-    fn send_command_txn_extra(
-        &self,
-        req: RaftCmdRequest,
-        txn_extra: TxnExtra,
-        cb: Callback<RocksSnapshot>,
-    ) -> Result<()> {
-        self.ch.send_command_txn_extra(req, txn_extra, cb)
-    }
-
-    fn casual_send(&self, region_id: u64, msg: CasualMessage<RocksEngine>) -> Result<()> {
-        self.ch.casual_send(region_id, msg)
-    }
-
-    fn broadcast_unreachable(&self, store_id: u64) {
-        self.ch.broadcast_unreachable(store_id)
     }
 
     fn significant_send(&self, region_id: u64, msg: SignificantMsg<RocksSnapshot>) -> Result<()> {

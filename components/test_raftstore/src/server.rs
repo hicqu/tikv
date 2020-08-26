@@ -25,7 +25,7 @@ use engine_traits::{Engines, MiscExt};
 use pd_client::PdClient;
 use raftstore::coprocessor::{CoprocessorHost, RegionInfoAccessor};
 use raftstore::errors::Error as RaftError;
-use raftstore::router::{RaftStoreBlackHole, RaftStoreRouter, ServerRaftStoreRouter};
+use raftstore::router::{RaftStoreBlackHole, RaftStoreRouter};
 use raftstore::store::fsm::store::StoreMeta;
 use raftstore::store::fsm::{ApplyRouter, RaftBatchSystem, RaftRouter};
 use raftstore::store::{
@@ -54,7 +54,7 @@ use tikv_util::time::ThreadReadId;
 use tikv_util::worker::{FutureWorker, Worker};
 use tikv_util::HandyRwLock;
 
-type SimulateStoreTransport = SimulateTransport<ServerRaftStoreRouter<RocksEngine, RocksEngine>>;
+type SimulateStoreTransport = SimulateTransport<RaftRouter<RocksEngine, RocksEngine>>;
 type SimulateServerTransport =
     SimulateTransport<ServerTransport<SimulateStoreTransport, PdStoreAddrResolver>>;
 
@@ -167,9 +167,7 @@ impl Simulator for ServerCluster {
             cfg.server.addr = addr.clone();
         }
 
-        let local_reader = LocalReader::new(engines.kv.clone(), store_meta.clone(), router.clone());
-        let raft_router = ServerRaftStoreRouter::new(router.clone(), local_reader);
-        let sim_router = SimulateTransport::new(raft_router.clone());
+        let sim_router = SimulateTransport::new(router.clone());
 
         let raft_engine = RaftKv::new(sim_router.clone(), engines.kv.clone());
 
@@ -196,7 +194,7 @@ impl Simulator for ServerCluster {
 
         let mut gc_worker = GcWorker::new(
             engine.clone(),
-            Some(raft_router.clone()),
+            Some(router.clone()),
             cfg.gc.clone(),
             Default::default(),
         );
@@ -241,7 +239,7 @@ impl Simulator for ServerCluster {
         let debug_service = DebugService::new(
             engines.clone(),
             pool,
-            raft_router,
+            router.clone(),
             ConfigController::default(),
             security_mgr.clone(),
         );

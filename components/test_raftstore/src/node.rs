@@ -19,7 +19,7 @@ use engine_traits::{Engines, MiscExt, Peekable};
 use raftstore::coprocessor::config::SplitCheckConfigManager;
 use raftstore::coprocessor::CoprocessorHost;
 use raftstore::errors::Error as RaftError;
-use raftstore::router::{RaftStoreRouter, ServerRaftStoreRouter};
+use raftstore::router::RaftStoreRouter;
 use raftstore::store::config::RaftstoreConfigManager;
 use raftstore::store::fsm::store::StoreMeta;
 use raftstore::store::fsm::{RaftBatchSystem, RaftRouter};
@@ -37,7 +37,7 @@ use tikv_util::worker::{FutureWorker, Worker};
 
 pub struct ChannelTransportCore {
     snap_paths: HashMap<u64, (SnapManager, TempDir)>,
-    routers: HashMap<u64, SimulateTransport<ServerRaftStoreRouter<RocksEngine, RocksEngine>>>,
+    routers: HashMap<u64, SimulateTransport<RaftRouter<RocksEngine, RocksEngine>>>,
 }
 
 #[derive(Clone)]
@@ -146,7 +146,7 @@ impl NodeCluster {
     pub fn get_node_router(
         &self,
         node_id: u64,
-    ) -> SimulateTransport<ServerRaftStoreRouter<RocksEngine, RocksEngine>> {
+    ) -> SimulateTransport<RaftRouter<RocksEngine, RocksEngine>> {
         self.trans
             .core
             .lock()
@@ -290,7 +290,6 @@ impl Simulator for NodeCluster {
                 .insert(node_id, (snap_mgr, tmp));
         }
 
-        let router = ServerRaftStoreRouter::new(router, local_reader);
         self.trans
             .core
             .lock()
