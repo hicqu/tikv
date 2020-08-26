@@ -24,6 +24,8 @@ where
     /// Sends RaftMessage to local store.
     fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()>;
 
+    fn send_store_msg(&self, msg: StoreMsg) -> RaftStoreResult<()>;
+
     /// Sends RaftCmdRequest to local store.
     fn send_command(&self, req: RaftCmdRequest, cb: Callback<EK::Snapshot>) -> RaftStoreResult<()> {
         self.send_command_txn_extra(req, TxnExtra::default(), cb)
@@ -98,6 +100,10 @@ where
 {
     /// Sends RaftMessage to local store.
     fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
+        Ok(())
+    }
+
+    fn send_store_msg(&self, _: StoreMsg) -> RaftStoreResult<()> {
         Ok(())
     }
 
@@ -191,6 +197,15 @@ where
         self.router
             .send_raft_message(msg)
             .map_err(|e| handle_send_error(region_id, e))
+    }
+
+    fn send_store_msg(&self, msg: StoreMsg) -> RaftStoreResult<()> {
+        self.router.send_control(msg).map_err(|e| {
+            RaftStoreError::Transport(match e {
+                TrySendError::Full(_) => DiscardReason::Full,
+                TrySendError::Disconnected(_) => DiscardReason::Disconnected,
+            })
+        })
     }
 
     fn send_command(&self, req: RaftCmdRequest, cb: Callback<EK::Snapshot>) -> RaftStoreResult<()> {
