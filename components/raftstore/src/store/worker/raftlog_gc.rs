@@ -12,7 +12,7 @@ use tikv_util::timer::Timer;
 use tikv_util::worker::{Runnable, RunnableWithTimer};
 
 const MAX_GC_REGION_BATCH: usize = 128;
-const COMPACT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const COMPACT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 pub enum Task {
     Gc {
