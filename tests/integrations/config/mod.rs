@@ -423,6 +423,7 @@ fn test_serde_custom_tikv_config() {
             compaction_guard_min_output_file_size: ReadableSize::mb(12),
             compaction_guard_max_output_file_size: ReadableSize::mb(34),
         },
+        gccf: Default::default(),
         raftcf: RaftCfConfig {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),

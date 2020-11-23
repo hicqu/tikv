@@ -11,6 +11,9 @@ pub const LARGE_CFS: &[CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE];
 pub const ALL_CFS: &[CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE, CF_RAFT];
 pub const DATA_CFS: &[CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE];
 
+// It's for compaction filters on write CF. It's unnecessary to sync it by Raft.
+pub const CF_GC: CfName = "gc";
+
 pub fn name_to_cf(name: &str) -> Option<CfName> {
     if name.is_empty() {
         return Some(CF_DEFAULT);

@@ -34,7 +34,7 @@ use engine_rocks::{
     DEFAULT_PROP_SIZE_INDEX_DISTANCE,
 };
 use engine_traits::{CFOptionsExt, ColumnFamilyOptions as ColumnFamilyOptionsTrait, DBOptionsExt};
-use engine_traits::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_VER_DEFAULT, CF_WRITE};
+use engine_traits::{CF_DEFAULT, CF_GC, CF_LOCK, CF_RAFT, CF_VER_DEFAULT, CF_WRITE};
 use keys::region_raft_prefix_len;
 use pd_client::Config as PdConfig;
 use raft_log_engine::RaftEngineConfig as RawRaftEngineConfig;
@@ -696,6 +696,73 @@ impl LockCfConfig {
     }
 }
 
+cf_config!(GcCfConfig);
+
+impl Default for GcCfConfig {
+    fn default() -> GcCfConfig {
+        // Setting blob_run_mode=read_only effectively disable Titan.
+        let mut titan = TitanCfConfig::default();
+        titan.blob_run_mode = BlobRunMode::ReadOnly;
+        GcCfConfig {
+            block_size: ReadableSize::kb(16),
+            // It's a little CF so that use lock CF's block cache size is ok.
+            block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_LOCK) as u64),
+            disable_block_cache: false,
+            cache_index_and_filter_blocks: true,
+            pin_l0_filter_and_index_blocks: true,
+            use_bloom_filter: true,
+            optimize_filters_for_hits: false,
+            whole_key_filtering: true,
+            bloom_filter_bits_per_key: 10,
+            block_based_bloom_filter: false,
+            read_amp_bytes_per_bit: 0,
+            compression_per_level: [DBCompressionType::No; 7],
+            write_buffer_size: ReadableSize::mb(32),
+            max_write_buffer_number: 5,
+            min_write_buffer_number_to_merge: 1,
+            max_bytes_for_level_base: ReadableSize::mb(128),
+            target_file_size_base: ReadableSize::mb(8),
+            level0_file_num_compaction_trigger: 1,
+            level0_slowdown_writes_trigger: 20,
+            level0_stop_writes_trigger: 36,
+            max_compaction_bytes: ReadableSize::gb(2),
+            compaction_pri: CompactionPriority::ByCompensatedSize,
+            dynamic_level_bytes: true,
+            num_levels: 7,
+            max_bytes_for_level_multiplier: 10,
+            compaction_style: DBCompactionStyle::Level,
+            disable_auto_compactions: false,
+            soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
+            hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
+            force_consistency_checks: false,
+            prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
+            prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
+            enable_doubly_skiplist: true,
+            enable_compaction_guard: false,
+            compaction_guard_min_output_file_size: ReadableSize::mb(8),
+            compaction_guard_max_output_file_size: ReadableSize::mb(128),
+            titan,
+        }
+    }
+}
+
+impl GcCfConfig {
+    pub fn build_opt(
+        &self,
+        cache: &Option<Cache>,
+        region_info_accessor: Option<&RegionInfoAccessor>,
+    ) -> ColumnFamilyOptions {
+        let mut cf_opts = build_cf_opt!(self, cache, region_info_accessor);
+        let f = Box::new(NoopSliceTransform);
+        cf_opts
+            .set_prefix_extractor("NoopSliceTransform", f)
+            .unwrap();
+        cf_opts.set_memtable_prefix_bloom_size_ratio(0.1);
+        cf_opts.set_titandb_options(&self.titan.build_opts());
+        cf_opts
+    }
+}
+
 cf_config!(RaftCfConfig);
 
 impl Default for RaftCfConfig {
@@ -938,6 +1005,8 @@ pub struct DbConfig {
     #[config(submodule)]
     pub lockcf: LockCfConfig,
     #[config(submodule)]
+    pub gccf: GcCfConfig,
+    #[config(submodule)]
     pub raftcf: RaftCfConfig,
     #[config(submodule)]
     pub ver_defaultcf: VersionCfConfig,
@@ -985,6 +1054,7 @@ impl Default for DbConfig {
             defaultcf: DefaultCfConfig::default(),
             writecf: WriteCfConfig::default(),
             lockcf: LockCfConfig::default(),
+            gccf: GcCfConfig::default(),
             raftcf: RaftCfConfig::default(),
             ver_defaultcf: VersionCfConfig::default(),
             titan: titan_config,
@@ -1070,7 +1140,7 @@ impl DbConfig {
                 CF_WRITE,
                 self.writecf.build_opt(cache, region_info_accessor),
             ),
-            // TODO: remove CF_RAFT.
+            CFOptions::new(CF_GC, self.gccf.build_opt(cache, region_info_accessor)),
             CFOptions::new(CF_RAFT, self.raftcf.build_opt(cache, region_info_accessor)),
             CFOptions::new(
                 CF_VER_DEFAULT,
@@ -1083,6 +1153,7 @@ impl DbConfig {
         self.defaultcf.validate()?;
         self.lockcf.validate()?;
         self.writecf.validate()?;
+        self.gccf.validate()?;
         self.raftcf.validate()?;
         self.ver_defaultcf.validate()?;
         self.titan.validate()?;
@@ -1101,6 +1172,7 @@ impl DbConfig {
         write_into_metrics!(self.defaultcf, CF_DEFAULT, CONFIG_ROCKSDB_GAUGE);
         write_into_metrics!(self.lockcf, CF_LOCK, CONFIG_ROCKSDB_GAUGE);
         write_into_metrics!(self.writecf, CF_WRITE, CONFIG_ROCKSDB_GAUGE);
+        write_into_metrics!(self.gccf, CF_GC, CONFIG_ROCKSDB_GAUGE);
         write_into_metrics!(self.raftcf, CF_RAFT, CONFIG_ROCKSDB_GAUGE);
         write_into_metrics!(self.ver_defaultcf, CF_VER_DEFAULT, CONFIG_ROCKSDB_GAUGE);
     }
@@ -2500,6 +2572,7 @@ impl TiKvConfig {
             cache_cfg.capacity.0 = Some(ReadableSize {
                 0: self.rocksdb.defaultcf.block_cache_size.0
                     + self.rocksdb.writecf.block_cache_size.0
+                    + self.rocksdb.gccf.block_cache_size.0
                     + self.rocksdb.lockcf.block_cache_size.0
                     + self.raftdb.defaultcf.block_cache_size.0,
             });
@@ -3077,12 +3150,14 @@ mod tests {
         tikv_cfg.rocksdb.defaultcf.block_size = ReadableSize::gb(10);
         tikv_cfg.rocksdb.lockcf.block_size = ReadableSize::gb(10);
         tikv_cfg.rocksdb.writecf.block_size = ReadableSize::gb(10);
+        tikv_cfg.rocksdb.gccf.block_size = ReadableSize::gb(10);
         tikv_cfg.rocksdb.raftcf.block_size = ReadableSize::gb(10);
         tikv_cfg.raftdb.defaultcf.block_size = ReadableSize::gb(10);
         assert!(tikv_cfg.validate().is_err());
         tikv_cfg.rocksdb.defaultcf.block_size = ReadableSize::kb(10);
         tikv_cfg.rocksdb.lockcf.block_size = ReadableSize::kb(10);
         tikv_cfg.rocksdb.writecf.block_size = ReadableSize::kb(10);
+        tikv_cfg.rocksdb.gccf.block_size = ReadableSize::kb(10);
         tikv_cfg.rocksdb.raftcf.block_size = ReadableSize::kb(10);
         tikv_cfg.raftdb.defaultcf.block_size = ReadableSize::kb(10);
         tikv_cfg.validate().unwrap();
