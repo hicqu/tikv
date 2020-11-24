@@ -1,9 +1,11 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::CString;
+use std::hash::{Hash, Hasher};
 use std::result::Result;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,8 +18,7 @@ use engine_rocks::{
     RocksWriteBatch,
 };
 use engine_traits::{
-    IterOptions, Iterable, Iterator, MiscExt, Mutable, MvccProperties, SeekKey, WriteBatchExt,
-    CF_WRITE,
+    IterOptions, Iterable, Iterator, MiscExt, Mutable, SeekKey, WriteBatchExt, CF_WRITE,
 };
 use pd_client::ClusterVersion;
 use prometheus::{local::*, *};
@@ -29,7 +30,8 @@ use crate::storage::mvcc::{check_need_gc, GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VER
 const DEFAULT_DELETE_BATCH_SIZE: usize = 256 * 1024;
 const DEFAULT_DELETE_BATCH_COUNT: usize = 128;
 const NEAR_SEEK_LIMIT: usize = 16;
-const SINGLE_SST_RATIO_THRESHOLD_ADJUST: f64 = 0.2;
+// Use 32M memory to store bottommost delete marks.
+const BOTTOMMOST_DELETE_MARK_SLOTS: usize = 32 * 1024 * 1024;
 
 // The default version that can enable compaction filter for GC. This is necessary because after
 // compaction filter is enabled, it's impossible to fallback to ealier version which modifications
@@ -42,6 +44,9 @@ struct GcContext {
     cfg_tracker: GcWorkerConfigManager,
     cluster_version: ClusterVersion,
 }
+
+static BOTTOMMOST_DELETE_MARKS: [AtomicU8; BOTTOMMOST_DELETE_MARK_SLOTS] =
+    unsafe { std::mem::transmute([0u8; BOTTOMMOST_DELETE_MARK_SLOTS]) };
 
 lazy_static! {
     static ref GC_CONTEXT: Mutex<Option<GcContext>> = Mutex::new(None);
@@ -138,7 +143,7 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
             return std::ptr::null_mut();
         }
 
-        let (mut needs_gc, mut mvcc_props) = (false, MvccProperties::new());
+        let mut needs_gc = false;
         for i in 0..context.file_numbers().len() {
             let table_props = context.table_properties(i);
             let user_props = unsafe {
@@ -146,15 +151,13 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
                     as *const RocksUserCollectedPropertiesNoRc)
             };
             if let Ok(props) = RocksMvccProperties::decode(user_props) {
-                mvcc_props.add(&props);
-                let sst_ratio = ratio_threshold + SINGLE_SST_RATIO_THRESHOLD_ADJUST;
-                if check_need_gc(safe_point.into(), sst_ratio, &props) {
+                if check_need_gc(safe_point.into(), ratio_threshold, &props) {
                     needs_gc = true;
                     break;
                 }
             }
         }
-        if !needs_gc && !check_need_gc(safe_point.into(), ratio_threshold, &mvcc_props) {
+        if !needs_gc {
             // NOTE: here we don't treat the bottommost level specially.
             // Maybe it's necessary to make a green channel for it.
             debug!("skip gc in compaction filter because it's not necessary");
@@ -163,19 +166,14 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
 
         let name = CString::new("write_compaction_filter").unwrap();
         let db = Arc::clone(&gc_context.db);
-        let filter = Box::new(WriteCompactionFilter::new(
-            db,
-            safe_point,
-            context,
-            &mvcc_props,
-        ));
+        let filter = Box::new(WriteCompactionFilter::new(db, safe_point, context));
         unsafe { new_compaction_filter_raw(name, filter) }
     }
 }
 
 struct WriteCompactionFilter {
     safe_point: u64,
-    handle_mvcc_deletes: bool,
+    is_bottommost_level: bool,
     engine: RocksEngine,
     is_invalid: bool,
     write_batch: RocksWriteBatch,
@@ -198,19 +196,14 @@ struct WriteCompactionFilter {
 }
 
 impl WriteCompactionFilter {
-    fn new(
-        db: Arc<DB>,
-        safe_point: u64,
-        context: &CompactionFilterContext,
-        props: &MvccProperties,
-    ) -> Self {
+    fn new(db: Arc<DB>, safe_point: u64, context: &CompactionFilterContext) -> Self {
         // Safe point must have been initialized.
         assert!(safe_point > 0);
         debug!("gc in compaction filter"; "safe_point" => safe_point);
 
         let mut filter = WriteCompactionFilter {
             safe_point,
-            handle_mvcc_deletes: context.is_bottommost_level() || too_many_delete_marks(props),
+            is_bottommost_level: context.is_bottommost_level(),
             engine: RocksEngine::from_db(db.clone()),
             is_invalid: false,
             write_batch: RocksWriteBatch::with_capacity(db, DEFAULT_DELETE_BATCH_SIZE),
@@ -230,7 +223,7 @@ impl WriteCompactionFilter {
             filtered_hist: GC_DELETE_VERSIONS_HISTOGRAM.local(),
         };
 
-        if filter.handle_mvcc_deletes {
+        if filter.is_bottommost_level {
             let iter_opts = IterOptions::default();
             match filter.engine.iterator_cf_opt(CF_WRITE, iter_opts) {
                 Ok(iter) => filter.write_iter = Some(iter),
@@ -274,9 +267,8 @@ impl WriteCompactionFilter {
                 WriteType::Put => self.remove_older = true,
                 WriteType::Delete => {
                     self.remove_older = true;
-                    if self.handle_mvcc_deletes {
-                        filtered = true;
-                        self.handle_delete_mark(key)?;
+                    if self.is_bottommost_level {
+                        filtered = self.meet_delete_mark(key)?;
                     }
                 }
             }
@@ -297,6 +289,31 @@ impl WriteCompactionFilter {
             (false, _) => CompactionFilterDecision::Keep,
         };
         Ok(decision)
+    }
+
+    // Return whether the delete mark has been already met or not.
+    fn meet_delete_mark(&mut self, mark: &[u8]) -> Result<bool, String> {
+        let hash_value = {
+            let mut hasher = DefaultHasher::new();
+            mark.hash(&mut hasher);
+            hasher.finish() as usize % (BOTTOMMOST_DELETE_MARK_SLOTS * 8)
+        };
+        let (slot, bit) = (hash_value / 8, hash_value % 8);
+
+        let mut already_met = false;
+        BOTTOMMOST_DELETE_MARKS[slot]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                let x = 1u8 << bit;
+                already_met = v & x > 0;
+                let new_v = if already_met { v - x } else { v + x };
+                Some(new_v)
+            })
+            .unwrap();
+
+        if already_met {
+            self.handle_delete_mark(mark)?;
+        }
+        Ok(already_met)
     }
 
     // Do gc before a delete mark.
@@ -501,10 +518,6 @@ fn parse_write(value: &[u8]) -> Result<WriteRef, String> {
     }
 }
 
-fn too_many_delete_marks(props: &MvccProperties) -> bool {
-    props.num_deletes as f64 / props.num_versions as f64 > 0.2
-}
-
 pub fn is_compaction_filter_allowd(cfg_value: &GcConfig, cluster_version: &ClusterVersion) -> bool {
     do_check_allowed(
         cfg_value.enable_compaction_filter,
@@ -530,10 +543,10 @@ pub mod tests {
     use crate::storage::kv::{RocksEngine as StorageRocksEngine, TestEngineBuilder};
     use crate::storage::mvcc::tests::{must_get, must_get_none};
     use crate::storage::txn::tests::{must_commit, must_prewrite_delete, must_prewrite_put};
-    use engine_rocks::raw::CompactOptions;
+    use engine_rocks::raw::{CompactOptions, Writable};
     use engine_rocks::util::get_cf_handle;
     use engine_rocks::RocksEngine;
-    use engine_traits::{MiscExt, Peekable, SyncMutable};
+    use engine_traits::{MiscExt, Peekable};
     use txn_types::TimeStamp;
 
     // Use a lock to protect concurrent compactions.
@@ -570,7 +583,14 @@ pub mod tests {
             compact_opts.set_change_level(true);
             compact_opts.set_target_level(target_level as i32);
         }
-        db.compact_range_cf_opt(handle, &compact_opts, start, end);
+
+        // Compact twice because of delete marks.
+        for _ in 0..2 {
+            // Put a new key-value pair to ensure compaction can be triggered correctly.
+            let cf_write = db.cf_handle(CF_WRITE).unwrap();
+            db.delete_cf(cf_write, b"not-exists-key").unwrap();
+            db.compact_range_cf_opt(handle, &compact_opts, start, end);
+        }
     }
 
     fn do_gc_by_compact_with_ratio_threshold(
@@ -596,8 +616,6 @@ pub mod tests {
 
     pub fn gc_by_compact(engine: &StorageRocksEngine, _: &[u8], safe_point: u64) {
         let engine = engine.get_rocksdb();
-        // Put a new key-value pair to ensure compaction can be triggered correctly.
-        engine.delete_cf("write", b"znot-exists-key").unwrap();
         do_gc_by_compact(&engine, None, None, safe_point, None);
     }
 
