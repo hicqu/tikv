@@ -329,6 +329,15 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 }
                 fsm_cnt += 1;
             }
+
+            let tp_name = std::any::type_name::<N>();
+            if batch.normals.len() >= self.max_batch_size {
+                error!(
+                    "{} batch system fetch batch size: {}",
+                    tp_name,
+                    batch.normals.len()
+                );
+            }
             self.handler.end(&mut batch.normals);
 
             // Because release use `swap_remove` internally, so using pop here

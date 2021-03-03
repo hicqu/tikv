@@ -67,6 +67,11 @@ const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
 const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
 const SHRINK_PENDING_CMD_QUEUE_CAP: usize = 64;
 
+pub static ALLOCATED_APPLIES: AtomicUsize = AtomicUsize::new(0);
+pub static LOG_ALLOCATED_APPLIES: AtomicUsize = AtomicUsize::new(0);
+pub static DEALLOCATED_APPLIES: AtomicUsize = AtomicUsize::new(0);
+pub static LOG_DEALLOCATED_APPLIES: AtomicUsize = AtomicUsize::new(0);
+
 pub struct PendingCmd<S>
 where
     S: Snapshot,
@@ -2669,6 +2674,10 @@ where
     entries_count: i64,
 }
 
+pub fn calc_entries_mem_size(entries: &Vec<Entry>) -> usize {
+    (ENTRY_MEM_SIZE * entries.capacity()) as usize + get_entries_mem_size(&entries) as usize
+}
+
 impl<S: Snapshot> Apply<S> {
     pub(crate) fn new(
         peer_id: u64,
@@ -3344,10 +3353,17 @@ where
         loop {
             match drainer.next() {
                 Some(Msg::Apply { start, apply }) => {
+                    let apply_size = apply.entries_mem_size as usize;
                     if channel_timer.is_none() {
                         channel_timer = Some(start);
                     }
                     self.handle_apply(apply_ctx, apply);
+                    let mut size = DEALLOCATED_APPLIES.fetch_add(apply_size, Ordering::Relaxed);
+                    size += apply_size;
+                    if size > LOG_DEALLOCATED_APPLIES.load(Ordering::Relaxed) + 1 << 25 {
+                        LOG_DEALLOCATED_APPLIES.store(size, Ordering::Relaxed);
+                        error!("TEMP size of deallocated applies: {}", size);
+                    }
                     if let Some(ref mut state) = self.delegate.yield_state {
                         state.pending_msgs = drainer.collect();
                         break;

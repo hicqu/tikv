@@ -35,7 +35,9 @@ use time::Timespec;
 use uuid::Uuid;
 
 use crate::coprocessor::{CoprocessorHost, RegionChangeEvent};
-use crate::store::fsm::apply::CatchUpLogs;
+use crate::store::fsm::apply::{
+    calc_entries_mem_size, CatchUpLogs, ALLOCATED_APPLIES, LOG_ALLOCATED_APPLIES,
+};
 use crate::store::fsm::store::PollContext;
 use crate::store::fsm::{apply, Apply, ApplyMetrics, ApplyTask, CollectedReady, Proposal};
 use crate::store::hibernate_state::GroupState;
@@ -1602,6 +1604,15 @@ where
         );
 
         let mut ready = self.raft_group.ready();
+        let apply_size = calc_entries_mem_size(ready.committed_entries());
+        if apply_size > 0 {
+            let mut size = ALLOCATED_APPLIES.fetch_add(apply_size, Ordering::Relaxed);
+            size += apply_size;
+            if size > LOG_ALLOCATED_APPLIES.load(Ordering::Relaxed) + 1 << 25 {
+                LOG_ALLOCATED_APPLIES.store(size, Ordering::Relaxed);
+                error!("TEMP size of allocated applies: {}", size);
+            }
+        }
 
         self.last_unpersisted_number = ready.number();
 
