@@ -355,7 +355,7 @@ impl Debugger {
                 }
             };
             if region_state.get_state() == PeerState::Tombstone {
-                v1!("skip because it's already tombstone");
+                println!("skip because it's already tombstone");
                 continue;
             }
             let region = &region_state.get_region();
@@ -364,7 +364,7 @@ impl Debugger {
 
         let mut write_opts = WriteOptions::new();
         write_opts.set_sync(true);
-        db.write_opt(&wb, &write_opts).unwrap();
+        db.write_opt(wb, &write_opts).unwrap();
         Ok(errors)
     }
 
