@@ -39,6 +39,7 @@ grpcio = { version = "0.9",  default-features = false, features = ["openssl-vend
 http = "0.2.0"
 lazy_static = "1.3"
 libc = "0.2"
+libcgroup-sys = { git = "https://github.com/hicqu/rcm", branch = "fix-compile-for-libcgroup-sys" }
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
 log_wrappers = { path = "../log_wrappers" }
 num_cpus = "1"

@@ -2132,6 +2132,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7282d924be3275cec7f6756ff4121987bc6481325397dde6ba3e7802b1a8b1c"
 
 [[package]]
+name = "libcgroup-sys"
+version = "0.3.0"
+source = "git+https://github.com/hicqu/rcm?branch=fix-compile-for-libcgroup-sys#6c45fbb49722eaaeb99f94c7f3e64ab2a71238d6"
+dependencies = [
+ "libc 0.2.86",
+]
+
+[[package]]
 name = "libflate"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5367,6 +5375,7 @@ dependencies = [
  "kvproto",
  "lazy_static",
  "libc 0.2.86",
+ "libcgroup-sys",
  "log",
  "log_wrappers",
  "nix 0.11.1",
