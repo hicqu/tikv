@@ -15,7 +15,7 @@ impl engine_traits::TablePropertiesCollection for TablePropertiesCollection {
     type UserCollectedProperties = UserCollectedProperties;
     fn iter_user_collected_properties<F>(&self, _: F)
     where
-        F: FnMut(&Self::UserCollectedProperties) -> bool,
+        F: FnMut(&Self::UserCollectedProperties, &str) -> bool,
     {
     }
 }
@@ -27,6 +27,10 @@ impl engine_traits::TablePropertiesExt for PanicEngine {
         cf: &str,
         ranges: &[Range],
     ) -> Result<Self::TablePropertiesCollection> {
+        panic!()
+    }
+
+    fn lsm_l0_tables(&self, cf: &str) -> Option<Vec<String>> {
         panic!()
     }
 }
