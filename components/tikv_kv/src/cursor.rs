@@ -12,13 +12,14 @@ use tikv_util::{panic_when_unexpected_key_or_data, set_panic_mark};
 use txn_types::{Key, TimeStamp};
 
 use crate::stats::{StatsCollector, StatsKind};
-use crate::{CfStatistics, Error, Iterator, Result, ScanMode, Snapshot, SEEK_BOUND};
+use crate::{seek_bound, CfStatistics, Error, Iterator, Result, ScanMode, Snapshot};
 
 pub struct Cursor<I: Iterator> {
     iter: I,
     scan_mode: ScanMode,
     // prefix_seek doesn't support seek_to_first and seek_to_last.
     prefix_seek: bool,
+    seek_bound: u64,
     // the data cursor can be seen will be
     min_key: Option<Vec<u8>>,
     max_key: Option<Vec<u8>>,
@@ -30,11 +31,11 @@ pub struct Cursor<I: Iterator> {
 }
 
 macro_rules! near_loop {
-    ($cond:expr, $fallback:expr, $st:expr) => {{
+    ($cond:expr, $fallback:expr, $bound: expr, $st:expr) => {{
         let mut cnt = 0;
         while $cond {
             cnt += 1;
-            if cnt >= SEEK_BOUND {
+            if cnt >= $bound {
                 $st.over_seek_bound += 1;
                 return $fallback;
             }
@@ -43,11 +44,12 @@ macro_rules! near_loop {
 }
 
 impl<I: Iterator> Cursor<I> {
-    pub fn new(iter: I, mode: ScanMode, prefix_seek: bool) -> Self {
+    pub fn new(iter: I, mode: ScanMode, prefix_seek: bool, seek_bound: u64) -> Self {
         Self {
             iter,
             scan_mode: mode,
             prefix_seek,
+            seek_bound,
             min_key: None,
             max_key: None,
 
@@ -140,6 +142,7 @@ impl<I: Iterator> Cursor<I> {
             near_loop!(
                 self.prev(statistics) && self.key(statistics) > key.as_encoded().as_slice(),
                 self.seek(key, statistics),
+                self.seek_bound,
                 statistics
             );
             if self.valid()? {
@@ -159,6 +162,7 @@ impl<I: Iterator> Cursor<I> {
             near_loop!(
                 self.next(statistics) && self.key(statistics) < key.as_encoded().as_slice(),
                 self.seek(key, statistics),
+                self.seek_bound,
                 statistics
             );
         }
@@ -248,6 +252,7 @@ impl<I: Iterator> Cursor<I> {
             near_loop!(
                 self.next(statistics) && self.key(statistics) < key.as_encoded().as_slice(),
                 self.seek_for_prev(key, statistics),
+                self.seek_bound,
                 statistics
             );
             if self.valid()? {
@@ -264,6 +269,7 @@ impl<I: Iterator> Cursor<I> {
             near_loop!(
                 self.prev(statistics) && self.key(statistics) > key.as_encoded().as_slice(),
                 self.seek_for_prev(key, statistics),
+                self.seek_bound,
                 statistics
             );
         }
@@ -552,10 +558,12 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
             iter_opt.use_prefix_seek();
             iter_opt.set_prefix_same_as_start(true);
         }
+
         Ok(Cursor::new(
             self.snapshot.iter_cf(self.cf, iter_opt)?,
             self.scan_mode,
             self.prefix_seek,
+            seek_bound(self.cf),
         ))
     }
 }

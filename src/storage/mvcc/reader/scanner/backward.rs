@@ -8,7 +8,7 @@ use kvproto::kvrpcpb::IsolationLevel;
 use txn_types::{Key, Lock, TimeStamp, Value, Write, WriteRef, WriteType};
 
 use super::ScannerConfig;
-use crate::storage::kv::{Cursor, Snapshot, Statistics, SEEK_BOUND};
+use crate::storage::kv::{Cursor, Snapshot, Statistics, SEEK_BOUND_WRITE};
 use crate::storage::mvcc::{Error, NewerTsCheckState, Result};
 
 // When there are many versions for the user key, after several tries,
@@ -16,8 +16,8 @@ use crate::storage::mvcc::{Error, NewerTsCheckState, Result};
 // the write cf's iterator's direction inside RocksDB, and the next user key
 // need to turn back the direction to backward. As we have tested, turn around
 // iterator's direction from forward to backward is as expensive as seek in
-// RocksDB, so don't set REVERSE_SEEK_BOUND too small.
-const REVERSE_SEEK_BOUND: u64 = 16;
+// RocksDB, so don't set REVERSE_SEEK_BOUND_WRITE too small.
+const REVERSE_SEEK_BOUND_WRITE: u64 = 16;
 
 /// This struct can be used to scan keys starting from the given user key in the reverse order
 /// (less than).
@@ -221,11 +221,11 @@ impl<S: Snapshot> BackwardKvScanner<S> {
         let mut last_version = None;
         let mut last_checked_commit_ts = TimeStamp::zero();
 
-        for i in 0..REVERSE_SEEK_BOUND {
+        for i in 0..REVERSE_SEEK_BOUND_WRITE {
             if i > 0 {
                 // We are already pointing at the smallest version, so we don't need to prev()
                 // for the first iteration. So we will totally call `prev()` function
-                // `REVERSE_SEEK_BOUND - 1` times.
+                // `REVERSE_SEEK_BOUND_WRITE - 1` times.
                 self.write_cursor.prev(&mut self.statistics.write);
                 if !self.write_cursor.valid()? {
                     // Key space ended. We use `last_version` as the return.
@@ -419,7 +419,7 @@ impl<S: Snapshot> BackwardKvScanner<S> {
     /// key, we `seek_for_prev()`.
     #[inline]
     fn move_write_cursor_to_prev_user_key(&mut self, current_user_key: &Key) -> Result<()> {
-        for i in 0..SEEK_BOUND {
+        for i in 0..SEEK_BOUND_WRITE {
             if i > 0 {
                 self.write_cursor.prev(&mut self.statistics.write);
             }
@@ -473,25 +473,25 @@ mod tests {
         let engine = TestEngineBuilder::new().build().unwrap();
 
         let ctx = Context::default();
-        // Generate REVERSE_SEEK_BOUND / 2 Put for key [10].
+        // Generate REVERSE_SEEK_BOUND_WRITE / 2 Put for key [10].
         let k = &[10_u8];
-        for ts in 0..REVERSE_SEEK_BOUND / 2 {
+        for ts in 0..REVERSE_SEEK_BOUND_WRITE / 2 {
             must_prewrite_put(&engine, k, &[ts as u8], k, ts);
             must_commit(&engine, k, ts, ts);
         }
 
-        // Generate REVERSE_SEEK_BOUND + 1 Put for key [9].
+        // Generate REVERSE_SEEK_BOUND_WRITE + 1 Put for key [9].
         let k = &[9_u8];
-        for ts in 0..=REVERSE_SEEK_BOUND {
+        for ts in 0..=REVERSE_SEEK_BOUND_WRITE {
             must_prewrite_put(&engine, k, &[ts as u8], k, ts);
             must_commit(&engine, k, ts, ts);
         }
 
-        // Generate REVERSE_SEEK_BOUND / 2 Put and REVERSE_SEEK_BOUND / 2 + 1 Rollback for key [8].
+        // Generate REVERSE_SEEK_BOUND_WRITE / 2 Put and REVERSE_SEEK_BOUND_WRITE / 2 + 1 Rollback for key [8].
         let k = &[8_u8];
-        for ts in 0..=REVERSE_SEEK_BOUND {
+        for ts in 0..=REVERSE_SEEK_BOUND_WRITE {
             must_prewrite_put(&engine, k, &[ts as u8], k, ts);
-            if ts < REVERSE_SEEK_BOUND / 2 {
+            if ts < REVERSE_SEEK_BOUND_WRITE / 2 {
                 must_commit(&engine, k, ts, ts);
             } else {
                 let modifies = vec![
@@ -507,19 +507,19 @@ mod tests {
             }
         }
 
-        // Generate REVERSE_SEEK_BOUND / 2 Put, 1 Delete and REVERSE_SEEK_BOUND / 2 Rollback
+        // Generate REVERSE_SEEK_BOUND_WRITE / 2 Put, 1 Delete and REVERSE_SEEK_BOUND_WRITE / 2 Rollback
         // for key [7].
         let k = &[7_u8];
-        for ts in 0..REVERSE_SEEK_BOUND / 2 {
+        for ts in 0..REVERSE_SEEK_BOUND_WRITE / 2 {
             must_prewrite_put(&engine, k, &[ts as u8], k, ts);
             must_commit(&engine, k, ts, ts);
         }
         {
-            let ts = REVERSE_SEEK_BOUND / 2;
+            let ts = REVERSE_SEEK_BOUND_WRITE / 2;
             must_prewrite_delete(&engine, k, k, ts);
             must_commit(&engine, k, ts, ts);
         }
-        for ts in REVERSE_SEEK_BOUND / 2 + 1..=REVERSE_SEEK_BOUND {
+        for ts in REVERSE_SEEK_BOUND_WRITE / 2 + 1..=REVERSE_SEEK_BOUND_WRITE {
             must_prewrite_put(&engine, k, &[ts as u8], k, ts);
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
@@ -540,9 +540,9 @@ mod tests {
             must_commit(&engine, k, ts, ts);
         }
 
-        // Generate REVERSE_SEEK_BOUND + 1 Rollback for key [5].
+        // Generate REVERSE_SEEK_BOUND_WRITE + 1 Rollback for key [5].
         let k = &[5_u8];
-        for ts in 0..=REVERSE_SEEK_BOUND {
+        for ts in 0..=REVERSE_SEEK_BOUND_WRITE {
             must_prewrite_put(&engine, k, &[ts as u8], k, ts);
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
@@ -556,19 +556,19 @@ mod tests {
             write(&engine, &ctx, modifies);
         }
 
-        // Generate 1 PUT with ts = REVERSE_SEEK_BOUND and 1 PUT
-        // with ts = REVERSE_SEEK_BOUND + 1 for key [4].
+        // Generate 1 PUT with ts = REVERSE_SEEK_BOUND_WRITE and 1 PUT
+        // with ts = REVERSE_SEEK_BOUND_WRITE + 1 for key [4].
         let k = &[4_u8];
-        for ts in REVERSE_SEEK_BOUND..REVERSE_SEEK_BOUND + 2 {
+        for ts in REVERSE_SEEK_BOUND_WRITE..REVERSE_SEEK_BOUND_WRITE + 2 {
             must_prewrite_put(&engine, k, &[ts as u8], k, ts);
             must_commit(&engine, k, ts, ts);
         }
 
-        // Assume REVERSE_SEEK_BOUND == 4, we have keys:
+        // Assume REVERSE_SEEK_BOUND_WRITE == 4, we have keys:
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, REVERSE_SEEK_BOUND.into())
+        let mut scanner = ScannerBuilder::new(snapshot, REVERSE_SEEK_BOUND_WRITE.into())
             .desc(true)
             .range(None, Some(Key::from_raw(&[11_u8])))
             .build()
@@ -577,7 +577,7 @@ mod tests {
         // Initial position: 1 seek_for_prev
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //                                                  ^cursor
-        // When get key [10]: REVERSE_SEEK_BOUND / 2 prev
+        // When get key [10]: REVERSE_SEEK_BOUND_WRITE / 2 prev
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //                                             ^cursor
         //                                               ^last_version
@@ -588,24 +588,24 @@ mod tests {
             scanner.next().unwrap(),
             Some((
                 Key::from_raw(&[10_u8]),
-                vec![(REVERSE_SEEK_BOUND / 2 - 1) as u8]
+                vec![(REVERSE_SEEK_BOUND_WRITE / 2 - 1) as u8]
             ))
         );
         let statistics = scanner.take_statistics();
-        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize / 2);
+        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND_WRITE as usize / 2);
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 0);
         assert_eq!(statistics.write.seek_for_prev, 1);
         assert_eq!(
             statistics.processed_size,
-            Key::from_raw(&[10_u8]).len() + vec![(REVERSE_SEEK_BOUND / 2 - 1) as u8].len()
+            Key::from_raw(&[10_u8]).len() + vec![(REVERSE_SEEK_BOUND_WRITE / 2 - 1) as u8].len()
         );
 
         // Before get key [9]:
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //                                             ^cursor
         // When get key [9]:
-        // First, REVERSE_SEEK_BOUND - 1 prev
+        // First, REVERSE_SEEK_BOUND_WRITE - 1 prev
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //                                       ^cursor
         //                                       ^last_version
@@ -621,23 +621,23 @@ mod tests {
         //                                   ^cursor
         assert_eq!(
             scanner.next().unwrap(),
-            Some((Key::from_raw(&[9_u8]), vec![REVERSE_SEEK_BOUND as u8]))
+            Some((Key::from_raw(&[9_u8]), vec![REVERSE_SEEK_BOUND_WRITE as u8]))
         );
         let statistics = scanner.take_statistics();
-        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize);
+        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND_WRITE as usize);
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 0);
         assert_eq!(statistics.write.seek_for_prev, 0);
         assert_eq!(
             statistics.processed_size,
-            Key::from_raw(&[9_u8]).len() + vec![(REVERSE_SEEK_BOUND) as u8].len()
+            Key::from_raw(&[9_u8]).len() + vec![(REVERSE_SEEK_BOUND_WRITE) as u8].len()
         );
 
         // Before get key [8]:
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //                                   ^cursor
         // When get key [8]:
-        // First, REVERSE_SEEK_BOUND - 1 prev
+        // First, REVERSE_SEEK_BOUND_WRITE - 1 prev
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //                             ^cursor
         //                                 ^last_version
@@ -661,23 +661,23 @@ mod tests {
             scanner.next().unwrap(),
             Some((
                 Key::from_raw(&[8_u8]),
-                vec![(REVERSE_SEEK_BOUND / 2 - 1) as u8]
+                vec![(REVERSE_SEEK_BOUND_WRITE / 2 - 1) as u8]
             ))
         );
         let statistics = scanner.take_statistics();
-        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize + 1);
+        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND_WRITE as usize + 1);
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
         assert_eq!(statistics.write.seek_for_prev, 0);
         assert_eq!(
             statistics.processed_size,
-            Key::from_raw(&[8_u8]).len() + vec![(REVERSE_SEEK_BOUND / 2 - 1) as u8].len()
+            Key::from_raw(&[8_u8]).len() + vec![(REVERSE_SEEK_BOUND_WRITE / 2 - 1) as u8].len()
         );
 
         // Before get key [7]:
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //                         ^cursor
-        // First, REVERSE_SEEK_BOUND - 1 prev
+        // First, REVERSE_SEEK_BOUND_WRITE - 1 prev
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //                   ^cursor
         // Bound reached, 1 extra seek.
@@ -704,7 +704,7 @@ mod tests {
             Some((Key::from_raw(&[6_u8]), vec![0_u8]))
         );
         let statistics = scanner.take_statistics();
-        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize + 2);
+        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND_WRITE as usize + 2);
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
         assert_eq!(statistics.write.seek_for_prev, 0);
@@ -717,7 +717,7 @@ mod tests {
         // Before get key [5]:
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //             ^cursor
-        // First, REVERSE_SEEK_BOUND - 1 prev
+        // First, REVERSE_SEEK_BOUND_WRITE - 1 prev
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
         //       ^cursor (last_version == None)
         // Bound reached, 1 extra seek.
@@ -741,16 +741,16 @@ mod tests {
         // ^cursor
         assert_eq!(
             scanner.next().unwrap(),
-            Some((Key::from_raw(&[4_u8]), vec![REVERSE_SEEK_BOUND as u8]))
+            Some((Key::from_raw(&[4_u8]), vec![REVERSE_SEEK_BOUND_WRITE as u8]))
         );
         let statistics = scanner.take_statistics();
-        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize + 3);
+        assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND_WRITE as usize + 3);
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
         assert_eq!(statistics.write.seek_for_prev, 0);
         assert_eq!(
             statistics.processed_size,
-            Key::from_raw(&[4_u8]).len() + vec![REVERSE_SEEK_BOUND as u8].len()
+            Key::from_raw(&[4_u8]).len() + vec![REVERSE_SEEK_BOUND_WRITE as u8].len()
         );
 
         // Scan end.
@@ -772,7 +772,7 @@ mod tests {
         let engine = TestEngineBuilder::new().build().unwrap();
         let ctx = Context::default();
         // Generate N/2 rollback for [b].
-        for ts in 0..REVERSE_SEEK_BOUND / 2 {
+        for ts in 0..REVERSE_SEEK_BOUND_WRITE / 2 {
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
@@ -786,22 +786,22 @@ mod tests {
         }
 
         // Generate 1 put for [c].
-        must_prewrite_put(&engine, b"c", b"value", b"c", REVERSE_SEEK_BOUND * 2);
+        must_prewrite_put(&engine, b"c", b"value", b"c", REVERSE_SEEK_BOUND_WRITE * 2);
         must_commit(
             &engine,
             b"c",
-            REVERSE_SEEK_BOUND * 2,
-            REVERSE_SEEK_BOUND * 2,
+            REVERSE_SEEK_BOUND_WRITE * 2,
+            REVERSE_SEEK_BOUND_WRITE * 2,
         );
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (REVERSE_SEEK_BOUND * 2).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (REVERSE_SEEK_BOUND_WRITE * 2).into())
             .desc(true)
             .range(None, None)
             .build()
             .unwrap();
 
-        // The following illustration comments assume that REVERSE_SEEK_BOUND = 4.
+        // The following illustration comments assume that REVERSE_SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_last:
         //   b_1 b_0 c_8
@@ -834,7 +834,10 @@ mod tests {
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.seek_for_prev, 0);
         assert_eq!(statistics.write.next, 0);
-        assert_eq!(statistics.write.prev, (REVERSE_SEEK_BOUND / 2) as usize);
+        assert_eq!(
+            statistics.write.prev,
+            (REVERSE_SEEK_BOUND_WRITE / 2) as usize
+        );
         assert_eq!(statistics.processed_size, 0);
 
         // Cursor remains invalid, so nothing should happen.
@@ -858,7 +861,7 @@ mod tests {
         // Generate 1 put and N/2 rollback for [b].
         must_prewrite_put(&engine, b"b", b"value_b", b"b", 0);
         must_commit(&engine, b"b", 0, 0);
-        for ts in 1..=REVERSE_SEEK_BOUND / 2 {
+        for ts in 1..=REVERSE_SEEK_BOUND_WRITE / 2 {
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
@@ -872,22 +875,28 @@ mod tests {
         }
 
         // Generate 1 put for [c].
-        must_prewrite_put(&engine, b"c", b"value_c", b"c", REVERSE_SEEK_BOUND * 2);
+        must_prewrite_put(
+            &engine,
+            b"c",
+            b"value_c",
+            b"c",
+            REVERSE_SEEK_BOUND_WRITE * 2,
+        );
         must_commit(
             &engine,
             b"c",
-            REVERSE_SEEK_BOUND * 2,
-            REVERSE_SEEK_BOUND * 2,
+            REVERSE_SEEK_BOUND_WRITE * 2,
+            REVERSE_SEEK_BOUND_WRITE * 2,
         );
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (REVERSE_SEEK_BOUND * 2).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (REVERSE_SEEK_BOUND_WRITE * 2).into())
             .desc(true)
             .range(None, None)
             .build()
             .unwrap();
 
-        // The following illustration comments assume that REVERSE_SEEK_BOUND = 4.
+        // The following illustration comments assume that REVERSE_SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_last:
         //   b_2 b_1 b_0 c_8
@@ -923,7 +932,10 @@ mod tests {
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.seek_for_prev, 0);
         assert_eq!(statistics.write.next, 0);
-        assert_eq!(statistics.write.prev, (REVERSE_SEEK_BOUND / 2 + 1) as usize);
+        assert_eq!(
+            statistics.write.prev,
+            (REVERSE_SEEK_BOUND_WRITE / 2 + 1) as usize
+        );
         assert_eq!(
             statistics.processed_size,
             Key::from_raw(b"b").len() + b"value_b".len()
@@ -952,7 +964,7 @@ mod tests {
         must_commit(&engine, b"c", 1, 1);
 
         // Generate N/2 put for [b] .
-        for ts in 1..=SEEK_BOUND / 2 {
+        for ts in 1..=SEEK_BOUND_WRITE / 2 {
             must_prewrite_put(&engine, b"b", &[ts as u8], b"b", ts);
             must_commit(&engine, b"b", ts, ts);
         }
@@ -964,7 +976,7 @@ mod tests {
             .build()
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_last:
         //   b_2 b_1 c_1
@@ -1004,7 +1016,7 @@ mod tests {
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.seek_for_prev, 0);
         assert_eq!(statistics.write.next, 0);
-        assert_eq!(statistics.write.prev, (SEEK_BOUND / 2) as usize);
+        assert_eq!(statistics.write.prev, (SEEK_BOUND_WRITE / 2) as usize);
         assert_eq!(
             statistics.processed_size,
             Key::from_raw(b"b").len() + vec![1u8].len()
@@ -1033,7 +1045,7 @@ mod tests {
         must_commit(&engine, b"c", 1, 1);
 
         // Generate N+1 put for [b] .
-        for ts in 1..SEEK_BOUND + 2 {
+        for ts in 1..SEEK_BOUND_WRITE + 2 {
             must_prewrite_put(&engine, b"b", &[ts as u8], b"b", ts);
             must_commit(&engine, b"b", ts, ts);
         }
@@ -1045,7 +1057,7 @@ mod tests {
             .build()
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_last:
         //   b_5 b_4 b_3 b_2 b_1 c_1
@@ -1077,7 +1089,7 @@ mod tests {
         //   b_5 b_4 b_3 b_2 b_1 c_1
         //               ^cursor
         // Now we get [b].
-        // After get the value, use N-1 prev: (TODO: Should be SEEK_BOUND)
+        // After get the value, use N-1 prev: (TODO: Should be SEEK_BOUND_WRITE)
         //   b_5 b_4 b_3 b_2 b_1 c_1
         //   ^cursor
         // Then, use seek_for_prev:
@@ -1091,7 +1103,7 @@ mod tests {
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.seek_for_prev, 1);
         assert_eq!(statistics.write.next, 0);
-        assert_eq!(statistics.write.prev, SEEK_BOUND as usize);
+        assert_eq!(statistics.write.prev, SEEK_BOUND_WRITE as usize);
         assert_eq!(
             statistics.processed_size,
             Key::from_raw(b"b").len() + vec![1u8].len()
@@ -1115,26 +1127,26 @@ mod tests {
     fn test_move_prev_user_key_out_of_bound_3() {
         let engine = TestEngineBuilder::new().build().unwrap();
 
-        // N denotes for SEEK_BOUND, M denotes for REVERSE_SEEK_BOUND
+        // N denotes for SEEK_BOUND_WRITE, M denotes for REVERSE_SEEK_BOUND_WRITE
 
         // Generate 1 put for [c].
         must_prewrite_put(&engine, b"c", b"value", b"c", 1);
         must_commit(&engine, b"c", 1, 1);
 
         // Generate N+M+1 put for [b] .
-        for ts in 1..SEEK_BOUND + REVERSE_SEEK_BOUND + 2 {
+        for ts in 1..SEEK_BOUND_WRITE + REVERSE_SEEK_BOUND_WRITE + 2 {
             must_prewrite_put(&engine, b"b", &[ts as u8], b"b", ts);
             must_commit(&engine, b"b", ts, ts);
         }
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (REVERSE_SEEK_BOUND + 1).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (REVERSE_SEEK_BOUND_WRITE + 1).into())
             .desc(true)
             .range(None, None)
             .build()
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4, REVERSE_SEEK_BOUND = 6.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4, REVERSE_SEEK_BOUND_WRITE = 6.
 
         // Initial position: 1 seek_to_last:
         //   b_11 b_10 b_9 b_8 b_7 b_6 b_5 b_4 b_3 b_2 b_1 c_1
@@ -1177,7 +1189,10 @@ mod tests {
         // ^cursor
         assert_eq!(
             scanner.next().unwrap(),
-            Some((Key::from_raw(b"b"), vec![(REVERSE_SEEK_BOUND + 1) as u8])),
+            Some((
+                Key::from_raw(b"b"),
+                vec![(REVERSE_SEEK_BOUND_WRITE + 1) as u8]
+            )),
         );
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
@@ -1185,11 +1200,11 @@ mod tests {
         assert_eq!(statistics.write.next, 0);
         assert_eq!(
             statistics.write.prev,
-            (REVERSE_SEEK_BOUND - 1 + SEEK_BOUND - 1) as usize
+            (REVERSE_SEEK_BOUND_WRITE - 1 + SEEK_BOUND_WRITE - 1) as usize
         );
         assert_eq!(
             statistics.processed_size,
-            Key::from_raw(b"b").len() + vec![(REVERSE_SEEK_BOUND + 1) as u8].len()
+            Key::from_raw(b"b").len() + vec![(REVERSE_SEEK_BOUND_WRITE + 1) as u8].len()
         );
 
         // Next we should get nothing.

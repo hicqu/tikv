@@ -8,7 +8,7 @@ use kvproto::kvrpcpb::{ExtraOp, IsolationLevel};
 use txn_types::{Key, Lock, LockType, OldValue, TimeStamp, Value, WriteRef, WriteType};
 
 use super::ScannerConfig;
-use crate::storage::kv::SEEK_BOUND;
+use crate::storage::kv::SEEK_BOUND_WRITE;
 use crate::storage::mvcc::{NewerTsCheckState, Result};
 use crate::storage::txn::{Result as TxnResult, TxnEntry, TxnEntryScanner};
 use crate::storage::{Cursor, Snapshot, Statistics};
@@ -73,7 +73,7 @@ impl<S: Snapshot> Cursors<S> {
         current_user_key: &Key,
         statistics: &mut Statistics,
     ) -> Result<()> {
-        for i in 0..SEEK_BOUND {
+        for i in 0..SEEK_BOUND_WRITE {
             if i > 0 {
                 self.write.next(&mut statistics.write);
             }
@@ -305,7 +305,7 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
         // Whether we have *not* reached where we want by `next()`.
         let mut needs_seek = true;
 
-        for i in 0..SEEK_BOUND {
+        for i in 0..SEEK_BOUND_WRITE {
             if i > 0 {
                 self.cursors.write.next(&mut self.statistics.write);
                 if !self.cursors.write.valid()? {
@@ -1177,11 +1177,11 @@ mod latest_kv_tests {
         let engine = TestEngineBuilder::new().build().unwrap();
         let ctx = Context::default();
         // Generate 1 put for [a].
-        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
-        must_commit(&engine, b"a", SEEK_BOUND * 2, SEEK_BOUND * 2);
+        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND_WRITE * 2);
+        must_commit(&engine, b"a", SEEK_BOUND_WRITE * 2, SEEK_BOUND_WRITE * 2);
 
-        // Generate SEEK_BOUND / 2 rollback and 1 put for [b] .
-        for ts in 0..SEEK_BOUND / 2 {
+        // Generate SEEK_BOUND_WRITE / 2 rollback and 1 put for [b] .
+        for ts in 0..SEEK_BOUND_WRITE / 2 {
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
@@ -1193,16 +1193,16 @@ mod latest_kv_tests {
             ];
             write(&engine, &ctx, modifies);
         }
-        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND / 2);
-        must_commit(&engine, b"b", SEEK_BOUND / 2, SEEK_BOUND / 2);
+        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND_WRITE / 2);
+        must_commit(&engine, b"b", SEEK_BOUND_WRITE / 2, SEEK_BOUND_WRITE / 2);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND_WRITE * 2).into())
             .range(None, None)
             .build()
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_first:
         //   a_8 b_2 b_1 b_0
@@ -1226,7 +1226,7 @@ mod latest_kv_tests {
         //   a_8 b_2 b_1 b_0
         //       ^cursor
         // We should be able to get wanted value without any operation.
-        // After get the value, use SEEK_BOUND / 2 + 1 next to reach next user key and stop:
+        // After get the value, use SEEK_BOUND_WRITE / 2 + 1 next to reach next user key and stop:
         //   a_8 b_2 b_1 b_0
         //                   ^cursor
         assert_eq!(
@@ -1235,7 +1235,7 @@ mod latest_kv_tests {
         );
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
-        assert_eq!(statistics.write.next, (SEEK_BOUND / 2 + 1) as usize);
+        assert_eq!(statistics.write.next, (SEEK_BOUND_WRITE / 2 + 1) as usize);
         assert_eq!(
             statistics.processed_size,
             Key::from_raw(b"b").len() + b"b_value".len()
@@ -1259,11 +1259,11 @@ mod latest_kv_tests {
         let ctx = Context::default();
 
         // Generate 1 put for [a].
-        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
-        must_commit(&engine, b"a", SEEK_BOUND * 2, SEEK_BOUND * 2);
+        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND_WRITE * 2);
+        must_commit(&engine, b"a", SEEK_BOUND_WRITE * 2, SEEK_BOUND_WRITE * 2);
 
-        // Generate SEEK_BOUND-1 rollback and 1 put for [b] .
-        for ts in 1..SEEK_BOUND {
+        // Generate SEEK_BOUND_WRITE-1 rollback and 1 put for [b] .
+        for ts in 1..SEEK_BOUND_WRITE {
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
@@ -1275,16 +1275,16 @@ mod latest_kv_tests {
             ];
             write(&engine, &ctx, modifies);
         }
-        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND);
-        must_commit(&engine, b"b", SEEK_BOUND, SEEK_BOUND);
+        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND_WRITE);
+        must_commit(&engine, b"b", SEEK_BOUND_WRITE, SEEK_BOUND_WRITE);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND_WRITE * 2).into())
             .range(None, None)
             .build()
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_first:
         //   a_8 b_4 b_3 b_2 b_1
@@ -1308,7 +1308,7 @@ mod latest_kv_tests {
         //   a_8 b_4 b_3 b_2 b_1
         //       ^cursor
         // We should be able to get wanted value without any operation.
-        // After get the value, use SEEK_BOUND-1 next: (TODO: fix it to SEEK_BOUND)
+        // After get the value, use SEEK_BOUND_WRITE-1 next: (TODO: fix it to SEEK_BOUND_WRITE)
         //   a_8 b_4 b_3 b_2 b_1
         //                   ^cursor
         // We still pointing at current user key, so a seek:
@@ -1320,7 +1320,7 @@ mod latest_kv_tests {
         );
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
-        assert_eq!(statistics.write.next, (SEEK_BOUND - 1) as usize);
+        assert_eq!(statistics.write.next, (SEEK_BOUND_WRITE - 1) as usize);
         assert_eq!(
             statistics.processed_size,
             Key::from_raw(b"b").len() + b"b_value".len()
@@ -1576,11 +1576,11 @@ mod latest_entry_tests {
         let ctx = Context::default();
 
         // Generate 1 put for [a].
-        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
-        must_commit(&engine, b"a", SEEK_BOUND * 2, SEEK_BOUND * 2);
+        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND_WRITE * 2);
+        must_commit(&engine, b"a", SEEK_BOUND_WRITE * 2, SEEK_BOUND_WRITE * 2);
 
-        // Generate SEEK_BOUND / 2 rollback and 1 put for [b] .
-        for ts in 0..SEEK_BOUND / 2 {
+        // Generate SEEK_BOUND_WRITE / 2 rollback and 1 put for [b] .
+        for ts in 0..SEEK_BOUND_WRITE / 2 {
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
@@ -1592,16 +1592,16 @@ mod latest_entry_tests {
             ];
             write(&engine, &ctx, modifies);
         }
-        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND / 2);
-        must_commit(&engine, b"b", SEEK_BOUND / 2, SEEK_BOUND / 2);
+        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND_WRITE / 2);
+        must_commit(&engine, b"b", SEEK_BOUND_WRITE / 2, SEEK_BOUND_WRITE / 2);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND_WRITE * 2).into())
             .range(None, None)
             .build_entry_scanner(0.into(), false)
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_first:
         //   a_8 b_2 b_1 b_0
@@ -1626,7 +1626,7 @@ mod latest_entry_tests {
         //   a_8 b_2 b_1 b_0
         //       ^cursor
         // We should be able to get wanted value without any operation.
-        // After get the value, use SEEK_BOUND / 2 + 1 next to reach next user key and stop:
+        // After get the value, use SEEK_BOUND_WRITE / 2 + 1 next to reach next user key and stop:
         //   a_8 b_2 b_1 b_0
         //                   ^cursor
         let entry = EntryBuilder::default()
@@ -1639,7 +1639,7 @@ mod latest_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
-        assert_eq!(statistics.write.next, (SEEK_BOUND / 2 + 1) as usize);
+        assert_eq!(statistics.write.next, (SEEK_BOUND_WRITE / 2 + 1) as usize);
         assert_eq!(statistics.processed_size, size);
 
         // Next we should get nothing.
@@ -1660,11 +1660,11 @@ mod latest_entry_tests {
         let ctx = Context::default();
 
         // Generate 1 put for [a].
-        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
-        must_commit(&engine, b"a", SEEK_BOUND * 2, SEEK_BOUND * 2);
+        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND_WRITE * 2);
+        must_commit(&engine, b"a", SEEK_BOUND_WRITE * 2, SEEK_BOUND_WRITE * 2);
 
-        // Generate SEEK_BOUND-1 rollback and 1 put for [b] .
-        for ts in 1..SEEK_BOUND {
+        // Generate SEEK_BOUND_WRITE-1 rollback and 1 put for [b] .
+        for ts in 1..SEEK_BOUND_WRITE {
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
@@ -1676,16 +1676,16 @@ mod latest_entry_tests {
             ];
             write(&engine, &ctx, modifies);
         }
-        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND);
-        must_commit(&engine, b"b", SEEK_BOUND, SEEK_BOUND);
+        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND_WRITE);
+        must_commit(&engine, b"b", SEEK_BOUND_WRITE, SEEK_BOUND_WRITE);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND_WRITE * 2).into())
             .range(None, None)
             .build_entry_scanner(0.into(), false)
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_first:
         //   a_8 b_4 b_3 b_2 b_1
@@ -1710,7 +1710,7 @@ mod latest_entry_tests {
         //   a_8 b_4 b_3 b_2 b_1
         //       ^cursor
         // We should be able to get wanted value without any operation.
-        // After get the value, use SEEK_BOUND-1 next: (TODO: fix it to SEEK_BOUND)
+        // After get the value, use SEEK_BOUND_WRITE-1 next: (TODO: fix it to SEEK_BOUND_WRITE)
         //   a_8 b_4 b_3 b_2 b_1
         //                   ^cursor
         // We still pointing at current user key, so a seek:
@@ -1726,7 +1726,7 @@ mod latest_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
-        assert_eq!(statistics.write.next, (SEEK_BOUND - 1) as usize);
+        assert_eq!(statistics.write.next, (SEEK_BOUND_WRITE - 1) as usize);
         assert_eq!(statistics.processed_size, size);
 
         // Next we should get nothing.
@@ -2011,11 +2011,11 @@ mod delta_entry_tests {
         let engine = TestEngineBuilder::new().build().unwrap();
         let ctx = Context::default();
         // Generate 1 put for [a].
-        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
-        must_commit(&engine, b"a", SEEK_BOUND * 2, SEEK_BOUND * 2);
+        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND_WRITE * 2);
+        must_commit(&engine, b"a", SEEK_BOUND_WRITE * 2, SEEK_BOUND_WRITE * 2);
 
-        // Generate SEEK_BOUND / 2 rollback and 1 put for [b] .
-        for ts in 0..SEEK_BOUND / 2 {
+        // Generate SEEK_BOUND_WRITE / 2 rollback and 1 put for [b] .
+        for ts in 0..SEEK_BOUND_WRITE / 2 {
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
@@ -2027,16 +2027,16 @@ mod delta_entry_tests {
             ];
             write(&engine, &ctx, modifies);
         }
-        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND / 2);
-        must_commit(&engine, b"b", SEEK_BOUND / 2, SEEK_BOUND / 2);
+        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND_WRITE / 2);
+        must_commit(&engine, b"b", SEEK_BOUND_WRITE / 2, SEEK_BOUND_WRITE / 2);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND_WRITE * 2).into())
             .range(None, None)
             .build_delta_scanner(0.into(), ExtraOp::Noop)
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_first:
         //   a_8 b_2 b_1 b_0
@@ -2061,7 +2061,7 @@ mod delta_entry_tests {
         //   a_8 b_2 b_1 b_0
         //       ^cursor
         // We should be able to get wanted value without any operation.
-        // After get the value, use SEEK_BOUND / 2 + 1 next to reach next user key and stop:
+        // After get the value, use SEEK_BOUND_WRITE / 2 + 1 next to reach next user key and stop:
         //   a_8 b_2 b_1 b_0
         //           ^cursor
         let entry = EntryBuilder::default()
@@ -2095,13 +2095,13 @@ mod delta_entry_tests {
         let ctx = Context::default();
 
         // Generate 1 put for [a].
-        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
-        must_commit(&engine, b"a", SEEK_BOUND * 2, SEEK_BOUND * 2);
+        must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND_WRITE * 2);
+        must_commit(&engine, b"a", SEEK_BOUND_WRITE * 2, SEEK_BOUND_WRITE * 2);
 
-        // Generate SEEK_BOUND rollback and 1 put for [b] .
+        // Generate SEEK_BOUND_WRITE rollback and 1 put for [b] .
         // It differs from EntryScanner that this will try to fetch multiple versions of each key.
         // So in this test it needs one more next than EntryScanner.
-        for ts in 1..=SEEK_BOUND {
+        for ts in 1..=SEEK_BOUND_WRITE {
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
@@ -2113,16 +2113,16 @@ mod delta_entry_tests {
             ];
             write(&engine, &ctx, modifies);
         }
-        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND + 1);
-        must_commit(&engine, b"b", SEEK_BOUND + 1, SEEK_BOUND + 1);
+        must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND_WRITE + 1);
+        must_commit(&engine, b"b", SEEK_BOUND_WRITE + 1, SEEK_BOUND_WRITE + 1);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND_WRITE * 2).into())
             .range(None, None)
             .build_delta_scanner(8.into(), ExtraOp::Noop)
             .unwrap();
 
-        // The following illustration comments assume that SEEK_BOUND = 4.
+        // The following illustration comments assume that SEEK_BOUND_WRITE = 4.
 
         // Initial position: 1 seek_to_first:
         //   a_8 b_4 b_3 b_2 b_1
@@ -2147,7 +2147,7 @@ mod delta_entry_tests {
         //   a_8 b_4 b_3 b_2 b_1
         //       ^cursor
         // We should be able to get wanted value without any operation.
-        // After get the value, use SEEK_BOUND-1 next: (TODO: fix it to SEEK_BOUND)
+        // After get the value, use SEEK_BOUND_WRITE-1 next: (TODO: fix it to SEEK_BOUND_WRITE)
         //   a_8 b_4 b_3 b_2 b_1
         //                   ^cursor
         // We still pointing at current user key, so a seek:
@@ -2170,7 +2170,7 @@ mod delta_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
-        assert_eq!(statistics.write.next, (SEEK_BOUND - 1) as usize);
+        assert_eq!(statistics.write.next, (SEEK_BOUND_WRITE - 1) as usize);
         assert_eq!(statistics.processed_size, 0);
     }
 

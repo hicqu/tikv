@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{error, ptr, result};
 
-use engine_traits::{CfName, CF_DEFAULT, CF_LOCK};
+use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use engine_traits::{
     IterOptions, KvEngine as LocalEngine, Mutable, MvccProperties, ReadOptions, WriteBatch,
 };
@@ -57,12 +57,21 @@ use error_code::{self, ErrorCode, ErrorCodeExt};
 use into_other::IntoOther;
 use tikv_util::time::ThreadReadId;
 
-pub const SEEK_BOUND: u64 = 8;
+pub const SEEK_BOUND_DEFAULT: u64 = 8;
+pub const SEEK_BOUND_WRITE: u64 = 50; // 16k/300
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
 
 pub type Callback<T> = Box<dyn FnOnce(Result<T>) + Send>;
 pub type ExtCallback = Box<dyn FnOnce() + Send>;
 pub type Result<T> = result::Result<T, Error>;
+
+pub fn seek_bound(cf: &str) -> u64 {
+    if cf == CF_WRITE || cf == CF_LOCK {
+        SEEK_BOUND_WRITE
+    } else {
+        SEEK_BOUND_DEFAULT
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Modify {
@@ -585,6 +594,7 @@ pub mod tests {
             snapshot.iter(IterOptions::default()).unwrap(),
             ScanMode::Mixed,
             false,
+            SEEK_BOUND_DEFAULT,
         );
         let mut statistics = CfStatistics::default();
         cursor.seek(&Key::from_raw(key), &mut statistics).unwrap();
@@ -598,6 +608,7 @@ pub mod tests {
             snapshot.iter(IterOptions::default()).unwrap(),
             ScanMode::Mixed,
             false,
+            SEEK_BOUND_DEFAULT,
         );
         let mut statistics = CfStatistics::default();
         cursor
@@ -696,6 +707,7 @@ pub mod tests {
             snapshot.iter(IterOptions::default()).unwrap(),
             ScanMode::Mixed,
             false,
+            SEEK_BOUND_DEFAULT,
         );
         let mut statistics = CfStatistics::default();
         assert!(
@@ -720,6 +732,7 @@ pub mod tests {
             snapshot.iter(IterOptions::default()).unwrap(),
             ScanMode::Mixed,
             false,
+            SEEK_BOUND_DEFAULT,
         );
         assert_near_seek(&mut cursor, b"x", (b"x", b"1"));
         assert_near_seek(&mut cursor, b"a", (b"x", b"1"));
@@ -734,7 +747,7 @@ pub mod tests {
                 .unwrap()
         );
         // Insert many key-values between 'x' and 'z' then near_seek will fallback to seek.
-        for i in 0..super::SEEK_BOUND {
+        for i in 0..super::SEEK_BOUND_DEFAULT {
             let key = format!("y{}", i);
             must_put(engine, key.as_bytes(), b"3");
         }
@@ -743,13 +756,14 @@ pub mod tests {
             snapshot.iter(IterOptions::default()).unwrap(),
             ScanMode::Mixed,
             false,
+            SEEK_BOUND_DEFAULT,
         );
         assert_near_seek(&mut cursor, b"x", (b"x", b"1"));
         assert_near_seek(&mut cursor, b"z", (b"z", b"2"));
 
         must_delete(engine, b"x");
         must_delete(engine, b"z");
-        for i in 0..super::SEEK_BOUND {
+        for i in 0..super::SEEK_BOUND_DEFAULT {
             let key = format!("y{}", i);
             must_delete(engine, key.as_bytes());
         }
@@ -761,6 +775,7 @@ pub mod tests {
             snapshot.iter(IterOptions::default()).unwrap(),
             ScanMode::Mixed,
             false,
+            SEEK_BOUND_DEFAULT,
         );
         let mut statistics = CfStatistics::default();
         assert!(
@@ -830,17 +845,26 @@ pub mod tests {
         start_idx: usize,
         step: usize,
     ) {
-        let mut cursor = Cursor::new(snapshot.iter(IterOptions::default()).unwrap(), mode, false);
-        let mut near_cursor =
-            Cursor::new(snapshot.iter(IterOptions::default()).unwrap(), mode, false);
-        let limit = (SEEK_BOUND as usize * 10 + 50 - 1) * 2;
+        let mut cursor = Cursor::new(
+            snapshot.iter(IterOptions::default()).unwrap(),
+            mode,
+            false,
+            SEEK_BOUND_DEFAULT,
+        );
+        let mut near_cursor = Cursor::new(
+            snapshot.iter(IterOptions::default()).unwrap(),
+            mode,
+            false,
+            SEEK_BOUND_DEFAULT,
+        );
+        let limit = (SEEK_BOUND_DEFAULT as usize * 10 + 50 - 1) * 2;
 
-        for (_, mut i) in (start_idx..(SEEK_BOUND as usize * 30))
+        for (_, mut i) in (start_idx..(SEEK_BOUND_DEFAULT as usize * 30))
             .enumerate()
             .filter(|&(i, _)| i % step == 0)
         {
             if seek_mode != SeekMode::Normal {
-                i = SEEK_BOUND as usize * 30 - 1 - i;
+                i = SEEK_BOUND_DEFAULT as usize * 30 - 1 - i;
             }
             let key = format!("key_{:03}", i);
             let seek_key = Key::from_raw(key.as_bytes());
@@ -893,46 +917,46 @@ pub mod tests {
     }
 
     pub fn test_linear<E: Engine>(engine: &E) {
-        for i in 50..50 + SEEK_BOUND * 10 {
+        for i in 50..50 + SEEK_BOUND_DEFAULT * 10 {
             let key = format!("key_{}", i * 2);
             let value = format!("value_{}", i);
             must_put(engine, key.as_bytes(), value.as_bytes());
         }
         let snapshot = engine.snapshot(Default::default()).unwrap();
 
-        for step in 1..SEEK_BOUND as usize * 3 {
+        for step in 1..SEEK_BOUND_DEFAULT as usize * 3 {
             for start in 0..10 {
                 test_linear_seek(
                     &snapshot,
                     ScanMode::Forward,
                     SeekMode::Normal,
-                    start * SEEK_BOUND as usize,
+                    start * SEEK_BOUND_DEFAULT as usize,
                     step,
                 );
                 test_linear_seek(
                     &snapshot,
                     ScanMode::Backward,
                     SeekMode::Reverse,
-                    start * SEEK_BOUND as usize,
+                    start * SEEK_BOUND_DEFAULT as usize,
                     step,
                 );
                 test_linear_seek(
                     &snapshot,
                     ScanMode::Backward,
                     SeekMode::ForPrev,
-                    start * SEEK_BOUND as usize,
+                    start * SEEK_BOUND_DEFAULT as usize,
                     step,
                 );
             }
         }
         for &seek_mode in &[SeekMode::Reverse, SeekMode::Normal, SeekMode::ForPrev] {
-            for step in 1..SEEK_BOUND as usize * 3 {
+            for step in 1..SEEK_BOUND_DEFAULT as usize * 3 {
                 for start in 0..10 {
                     test_linear_seek(
                         &snapshot,
                         ScanMode::Mixed,
                         seek_mode,
-                        start * SEEK_BOUND as usize,
+                        start * SEEK_BOUND_DEFAULT as usize,
                         step,
                     );
                 }
@@ -971,6 +995,7 @@ pub mod tests {
             snapshot.iter(IterOptions::default()).unwrap(),
             ScanMode::Forward,
             false,
+            SEEK_BOUND_DEFAULT,
         );
 
         let mut statistics = CfStatistics::default();

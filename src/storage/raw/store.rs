@@ -10,6 +10,7 @@ use crate::storage::{Error, Result};
 use engine_traits::{CfName, IterOptions, CF_DEFAULT, DATA_KEY_PREFIX_LEN};
 use kvproto::kvrpcpb::{ApiVersion, KeyRange};
 use std::time::Duration;
+use tikv_kv::seek_bound;
 use tikv_util::time::Instant;
 use txn_types::{Key, KvPair};
 use yatp::task::future::reschedule;
@@ -164,7 +165,12 @@ impl<'a, S: Snapshot> RawStoreInner<S> {
         option: IterOptions,
         key_only: bool,
     ) -> Result<Vec<Result<KvPair>>> {
-        let mut cursor = Cursor::new(self.snapshot.iter_cf(cf, option)?, ScanMode::Forward, false);
+        let mut cursor = Cursor::new(
+            self.snapshot.iter_cf(cf, option)?,
+            ScanMode::Forward,
+            false,
+            seek_bound(cf),
+        );
         let statistics = statistics.mut_cf_statistics(cf);
         if !cursor.seek(start_key, statistics)? {
             return Ok(vec![]);
@@ -212,6 +218,7 @@ impl<'a, S: Snapshot> RawStoreInner<S> {
             self.snapshot.iter_cf(cf, option)?,
             ScanMode::Backward,
             false,
+            seek_bound(cf),
         );
         let statistics = statistics.mut_cf_statistics(cf);
         if !cursor.reverse_seek(start_key, statistics)? {
