@@ -20,7 +20,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::num::NonZeroU64;
 use std::ops::{Add, Deref, DerefMut};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicIsize, Ordering},
     Arc,
 };
 
@@ -120,7 +120,7 @@ impl Add for TraceEvent {
 
 pub struct MemoryTrace {
     pub id: Id,
-    trace: AtomicUsize,
+    trace: AtomicIsize,
     children: HashMap<Id, Arc<MemoryTrace>>,
 }
 
@@ -128,7 +128,7 @@ impl MemoryTrace {
     pub fn new(id: impl Into<Id>) -> MemoryTrace {
         MemoryTrace {
             id: id.into(),
-            trace: std::sync::atomic::AtomicUsize::default(),
+            trace: std::sync::atomic::AtomicIsize::default(),
             children: HashMap::default(),
         }
     }
@@ -136,13 +136,13 @@ impl MemoryTrace {
     pub fn trace(&self, event: TraceEvent) {
         match event {
             TraceEvent::Add(val) => {
-                self.trace.fetch_add(val, Ordering::Relaxed);
+                self.trace.fetch_add(val as _, Ordering::Relaxed);
             }
             TraceEvent::Sub(val) => {
-                self.trace.fetch_sub(val, Ordering::Relaxed);
+                self.trace.fetch_sub(val as _, Ordering::Relaxed);
             }
             TraceEvent::Reset(val) => {
-                self.trace.swap(val, Ordering::Relaxed);
+                self.trace.swap(val as _, Ordering::Relaxed);
             }
         }
     }
@@ -176,7 +176,8 @@ impl MemoryTrace {
     // TODO: Maybe need a cache to reduce read cost.
     pub fn sum(&self) -> usize {
         let sum: usize = self.children.values().map(|c| c.sum()).sum();
-        sum + self.trace.load(Ordering::Relaxed)
+        let self_v = self.trace.load(Ordering::Relaxed);
+        sum + if self_v < 0 { 0 } else { self_v as _ }
     }
 
     pub fn name(&self) -> String {
@@ -194,7 +195,7 @@ impl MemoryTrace {
 
 pub struct MemoryTraceSnapshot {
     pub id: Id,
-    pub trace: usize,
+    pub trace: isize,
     pub children: Vec<MemoryTraceSnapshot>,
 }
 
