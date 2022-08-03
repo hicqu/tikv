@@ -426,8 +426,11 @@ pub struct Endpoint<T, E> {
 
     // Metrics and logging.
     current_ts: TimeStamp,
+
+    // For `ChangeDataRequestKvApi::Tidb` or `ChangeDataRequestKvApi::TxnKv`.
     min_resolved_ts: TimeStamp,
     min_ts_region_id: u64,
+
     resolved_region_count: usize,
     unresolved_region_count: usize,
     warn_resolved_ts_repeat_count: usize,
@@ -868,6 +871,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
     }
 
     pub fn on_raw_untrack_ts(&mut self, batch_region_ts: Vec<RawRegionTs>) {
+        println!("on_raw_untrack_ts is called");
         for region_ts in batch_region_ts {
             let region_id = region_ts.region_id;
             if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
@@ -943,6 +947,8 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         }
     }
 
+    // `min_ts` is only for `ChangeDataRequestKvApi::Tidb` or
+    // `ChangeDataRequestKvApi::TxnKv`.
     fn on_min_ts(&mut self, regions: Vec<u64>, min_ts: TimeStamp, current_ts: TimeStamp) {
         // Reset resolved_regions to empty.
         let resolved_regions = &mut self.resolved_region_heap;
@@ -962,27 +968,28 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 let old_resolved_ts = delegate
                     .resolver
                     .as_ref()
-                    .map_or(TimeStamp::zero(), |r| r.resolved_ts());
+                    .map_or(TimeStamp::zero(), |r| r.resolved_ts().txn_ts);
                 if old_resolved_ts > min_ts {
                     advance_failed_stale += 1;
                 }
                 if let Some(resolved_ts) = delegate.on_min_ts(min_ts) {
-                    if resolved_ts.min() < self.min_resolved_ts {
-                        self.min_resolved_ts = resolved_ts.min();
+                    if resolved_ts.txn_ts < self.min_resolved_ts {
+                        self.min_resolved_ts = resolved_ts.txn_ts;
                         self.min_ts_region_id = region_id;
                     }
-                    resolved_regions.push(region_id, resolved_ts.min());
+                    resolved_regions.push(region_id, resolved_ts.txn_ts);
+
+                    if resolved_ts.txn_ts == old_resolved_ts {
+                        advance_failed_same += 1;
+                    } else {
+                        advance_ok += 1;
+                    }
+
                     // The judge of raw region is not accuracy here, and we may miss at most one
                     // "normal" raw region. But this will not break the correctness of outlier
                     // detection.
                     if resolved_ts.is_min_ts_from_raw() || delegate.is_raw_region() {
                         raw_resolved_regions.push(region_id, resolved_ts.raw_ts)
-                    }
-
-                    if resolved_ts.min() == old_resolved_ts {
-                        advance_failed_same += 1;
-                    } else {
-                        advance_ok += 1;
                     }
                 } else {
                     advance_failed_none += 1;
@@ -1277,6 +1284,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
     }
 
     fn on_raw_track_ts(&mut self, region_id: u64, ts: TimeStamp) {
+        println!("on_raw_track_ts is called");
         if let Some(ref mut delegate) = self.capture_regions.get_mut(&region_id) {
             delegate.raw_track_ts(ts);
         } else {
@@ -2082,7 +2090,7 @@ mod tests {
         suite.run(Task::RawTrackTs { region_id, ts });
         let delegate = suite.endpoint.capture_regions.get_mut(&region_id).unwrap();
         let resolver = delegate.resolver.as_mut().unwrap();
-        let raw_resolved_ts = resolver.resolve(TimeStamp::compose(20, 0)).min();
+        let raw_resolved_ts = resolver.resolve(TimeStamp::compose(20, 0)).raw_ts;
         assert_eq!(raw_resolved_ts, ts);
     }
 
@@ -2159,7 +2167,7 @@ mod tests {
         // after region ready, pending locks will be added back to resolver.
         let delegate = suite.endpoint.capture_regions.get_mut(&region_id).unwrap();
         let resolver = delegate.resolver.as_mut().unwrap();
-        let raw_resolved_ts = resolver.resolve(TimeStamp::compose(200, 0)).min();
+        let raw_resolved_ts = resolver.resolve(TimeStamp::compose(200, 0)).raw_ts;
         assert_eq!(raw_resolved_ts, TimeStamp::compose(125, 0));
     }
 
@@ -2239,7 +2247,7 @@ mod tests {
                 suite.run(Task::RawTrackTs { region_id, ts });
                 let delegate = suite.endpoint.capture_regions.get_mut(&region_id).unwrap();
                 let resolver = delegate.resolver.as_mut().unwrap();
-                let raw_resolved_ts = resolver.resolve(cur_tso).min();
+                let raw_resolved_ts = resolver.resolve(cur_tso).raw_ts;
                 assert_eq!(raw_resolved_ts, ts);
             }
         }
@@ -2305,7 +2313,7 @@ mod tests {
             .get_mut(&untrack_region_id)
             .unwrap();
         let resolver = delegate.resolver.as_mut().unwrap();
-        let raw_resolved_ts = resolver.resolve(cur_tso).min();
+        let raw_resolved_ts = resolver.resolve(cur_tso).raw_ts;
         assert_eq!(raw_resolved_ts, cur_tso); // region is untracked.
     }
 

@@ -26,9 +26,6 @@ impl ResolvedTs {
             txn_ts: TimeStamp::zero(),
         }
     }
-    pub fn min(&self) -> TimeStamp {
-        cmp::min(self.raw_ts, self.txn_ts)
-    }
 
     pub fn is_min_ts_from_raw(&self) -> bool {
         self.raw_ts < self.txn_ts
@@ -101,8 +98,8 @@ impl Resolver {
         }
     }
 
-    pub fn resolved_ts(&self) -> TimeStamp {
-        self.resolved_ts.min()
+    pub fn resolved_ts(&self) -> ResolvedTs {
+        self.resolved_ts
     }
 
     pub fn size(&self) -> usize {

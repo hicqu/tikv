@@ -428,7 +428,11 @@ impl Delegate {
         debug!("cdc resolved ts updated";
             "region_id" => self.region_id, "resolved_ts" => ?resolved_ts);
         CDC_RESOLVED_TS_GAP_HISTOGRAM
-            .observe((min_ts.physical() - resolved_ts.min().physical()) as f64 / 1000f64);
+            .observe((min_ts.physical() - resolved_ts.txn_ts.physical()) as f64 / 1000f64);
+        println!(
+            "region {} on_min_ts({}) -> {:?}",
+            self.region_id, min_ts, resolved_ts
+        );
         Some(resolved_ts)
     }
 
@@ -744,7 +748,7 @@ impl Delegate {
                 };
                 // validate commit_ts must be greater than the current resolved_ts
                 if let (Some(resolver), Some(commit_ts)) = (&self.resolver, commit_ts) {
-                    let resolved_ts = resolver.resolved_ts();
+                    let resolved_ts = resolver.resolved_ts().txn_ts;
                     assert!(
                         commit_ts > resolved_ts,
                         "region {} commit_ts: {:?}, resolved_ts: {:?}",

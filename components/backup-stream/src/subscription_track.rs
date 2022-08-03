@@ -392,7 +392,7 @@ impl TwoPhaseResolver {
             return min_ts.min(stable_ts);
         }
 
-        self.resolver.resolve(min_ts).min()
+        self.resolver.resolve(min_ts).txn_ts
     }
 
     pub fn resolved_ts(&self) -> TimeStamp {
@@ -400,7 +400,7 @@ impl TwoPhaseResolver {
             return stable_ts;
         }
 
-        self.resolver.resolved_ts()
+        self.resolver.resolved_ts().txn_ts
     }
 
     pub fn new(region_id: u64, stable_ts: Option<TimeStamp>) -> Self {

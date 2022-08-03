@@ -10,10 +10,11 @@ use grpcio::WriteFlags;
 use kvproto::{cdcpb::*, kvrpcpb::*};
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
+use raftstore::store::util::find_peer;
 use test_raftstore::*;
 use tikv::server::DEFAULT_CLUSTER_ID;
-use tikv_util::HandyRwLock;
-use txn_types::{Key, Lock, LockType};
+use tikv_util::{config::ReadableDuration, HandyRwLock};
+use txn_types::{Key, Lock, LockType, TimeStamp};
 
 use crate::{new_event_feed, TestSuite, TestSuiteBuilder};
 
@@ -2358,4 +2359,50 @@ fn test_prewrite_without_value() {
     // The lock without value shouldn't be retrieved.
     let event = receive_event(false);
     assert_eq!(event.get_events()[0].get_entries().entries[0].commit_ts, 14);
+}
+
+#[test]
+fn test_region_resolved_ts_fallback() {
+    let mut cluster = new_server_cluster(0, 2);
+    cluster.cfg.cdc.min_ts_interval = ReadableDuration(Duration::from_secs(1));
+    cluster.pd_client.disable_default_operator();
+    let mut suite = TestSuiteBuilder::new().cluster(cluster).build();
+
+    let r0 = suite.cluster.get_region(b"");
+    suite.cluster.must_split(&r0, b"m");
+    let r1 = suite.cluster.get_region(b"a");
+    let r2 = suite.cluster.get_region(b"x");
+    let p1 = find_peer(&r1, 1).unwrap().clone();
+    let p2 = find_peer(&r2, 1).unwrap().clone();
+    suite.cluster.must_transfer_leader(r1.id, p1);
+    suite.cluster.must_transfer_leader(r2.id, p2);
+
+    let curr_tso: TimeStamp = block_on(suite.cluster.pd_client.get_tso()).unwrap();
+    let test_cases = &[
+        (r1, curr_tso.into_inner()),
+        (r2, curr_tso.into_inner() + 10),
+    ];
+
+    let mut req_txs = Vec::with_capacity(2);
+    let mut receive_events = Vec::with_capacity(2);
+    for (r, tso) in test_cases {
+        let mut req = suite.new_changedata_request(r.id);
+        req.checkpoint_ts = *tso;
+        let (mut req_tx, _, receive_event) = new_event_feed(suite.get_region_cdc_client(r.id));
+        block_on(req_tx.send((req, WriteFlags::default()))).unwrap();
+        receive_events.push(receive_event);
+        req_txs.push(req_tx);
+    }
+
+    for (i, receive_event) in receive_events.iter().enumerate() {
+        loop {
+            let event = receive_event(true);
+            if event.has_resolved_ts() {
+                println!("event: {:?}", event);
+                let checkpoint = test_cases[i].1;
+                // assert!(event.get_resolved_ts().ts >= checkpoint);
+                break;
+            }
+        }
+    }
 }

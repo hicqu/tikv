@@ -449,13 +449,14 @@ impl<E: KvEngine> Initializer<E> {
 
     fn finish_building_resolver(&self, mut resolver: Resolver, region: Region) {
         let observe_id = self.observe_id;
-        let rts = resolver.resolve(TimeStamp::zero()).min();
+        let rts = resolver.resolve(self.checkpoint_ts);
+        println!("resolver initialized with {}", self.checkpoint_ts);
         info!(
             "cdc resolver initialized and schedule resolver ready";
             "region_id" => region.get_id(),
             "conn_id" => ?self.conn_id,
             "downstream_id" => ?self.downstream_id,
-            "resolved_ts" => rts,
+            "resolved_ts" => ?rts,
             "lock_count" => resolver.locks().len(),
             "observe_id" => ?observe_id,
         );
