@@ -17,9 +17,11 @@ use futures::{channel::mpsc, executor::block_on, FutureExt, StreamExt};
 use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
+use tidb_query_datatype::codec::table::{decode_int_handle, decode_table_id};
 use tikv::storage::CfStatistics;
 use tikv_util::{
     box_err,
+    codec::bytes::decode_bytes_in_place,
     sys::inspector::{
         self_thread_inspector, IoStat, ThreadInspector, ThreadInspectorImpl as OsInspector,
     },
