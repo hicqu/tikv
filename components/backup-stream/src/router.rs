@@ -26,7 +26,7 @@ use openssl::hash::{Hasher, MessageDigest};
 use protobuf::Message;
 use raftstore::coprocessor::CmdBatch;
 use slog_global::debug;
-use tidb_query_datatype::codec::table::decode_table_id;
+use tidb_query_datatype::codec::table::{decode_int_handle, decode_table_id};
 use tikv_util::{
     box_err,
     codec::stream_event::EventEncoder,
@@ -53,7 +53,7 @@ use crate::{
     metrics::{HANDLE_KV_HISTOGRAM, SKIP_KV_COUNTER},
     subscription_track::TwoPhaseResolver,
     try_send,
-    utils::{self, SegmentMap, Slot, SlotMap, StopWatch},
+    utils::{self, redact, SegmentMap, Slot, SlotMap, StopWatch},
 };
 
 const FLUSH_FAILURE_BECOME_FATAL_THRESHOLD: usize = 30;
@@ -161,6 +161,10 @@ impl ApplyEvents {
                     continue;
                 }
             };
+            if let Ok(2590) = decode_int_handle(&key) {
+                let tbl_id = decode_table_id(&key).unwrap_or_default();
+                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&key));
+            }
             if cf == CF_LOCK {
                 match cmd_type {
                     CmdType::Put => {
@@ -1258,6 +1262,12 @@ impl DataFile {
         let mut total_size = 0;
 
         for mut event in events.events {
+            let key = event.key.as_slice();
+            if let Ok(2590) = decode_int_handle(key) {
+                let tbl_id = decode_table_id(key).unwrap_or_default();
+                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(key));
+            }
+
             let encoded = EventEncoder::encode_event(&event.key, &event.value);
             let mut size = 0;
             for slice in encoded {
