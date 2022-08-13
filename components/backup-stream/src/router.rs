@@ -161,13 +161,7 @@ impl ApplyEvents {
                     continue;
                 }
             };
-            let mut decoded = key.clone();
-            decode_bytes_in_place(&mut decoded, false)
-                .unwrap_or_else(|_| panic!("meet key cannot be decoded {}", utils::redact(&key)));
-            if let Ok(2590) = decode_int_handle(&decoded) {
-                let tbl_id = decode_table_id(&decoded).unwrap_or_default();
-                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&decoded));
-            }
+            utils::_2590("transforming", cf, &key);
             if cf == CF_LOCK {
                 match cmd_type {
                     CmdType::Put => {
@@ -1265,14 +1259,7 @@ impl DataFile {
         let mut total_size = 0;
 
         for mut event in events.events {
-            let mut decoded = event.key.clone();
-            decode_bytes_in_place(&mut decoded, false).unwrap_or_else(|_| {
-                panic!("meet key cannot be decoded {}", utils::redact(&event.key))
-            });
-            if let Ok(2590) = decode_int_handle(&decoded) {
-                let tbl_id = decode_table_id(&decoded).unwrap_or_default();
-                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&decoded));
-            }
+            utils::_2590("putting_to_file", event.cf, &event.key);
 
             let encoded = EventEncoder::encode_event(&event.key, &event.value);
             let mut size = 0;
