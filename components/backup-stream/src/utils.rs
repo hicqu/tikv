@@ -66,9 +66,9 @@ pub fn cf_name(s: &str) -> CfName {
 pub fn _2590(ctx: &str, cf: &str, key: &Vec<u8>) {
     let mut decoded = key.clone();
     let ts = Key::decode_ts_from(&decoded)
-        .unwrap_or_else(|_| panic!("meet key without TS {}", utils::redact(&key)));
+        .unwrap_or_else(|_| panic!("meet key without TS {}", redact(&key)));
     decode_bytes_in_place(&mut decoded, false)
-        .unwrap_or_else(|_| panic!("meet key cannot be decoded {}", utils::redact(&key)));
+        .unwrap_or_else(|_| panic!("meet key cannot be decoded {}", redact(&key)));
     if let Ok(2590) = decode_int_handle(&decoded) {
         let tbl_id = decode_table_id(&decoded).unwrap_or_default();
         info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&decoded), "ctx" => %ctx, "cf" => %cf, "ts" => ts);
