@@ -163,7 +163,7 @@ impl ApplyEvents {
             };
             let mut decoded = key.clone();
             decode_bytes_in_place(&mut decoded, false)
-                .unwrap_or(|| panic!("meet key cannot be decoded {}", utils::redact(&key)));
+                .unwrap_or(|_| panic!("meet key cannot be decoded {}", utils::redact(&key)));
             if let Ok(2590) = decode_int_handle(&decoded) {
                 let tbl_id = decode_table_id(&decoded).unwrap_or_default();
                 info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&decoded));
