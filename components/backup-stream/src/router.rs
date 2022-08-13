@@ -1265,7 +1265,7 @@ impl DataFile {
             let key = event.key.as_slice();
             if let Ok(2590) = decode_int_handle(key) {
                 let tbl_id = decode_table_id(key).unwrap_or_default();
-                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(key));
+                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&key));
             }
 
             let encoded = EventEncoder::encode_event(&event.key, &event.value);
