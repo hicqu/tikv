@@ -1266,8 +1266,9 @@ impl DataFile {
 
         for mut event in events.events {
             let mut decoded = event.key.clone();
-            decode_bytes_in_place(&mut decoded, false)
-                .unwrap_or(|| panic!("meet key cannot be decoded {}", utils::redact(&key)));
+            decode_bytes_in_place(&mut decoded, false).unwrap_or_else(|| {
+                panic!("meet key cannot be decoded {}", utils::redact(&event.key))
+            });
             if let Ok(2590) = decode_int_handle(&decoded) {
                 let tbl_id = decode_table_id(&decoded).unwrap_or_default();
                 info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&decoded));
