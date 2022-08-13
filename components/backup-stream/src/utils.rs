@@ -22,6 +22,7 @@ use tikv::storage::CfStatistics;
 use tikv_util::{
     box_err,
     codec::bytes::decode_bytes_in_place,
+    info,
     sys::inspector::{
         self_thread_inspector, IoStat, ThreadInspector, ThreadInspectorImpl as OsInspector,
     },
