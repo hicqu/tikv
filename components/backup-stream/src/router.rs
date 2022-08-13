@@ -140,6 +140,7 @@ impl ApplyEvents {
                 #[allow(clippy::needless_bool)]
                 if cmd.response.get_header().has_error() {
                     // Add some log for skipping the error.
+                    warn!("the response has errors, should abort"; "resp" => ?cmd.response);
                     false
                 } else if cmd.request.has_admin_request() {
                     // Add some log for skipping the admin request.
