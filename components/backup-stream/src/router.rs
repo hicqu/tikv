@@ -29,7 +29,7 @@ use slog_global::debug;
 use tidb_query_datatype::codec::table::{decode_int_handle, decode_table_id};
 use tikv_util::{
     box_err,
-    codec::stream_event::EventEncoder,
+    codec::{bytes::decode_bytes_in_place, stream_event::EventEncoder},
     error, info,
     time::{Instant, Limiter},
     warn,
@@ -161,9 +161,12 @@ impl ApplyEvents {
                     continue;
                 }
             };
-            if let Ok(2590) = decode_int_handle(&key) {
-                let tbl_id = decode_table_id(&key).unwrap_or_default();
-                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&key));
+            let mut decoded = key.clone();
+            decode_bytes_in_place(&mut decoded, false)
+                .unwrap_or(|| panic!("meet key cannot be decoded {}", utils::redact(&key)));
+            if let Ok(2590) = decode_int_handle(&decoded) {
+                let tbl_id = decode_table_id(&decoded).unwrap_or_default();
+                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&decoded));
             }
             if cf == CF_LOCK {
                 match cmd_type {
@@ -1262,10 +1265,12 @@ impl DataFile {
         let mut total_size = 0;
 
         for mut event in events.events {
-            let key = event.key.as_slice();
-            if let Ok(2590) = decode_int_handle(key) {
-                let tbl_id = decode_table_id(key).unwrap_or_default();
-                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&key));
+            let mut decoded = event.key.clone();
+            decode_bytes_in_place(&mut decoded, false)
+                .unwrap_or(|| panic!("meet key cannot be decoded {}", utils::redact(&key)));
+            if let Ok(2590) = decode_int_handle(&decoded) {
+                let tbl_id = decode_table_id(&decoded).unwrap_or_default();
+                info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&decoded));
             }
 
             let encoded = EventEncoder::encode_event(&event.key, &event.value);
