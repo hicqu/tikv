@@ -430,7 +430,6 @@ where
             }
         };
         let pitr_id = batch.pitr_id;
-        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver());
         // Stale data is accpetable, while stale locks may block the checkpoint advancing.
         // Let L be the instant some key locked, U be the instant it unlocked,
         // +---------*-------L-----------U--*-------------+
@@ -444,7 +443,7 @@ where
             info!("stale command"; "region_id" => %region_id, "now" => ?resolver.value().handle.id, "remote" => ?pitr_id);
             return None;
         }
-
+        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver());
         Some(kvs)
     }
 
