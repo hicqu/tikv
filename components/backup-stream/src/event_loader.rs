@@ -153,6 +153,12 @@ impl<S: Snapshot> EventLoader<S> {
                             utils::redact(&lock_at)
                         )
                     })?;
+                    utils::_2590(
+                        format_args!("initial_scan:lock:{}", lock.ts),
+                        "lock",
+                        &lock_at,
+                        self.region_id,
+                    );
                     debug!("meet lock during initial scanning."; "key" => %utils::redact(&lock_at), "ts" => %lock.ts);
                     resolver.track_phase_one_lock(lock.ts, lock_at)
                 }

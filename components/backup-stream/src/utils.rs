@@ -3,6 +3,7 @@
 use std::{
     borrow::Borrow,
     collections::{hash_map::RandomState, BTreeMap, HashMap},
+    fmt::Display,
     ops::{Bound, RangeBounds},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -32,7 +33,7 @@ use tikv_util::{
     Either,
 };
 use tokio::sync::{oneshot, Mutex, RwLock};
-use txn_types::{Key, Lock, LockType};
+use txn_types::{Key, Lock, LockType, TimeStamp};
 
 use crate::{
     errors::{Error, Result},
@@ -64,10 +65,14 @@ pub fn cf_name(s: &str) -> CfName {
     }
 }
 
-pub fn _2590(ctx: &str, cf: &str, key: &Vec<u8>, region_id: u64) {
+pub fn _2590(ctx: impl Display, cf: &str, key: &Vec<u8>, region_id: u64) {
     let mut decoded = key.clone();
-    let ts = Key::decode_ts_from(&decoded)
-        .unwrap_or_else(|_| panic!("meet key without TS {}", redact(&key)));
+    let ts = if cf == CF_LOCK {
+        TimeStamp::zero()
+    } else {
+        Key::decode_ts_from(&decoded)
+            .unwrap_or_else(|_| panic!("meet key without TS {}", redact(&key)))
+    };
     decode_bytes_in_place(&mut decoded, false)
         .unwrap_or_else(|_| panic!("meet key cannot be decoded {}", redact(&key)));
     if let Ok(2590) = decode_int_handle(&decoded) {

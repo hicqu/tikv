@@ -175,6 +175,12 @@ impl ApplyEvents {
                         }) {
                             Ok(lock) => {
                                 if utils::should_track_lock(&lock) {
+                                    utils::_2590(
+                                        format_args!("transforming:lock:{}", lock.ts),
+                                        cf,
+                                        &key,
+                                        region_id,
+                                    );
                                     resolver.track_lock(lock.ts, key)
                                 }
                             }
