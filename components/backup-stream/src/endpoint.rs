@@ -425,10 +425,12 @@ where
         let mut resolver = match subs.get_subscription_of(region_id) {
             Some(rts) => rts,
             None => {
-                debug!("the region isn't registered (no resolver found) but sent to backup_batch, maybe stale."; "region_id" => %region_id);
+                info!("the region isn't registered (no resolver found) but sent to backup_batch, maybe stale."; "region_id" => %region_id);
                 return None;
             }
         };
+        let pitr_id = batch.pitr_id;
+        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver());
         // Stale data is accpetable, while stale locks may block the checkpoint advancing.
         // Let L be the instant some key locked, U be the instant it unlocked,
         // +---------*-------L-----------U--*-------------+
@@ -438,12 +440,11 @@ where
         //              ...note that (1) is the last cmd batch of first observing, so the unlock event would never be sent to us.
         //              ...then the lock would get an eternal life in the resolver :|
         //                 (Before we refreshing the resolver for this region again)
-        if batch.pitr_id != resolver.value().handle.id {
-            debug!("stale command"; "region_id" => %region_id, "now" => ?resolver.value().handle.id, "remote" => ?batch.pitr_id);
+        if pitr_id != resolver.value().handle.id {
+            info!("stale command"; "region_id" => %region_id, "now" => ?resolver.value().handle.id, "remote" => ?pitr_id);
             return None;
         }
 
-        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver());
         Some(kvs)
     }
 

@@ -144,6 +144,7 @@ impl ApplyEvents {
                     false
                 } else if cmd.request.has_admin_request() {
                     // Add some log for skipping the admin request.
+                    warn!("the response has admin requests, should abort"; "resp" => ?cmd.response);
                     false
                 } else {
                     true
@@ -161,7 +162,7 @@ impl ApplyEvents {
                     continue;
                 }
             };
-            utils::_2590("transforming", cf, &key);
+            utils::_2590("transforming", cf, &key, region_id);
             if cf == CF_LOCK {
                 match cmd_type {
                     CmdType::Put => {
@@ -1259,7 +1260,7 @@ impl DataFile {
         let mut total_size = 0;
 
         for mut event in events.events {
-            utils::_2590("putting_to_file", event.cf, &event.key);
+            utils::_2590("putting_to_file", event.cf, &event.key, 0);
 
             let encoded = EventEncoder::encode_event(&event.key, &event.value);
             let mut size = 0;

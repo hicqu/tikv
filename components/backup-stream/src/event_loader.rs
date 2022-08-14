@@ -78,6 +78,7 @@ pub struct EventLoader<S: Snapshot> {
     scanner: DeltaScanner<S>,
     // pooling the memory.
     entry_batch: EntryBatch,
+    region_id: u64,
 }
 
 const ENTRY_BATCH_SIZE: usize = 1024;
@@ -107,6 +108,7 @@ impl<S: Snapshot> EventLoader<S> {
         Ok(Self {
             scanner,
             entry_batch: EntryBatch::with_capacity(ENTRY_BATCH_SIZE),
+            region_id,
         })
     }
 
@@ -136,7 +138,7 @@ impl<S: Snapshot> EventLoader<S> {
                     ..
                 } => {
                     if !key.is_empty() {
-                        utils::_2590("initial_scan:prewrite", "default", &key);
+                        utils::_2590("initial_scan:prewrite", "default", &key, self.region_id);
                         result.push(ApplyEvent {
                             key,
                             value,
@@ -155,7 +157,7 @@ impl<S: Snapshot> EventLoader<S> {
                     resolver.track_phase_one_lock(lock.ts, lock_at)
                 }
                 TxnEntry::Commit { default, write, .. } => {
-                    utils::_2590("initial_scan:commit", "write", &write.0);
+                    utils::_2590("initial_scan:commit", "write", &write.0, self.region_id);
                     result.push(ApplyEvent {
                         key: write.0,
                         value: write.1,
@@ -163,7 +165,7 @@ impl<S: Snapshot> EventLoader<S> {
                         cmd_type: CmdType::Put,
                     });
                     if !default.0.is_empty() {
-                        utils::_2590("initial_scan:commit", "default", &default.0);
+                        utils::_2590("initial_scan:commit", "default", &default.0, self.region_id);
                         result.push(ApplyEvent {
                             key: default.0,
                             value: default.1,
