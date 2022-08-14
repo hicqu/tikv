@@ -390,6 +390,7 @@ where
         join_handles: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<Statistics> {
         let mut stats = StatisticsSummary::default();
+        let mut entries_get = 0;
         let start = Instant::now();
         loop {
             #[cfg(feature = "failpoints")]
@@ -405,8 +406,11 @@ where
             self.with_resolver(region, |r| event_loader.emit_entries_to(&mut events, r))?;
             if events.is_empty() {
                 metrics::INITIAL_SCAN_DURATION.observe(start.saturating_elapsed_secs());
+                let rocks_keys = stats.stat.write.processed_keys;
+                info!("initial scan done"; "region_id" => %region.id, "write_processed_keys" => %rocks_keys, "entries" => %entries_get);
                 return Ok(stats.stat);
             }
+            entries_get += events.len();
             stats.add_statistics(&stat);
             let region_id = region.get_id();
             let sink = self.sink.clone();
