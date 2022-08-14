@@ -94,7 +94,6 @@ impl<S: Snapshot> EventLoader<S> {
         let apply_index = snapshot.get_apply_index().unwrap_or(0);
         let r = snapshot.get_region().clone();
         let scanner = ScannerBuilder::new(snapshot, to_ts)
-            .hint_min_ts(Some(from_ts))
             .fill_cache(false)
             .build_delta_scanner(from_ts, ExtraOp::Noop)
             .map_err(|err| Error::Txn(err.into()))
