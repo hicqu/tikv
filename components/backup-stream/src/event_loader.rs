@@ -91,6 +91,8 @@ impl<S: Snapshot> EventLoader<S> {
         region: &Region,
     ) -> Result<Self> {
         let region_id = region.get_id();
+        let apply_index = snapshot.get_apply_index().unwrap_or(0);
+        let r = snapshot.get_region().clone();
         let scanner = ScannerBuilder::new(snapshot, to_ts)
             .hint_min_ts(Some(from_ts))
             .fill_cache(false)
@@ -100,9 +102,7 @@ impl<S: Snapshot> EventLoader<S> {
                 "failed to create entry scanner from_ts = {}, to_ts = {}, region = {}",
                 from_ts, to_ts, region_id
             ))?;
-        let apply_index = snapshot.get_apply_index().unwrap_or(0);
-        let region = snapshot.get_region();
-        info!("begin initial scanning"; "index" => %apply_index, "region" => %region, "from_ts" => %from_ts);
+        info!("begin initial scanning"; "index" => %apply_index, "region" => ?r, "from_ts" => %from_ts);
         Ok(Self {
             scanner,
             entry_batch: EntryBatch::with_capacity(ENTRY_BATCH_SIZE),
@@ -285,7 +285,11 @@ where
     /// Start observe over some region.
     /// This will register the region to the raftstore as observing,
     /// and return the current snapshot of that region.
-    fn observe_over(&self, region: &Region, cmd: ChangeObserver) -> Result<impl Snapshot> {
+    fn observe_over(
+        &self,
+        region: &Region,
+        cmd: ChangeObserver,
+    ) -> Result<RegionSnapshot<impl Snapshot>> {
         // There are 2 ways for getting the initial snapshot of a region:
         //   1. the BR method: use the interface in the RaftKv interface, read the key-values directly.
         //   2. the CDC method: use the raftstore message `SignificantMsg::CaptureChange` to
@@ -427,7 +431,7 @@ where
         &self,
         region: &Region,
         start_ts: TimeStamp,
-        snap: impl Snapshot,
+        snap: RegionSnapshot<impl Snapshot>,
     ) -> Result<Statistics> {
         let _guard = self.handle.enter();
         let tr = self.tracing.clone();
