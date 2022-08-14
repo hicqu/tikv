@@ -6,22 +6,22 @@ use std::{
     time::Duration,
 };
 
-use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
+use engine_traits::{KvEngine, Snapshot, CF_DEFAULT, CF_WRITE};
 use futures::executor::block_on;
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 use raftstore::{
     coprocessor::RegionInfoProvider,
     router::RaftStoreRouter,
-    store::{fsm::ChangeObserver, Callback, SignificantMsg},
+    store::{fsm::ChangeObserver, Callback, RegionSnapshot, SignificantMsg},
 };
 use tikv::storage::{
     kv::StatisticsSummary,
     mvcc::{DeltaScanner, ScannerBuilder},
     txn::{EntryBatch, TxnEntry, TxnEntryScanner},
-    Snapshot, Statistics,
+    Statistics,
 };
 use tikv_util::{
-    box_err,
+    box_err, info,
     time::{Instant, Limiter},
     worker::Scheduler,
 };
@@ -75,7 +75,7 @@ impl PendingMemoryQuota {
 
 /// EventLoader transforms data from the snapshot into ApplyEvent.
 pub struct EventLoader<S: Snapshot> {
-    scanner: DeltaScanner<S>,
+    scanner: DeltaScanner<RegionSnapshot<S>>,
     // pooling the memory.
     entry_batch: EntryBatch,
     region_id: u64,
@@ -85,7 +85,7 @@ const ENTRY_BATCH_SIZE: usize = 1024;
 
 impl<S: Snapshot> EventLoader<S> {
     pub fn load_from(
-        snapshot: S,
+        snapshot: RegionSnapshot<S>,
         from_ts: TimeStamp,
         to_ts: TimeStamp,
         region: &Region,
@@ -100,7 +100,9 @@ impl<S: Snapshot> EventLoader<S> {
                 "failed to create entry scanner from_ts = {}, to_ts = {}, region = {}",
                 from_ts, to_ts, region_id
             ))?;
-
+        let apply_index = snapshot.get_apply_index().unwrap_or(0);
+        let region = snapshot.get_region();
+        info!("begin initial scanning"; "index" => %apply_index, "region" => %region, "from_ts" => %from_ts);
         Ok(Self {
             scanner,
             entry_batch: EntryBatch::with_capacity(ENTRY_BATCH_SIZE),
@@ -237,7 +239,7 @@ where
         &self,
         region: &Region,
         mut cmd: impl FnMut() -> ChangeObserver,
-    ) -> Result<impl Snapshot> {
+    ) -> Result<RegionSnapshot<impl Snapshot>> {
         let mut last_err = None;
         for _ in 0..MAX_GET_SNAPSHOT_RETRY {
             let r = self.observe_over(region, cmd());

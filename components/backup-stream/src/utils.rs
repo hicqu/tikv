@@ -72,11 +72,9 @@ pub fn cmd_2590(batch: &[CmdBatch]) {
     for cb in batch {
         for cmd in cb.cmds.iter() {
             for req in cmd.request.get_requests() {
-                let cmd_type = req.get_cmd_type();
-
                 if let Some((key, cf)) = key_of_request(req) {
                     _2590(
-                        format_args!("cmd_batch:{}:{}:{:?}", cmd.index, cb.region_id, cb.level),
+                        format_args!("cmd_batch:{}:{:?}", cmd.index, cb.level),
                         cf,
                         key,
                         cb.region_id,
