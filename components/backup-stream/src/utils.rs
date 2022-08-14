@@ -17,7 +17,10 @@ use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use futures::{channel::mpsc, executor::block_on, FutureExt, StreamExt};
 use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
-use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
+use raftstore::{
+    coprocessor::{CmdBatch, RegionInfoProvider},
+    RegionInfo,
+};
 use tidb_query_datatype::codec::table::{decode_int_handle, decode_table_id};
 use tikv::storage::CfStatistics;
 use tikv_util::{
@@ -65,8 +68,27 @@ pub fn cf_name(s: &str) -> CfName {
     }
 }
 
-pub fn _2590(ctx: impl Display, cf: &str, key: &Vec<u8>, region_id: u64) {
-    let mut decoded = key.clone();
+pub fn cmd_2590(batch: &[CmdBatch]) {
+    for cb in batch {
+        for cmd in cb.cmds.iter() {
+            for req in cmd.request.get_requests() {
+                let cmd_type = req.get_cmd_type();
+
+                if let Some((key, cf)) = key_of_request(req) {
+                    _2590(
+                        format_args!("cmd_batch:{}:{}:{:?}", cmd.index, cb.region_id, cb.level),
+                        cf,
+                        key,
+                        cb.region_id,
+                    )
+                }
+            }
+        }
+    }
+}
+
+pub fn _2590(ctx: impl Display, cf: &str, key: &[u8], region_id: u64) {
+    let mut decoded = key.to_vec();
     let ts = if cf == CF_LOCK {
         TimeStamp::zero()
     } else {
@@ -340,6 +362,21 @@ pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, CfName),
         _ => return Either::Right(req),
     };
     Either::Left((key, value, cf_name(cf.as_str())))
+}
+
+fn key_of_request(req: &Request) -> Option<(&[u8], CfName)> {
+    let (key, cf) = match req.get_cmd_type() {
+        CmdType::Put => {
+            let put = req.get_put();
+            (put.get_key(), &put.cf)
+        }
+        CmdType::Delete => {
+            let del = req.get_delete();
+            (del.get_key(), &del.cf)
+        }
+        _ => return None,
+    };
+    Some((key, cf_name(cf)))
 }
 
 /// `try_send!(s: Scheduler<T>, task: T)` tries to send a task to the scheduler,

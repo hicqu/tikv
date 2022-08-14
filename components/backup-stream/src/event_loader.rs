@@ -92,10 +92,6 @@ impl<S: Snapshot> EventLoader<S> {
     ) -> Result<Self> {
         let region_id = region.get_id();
         let scanner = ScannerBuilder::new(snapshot, to_ts)
-            .range(
-                (!region.start_key.is_empty()).then(|| Key::from_encoded_slice(&region.start_key)),
-                (!region.end_key.is_empty()).then(|| Key::from_encoded_slice(&region.end_key)),
-            )
             .hint_min_ts(Some(from_ts))
             .fill_cache(false)
             .build_delta_scanner(from_ts, ExtraOp::Noop)

@@ -15,7 +15,7 @@ use crate::{
     debug,
     endpoint::{ObserveOp, Task},
     try_send,
-    utils::SegmentSet,
+    utils::{cmd_2590, SegmentSet},
 };
 
 /// The inflight `StartObserve` message count.
@@ -113,6 +113,8 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
             "cmd_batches len" => cmd_batches.len(),
             "level" => ?max_level,
         );
+
+        cmd_2590(&cmd_batches);
 
         if max_level != ObserveLevel::All {
             return;
