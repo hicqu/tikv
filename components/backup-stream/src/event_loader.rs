@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use engine_traits::{KvEngine, Snapshot, CF_DEFAULT, CF_WRITE};
+use engine_traits::{IterOptions, KvEngine, Snapshot, CF_DEFAULT, CF_WRITE, DATA_KEY_PREFIX_LEN};
 use futures::executor::block_on;
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 use raftstore::{
@@ -14,6 +14,7 @@ use raftstore::{
     router::RaftStoreRouter,
     store::{fsm::ChangeObserver, Callback, RegionSnapshot, SignificantMsg},
 };
+use tidb_query_datatype::codec::table::{decode_table_id, encode_row_key};
 use tikv::storage::{
     kv::StatisticsSummary,
     mvcc::{DeltaScanner, ScannerBuilder},
@@ -22,6 +23,7 @@ use tikv::storage::{
 };
 use tikv_util::{
     box_err, info,
+    keybuilder::KeyBuilder,
     time::{Instant, Limiter},
     worker::Scheduler,
 };
@@ -101,7 +103,34 @@ impl<S: Snapshot> EventLoader<S> {
                 "failed to create entry scanner from_ts = {}, to_ts = {}, region = {}",
                 from_ts, to_ts, region_id
             ))?;
+
         info!("begin initial scanning"; "index" => %apply_index, "region" => ?r, "from_ts" => %from_ts);
+
+        if let Ok(start_key) = Key::from_encoded_slice(r.get_start_key()).into_raw() {
+            if let Ok(tid) = decode_table_id(&start_key) {
+                let key_2590 = Key::from_raw(&encode_row_key(tid, 2590)).into_encoded();
+                let key_2591 = Key::from_raw(&encode_row_key(tid, 2591)).into_encoded();
+                let s = KeyBuilder::from_vec(key_2590, DATA_KEY_PREFIX_LEN, 0);
+                let e = KeyBuilder::from_vec(key_2591, DATA_KEY_PREFIX_LEN, 0);
+                let iter_opts = IterOptions::new(Some(s), Some(e), false);
+                let mut iter = snapshot.iter_cf(CF_WRITE, iter_opts).unwrap();
+                let mut version_count = 0;
+                let mut latest_version = 0;
+                let mut valid = iter.seek_to_first().unwrap();
+                while valid {
+                    if latest_version == 0 {
+                        let (_, commit_ts) = Key::split_on_ts_for(iter.key()).unwrap();
+                        latest_version = commit_ts;
+                    }
+                    version_count += 1;
+                    valid = iter.next().unwrap();
+                }
+                info!("initial scanning"; "region_id" => r.id, "table" => tid, "commit_ts" => latest_version, "version_count" => version_count);
+            }
+        } else {
+            info!("initial scanning with invalid encoded start key"; "region_id" => r.id);
+        }
+
         Ok(Self {
             scanner,
             entry_batch: EntryBatch::with_capacity(ENTRY_BATCH_SIZE),
