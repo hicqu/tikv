@@ -17,7 +17,7 @@ use concurrency_manager::ConcurrencyManager;
 use crossbeam::atomic::AtomicCell;
 use engine_traits::KvEngine;
 use fail::fail_point;
-use futures::compat::Future01CompatExt;
+use futures::{compat::Future01CompatExt, executor::block_on};
 use grpcio::Environment;
 use kvproto::{
     cdcpb::{
@@ -59,7 +59,7 @@ use tokio::{
 use txn_types::{Key, TimeStamp, TxnExtra, TxnExtraScheduler};
 
 use crate::{
-    channel::{CdcEvent, SendError},
+    channel::{CdcEvent, DownstreamSink, SendError},
     delegate::{on_init_downstream, Delegate, Downstream, DownstreamId, DownstreamState, MiniLock},
     initializer::Initializer,
     metrics::*,
@@ -199,11 +199,7 @@ pub enum Task {
         observe_id: ObserveId,
         downstream_id: DownstreamId,
         downstream_state: Arc<AtomicCell<DownstreamState>>,
-        sink: crate::channel::Sink,
         build_resolver: Arc<AtomicBool>,
-        // `incremental_scan_barrier` will be sent into `sink` to ensure all delta changes
-        // are delivered to the downstream. And then incremental scan can start.
-        incremental_scan_barrier: CdcEvent,
         cb: InitCallback,
     },
     TxnExtra(TxnExtra),
@@ -376,18 +372,6 @@ pub(crate) struct Advance {
 
 impl Advance {
     fn emit_resolved_ts(&mut self, connections: &HashMap<ConnId, Conn>) {
-        let handle_send_result = |conn: &Conn, res: Result<(), SendError>| match res {
-            Ok(_) => {}
-            Err(SendError::Disconnected) => {
-                debug!("cdc send event failed, disconnected";
-                        "conn_id" => ?conn.get_id(), "downstream" => ?conn.get_peer());
-            }
-            Err(SendError::Full) | Err(SendError::Congested) => {
-                info!("cdc send event failed, full";
-                        "conn_id" => ?conn.get_id(), "downstream" => ?conn.get_peer());
-            }
-        };
-
         let mut batch_min_resolved_ts = 0;
         let mut batch_min_ts_region_id = 0;
         let mut batch_send = |ts: u64, conn: &Conn, req_id: RequestId, regions: Vec<u64>| {
@@ -398,15 +382,8 @@ impl Advance {
                 }
             }
 
-            let mut resolved_ts = ResolvedTs::default();
-            resolved_ts.ts = ts;
-            resolved_ts.request_id = req_id.0;
-            *resolved_ts.mut_regions() = regions;
-
-            let res = conn
-                .get_sink()
-                .unbounded_send(CdcEvent::ResolvedTs(resolved_ts), false);
-            handle_send_result(conn, res);
+            conn.get_sink()
+                .send_batch_resolved_ts(regions, req_id.0, ts);
         };
 
         let mut compat_min_resolved_ts = 0;
@@ -423,10 +400,8 @@ impl Advance {
                 event: Some(Event_oneof_event::ResolvedTs(ts)),
                 ..Default::default()
             };
-            let res = conn
-                .get_sink()
-                .unbounded_send(CdcEvent::Event(event), false);
-            handle_send_result(conn, res);
+            conn.get_sink()
+                .send_region_resolved_ts(region_id, req_id.0, ts);
         };
 
         let multiplexing = std::mem::take(&mut self.multiplexing).into_iter();
@@ -809,7 +784,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
                 return;
             }
         };
-        downstream.set_sink(conn.get_sink().clone());
+        // downstream.set_sink(conn.get_sink().clone());
 
         // Check if the cluster id matches if supported.
         if conn.features().contains(FeatureGate::VALIDATE_CLUSTER_ID) {
@@ -821,19 +796,21 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
                 err.set_request(request_cluster_id);
                 err_event.set_cluster_id_mismatch(err);
 
-                let _ = downstream.sink_error_event(region_id, err_event);
+                drop(err_event);
+                // let _ = downstream.sink_error_event(region_id, err_event);
                 return;
             }
         }
 
         if !validate_kv_api(kv_api, api_version) {
             error!("cdc RawKv is supported by api-version 2 only. TxnKv is not supported now.");
-            let mut err_event = EventError::default();
-            let mut err = ErrorCompatibility::default();
-            err.set_required_version("6.2.0".to_string());
-            err_event.set_compatibility(err);
+            // FIXME.
+            // let mut err_event = EventError::default();
+            // let mut err = ErrorCompatibility::default();
+            // err.set_required_version("6.2.0".to_string());
+            // err_event.set_compatibility(err);
 
-            let _ = downstream.sink_error_event(region_id, err_event);
+            // let _ = downstream.sink_error_event(region_id, err_event);
             return;
         }
 
@@ -852,9 +829,10 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             );
             // To avoid OOM (e.g., https://github.com/tikv/tikv/issues/16035),
             // TiKV needs to reject and return error immediately.
-            let mut err_event = EventError::default();
-            err_event.mut_server_is_busy().reason = "too many pending incremental scans".to_owned();
-            let _ = downstream.sink_error_event(region_id, err_event);
+            // let mut err_event = EventError::default();
+            // err_event.mut_server_is_busy().reason = "too many pending incremental
+            // scans".to_owned(); let _ = downstream.sink_error_event(region_id,
+            // err_event);
             return;
         }
 
@@ -862,9 +840,10 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             Some(reader) => reader.txn_extra_op.clone(),
             None => {
                 error!("cdc register for a not found region"; "region_id" => region_id);
-                let mut err_event = EventError::default();
-                err_event.mut_region_not_found().region_id = region_id;
-                let _ = downstream.sink_error_event(region_id, err_event);
+                // FIXME.
+                // let mut err_event = EventError::default();
+                // err_event.mut_region_not_found().region_id = region_id;
+                // let _ = downstream.sink_error_event(region_id, err_event);
                 return;
             }
         };
@@ -873,11 +852,12 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             .subscribe(request_id, region_id, downstream_id, downstream_state)
             .is_some()
         {
-            let mut err_event = EventError::default();
-            let mut err = ErrorDuplicateRequest::default();
-            err.set_region_id(region_id);
-            err_event.set_duplicate_request(err);
-            let _ = downstream.sink_error_event(region_id, err_event);
+            // FIXME.
+            // let mut err_event = EventError::default();
+            // let mut err = ErrorDuplicateRequest::default();
+            // err.set_region_id(region_id);
+            // err_event.set_duplicate_request(err);
+            // let _ = downstream.sink_error_event(region_id, err_event);
             error!("cdc duplicate register";
                 "region_id" => region_id,
                 "conn_id" => ?conn_id,
@@ -913,8 +893,9 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
         let scan_truncated = downstream.scan_truncated.clone();
 
         if let Err((err, downstream)) = delegate.subscribe(downstream) {
-            let error_event = err.into_error_event(region_id);
-            let _ = downstream.sink_error_event(region_id, error_event);
+            // FIXME
+            // let error_event = err.into_error_event(region_id);
+            // let _ = downstream.sink_error_event(region_id, error_event);
             conn.unsubscribe(request_id, region_id);
             if is_new_delegate {
                 self.capture_regions.remove(&region_id);
@@ -950,7 +931,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
 
             tablet: self.tablets.get(region_id).map(|t| t.into_owned()),
             sched,
-            sink: conn.get_sink().clone(),
+            sink: DownstreamSink::new(region_id, request_id, conn.get_sink().clone()),
             concurrency_semaphore: self.scan_concurrency_semaphore.clone(),
 
             scan_speed_limiter: self.scan_speed_limiter.clone(),
@@ -1240,9 +1221,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta + Send> Runnable
                 observe_id,
                 downstream_id,
                 downstream_state,
-                sink,
                 build_resolver,
-                incremental_scan_barrier,
                 cb,
             } => {
                 match self.capture_regions.get_mut(&region_id) {
@@ -1252,14 +1231,6 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta + Send> Runnable
                         }
                     }
                     _ => return,
-                }
-                if let Err(e) = sink.unbounded_send(incremental_scan_barrier, true) {
-                    error!("cdc failed to schedule barrier for delta before delta scan";
-                        "region_id" => region_id,
-                        "observe_id" => ?observe_id,
-                        "downstream_id" => ?downstream_id,
-                        "error" => ?e);
-                    return;
                 }
                 if on_init_downstream(&downstream_state) {
                     info!("cdc downstream starts to initialize";

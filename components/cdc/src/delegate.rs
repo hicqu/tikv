@@ -16,6 +16,7 @@ use std::{
 use api_version::{ApiV2, KeyMode, KvFormat};
 use collections::HashMap;
 use crossbeam::atomic::AtomicCell;
+use futures::executor::block_on;
 use kvproto::{
     cdcpb::{
         ChangeDataRequestKvApi, Error as EventError, Event, EventEntries, EventLogType, EventRow,
@@ -40,7 +41,7 @@ use tikv_util::{
 use txn_types::{Key, Lock, LockType, TimeStamp, WriteBatchFlags, WriteRef, WriteType};
 
 use crate::{
-    channel::{CdcEvent, SendError, Sink, CDC_EVENT_MAX_BYTES},
+    channel::{CdcEvent, DownstreamSink, SendError},
     endpoint::Advance,
     initializer::KvEntry,
     metrics::*,
@@ -51,6 +52,8 @@ use crate::{
 };
 
 static DOWNSTREAM_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
+
+const CDC_EVENT_MAX_BYTES: usize = 1024;
 
 /// A unique identifier of a Downstream.
 #[derive(Clone, Copy, Debug, PartialEq, Hash)]
@@ -138,7 +141,7 @@ pub struct Downstream {
     pub filter_loop: bool,
     pub observed_range: ObservedRange,
 
-    sink: Option<Sink>,
+    sink: Option<DownstreamSink>,
     state: Arc<AtomicCell<DownstreamState>>,
     pub(crate) scan_truncated: Arc<AtomicBool>,
 
@@ -192,50 +195,17 @@ impl Downstream {
         }
     }
 
-    // NOTE: it's not allowed to sink `EventError` directly by this function,
-    // because the sink can be also used by an incremental scan. We must ensure
-    // no more events can be pushed to the sink after an `EventError` is sent.
-    pub fn sink_event(&self, mut event: Event, force: bool) -> Result<()> {
-        event.set_request_id(self.req_id.0);
-        if self.sink.is_none() {
-            info!("cdc drop event, no sink";
-                "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
-            return Err(Error::Sink(SendError::Disconnected));
-        }
-        let sink = self.sink.as_ref().unwrap();
-        match sink.unbounded_send(CdcEvent::Event(event), force) {
-            Ok(_) => Ok(()),
-            Err(SendError::Disconnected) => {
-                debug!("cdc send event failed, disconnected";
-                    "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
-                Err(Error::Sink(SendError::Disconnected))
-            }
-            // TODO handle errors.
-            Err(e @ SendError::Full) | Err(e @ SendError::Congested) => {
-                info!("cdc send event failed, full";
-                    "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
-                Err(Error::Sink(e))
-            }
-        }
-    }
-
-    /// EventErrors must be sent by this function. And we must ensure no more
-    /// events or ResolvedTs will be sent to the downstream after
-    /// `sink_error_event` is called.
-    pub fn sink_error_event(&self, region_id: u64, err_event: EventError) -> Result<()> {
+    pub fn cancel_by_error(&self, err_event: EventError) -> Result<()> {
         info!("cdc downstream meets region error";
             "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
 
-        self.scan_truncated.store(true, Ordering::Release);
-        let mut change_data_event = Event::default();
-        change_data_event.event = Some(Event_oneof_event::Error(err_event));
-        change_data_event.region_id = region_id;
-        // Try it's best to send error events.
-        let force_send = true;
-        self.sink_event(change_data_event, force_send)
+        if let Some(sink) = self.sink.as_ref() {
+            return block_on(sink.cancel_by_error(err_event));
+        }
+        Ok(())
     }
 
-    pub fn set_sink(&mut self, sink: Sink) {
+    pub fn set_sink(&mut self, sink: DownstreamSink) {
         self.sink = Some(sink);
     }
 
@@ -547,7 +517,7 @@ impl Delegate {
         let region_id = self.region_id;
         if let Some(d) = self.remove_downstream(id) {
             if let Some(error_event) = error_event {
-                if let Err(err) = d.sink_error_event(region_id, error_event.clone()) {
+                if let Err(err) = d.cancel_by_error(error_event.clone()) {
                     warn!("cdc send unsubscribe failed";
                         "region_id" => region_id, "error" => ?err, "origin_error" => ?error_event,
                         "downstream_id" => ?d.id, "downstream" => ?d.peer,
@@ -582,7 +552,7 @@ impl Delegate {
         let send = move |downstream: &Downstream| {
             downstream.state.store(DownstreamState::Stopped);
             let error_event = error.clone();
-            if let Err(err) = downstream.sink_error_event(region_id, error_event) {
+            if let Err(err) = downstream.cancel_by_error(error_event) {
                 warn!("cdc send region error failed";
                     "region_id" => region_id, "error" => ?err, "origin_error" => ?error,
                     "downstream_id" => ?downstream.id, "downstream" => ?downstream.peer,
@@ -752,7 +722,7 @@ impl Delegate {
         entries: Vec<Option<KvEntry>>,
         filter_loop: bool,
         observed_range: &ObservedRange,
-    ) -> Result<Vec<CdcEvent>> {
+    ) -> Result<Vec<Vec<EventRow>>> {
         let entries_len = entries.len();
         let mut rows = vec![Vec::with_capacity(entries_len)];
         let mut current_rows_size: usize = 0;
@@ -769,9 +739,6 @@ impl Delegate {
                     lock,
                     old_value,
                 })) => {
-                    if !observed_range.contains_encoded_key(&lock.0) {
-                        continue;
-                    }
                     let l = Lock::parse(&lock.1).unwrap();
                     if decode_lock(lock.0, l, &mut row, &mut _has_value) {
                         continue;
@@ -785,9 +752,6 @@ impl Delegate {
                     write,
                     old_value,
                 })) => {
-                    if !observed_range.contains_encoded_key(&write.0) {
-                        continue;
-                    }
                     if decode_write(write.0, &write.1, &mut row, &mut _has_value, false) {
                         continue;
                     }
@@ -828,22 +792,22 @@ impl Delegate {
             rows.last_mut().unwrap().push(row);
         }
 
-        let rows = rows
-            .into_iter()
-            .filter(|rs| !rs.is_empty())
-            .map(|rs| {
-                let event_entries = EventEntries {
-                    entries: rs.into(),
-                    ..Default::default()
-                };
-                CdcEvent::Event(Event {
-                    region_id,
-                    request_id: request_id.0,
-                    event: Some(Event_oneof_event::Entries(event_entries)),
-                    ..Default::default()
-                })
-            })
-            .collect();
+        // let rows = rows
+        //     .into_iter()
+        //     .filter(|rs| !rs.is_empty())
+        //     .map(|rs| {
+        //         let event_entries = EventEntries {
+        //             entries: rs.into(),
+        //             ..Default::default()
+        //         };
+        //         CdcEvent::Event(Event {
+        //             region_id,
+        //             request_id: request_id.0,
+        //             event: Some(Event_oneof_event::Entries(event_entries)),
+        //             ..Default::default()
+        //         })
+        //     })
+        //     .collect();
         Ok(rows)
     }
 
@@ -903,17 +867,9 @@ impl Delegate {
             if filtered_entries.is_empty() {
                 continue;
             }
-            let event = Event {
-                region_id: self.region_id,
-                index,
-                request_id: downstream.req_id.0,
-                event: Some(Event_oneof_event::Entries(EventEntries {
-                    entries: filtered_entries.into(),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            };
-            downstream.sink_event(event, false)?;
+            if let Some(sink) = downstream.sink.as_ref() {
+                block_on(sink.send_observed_raw(index, filtered_entries))?;
+            }
         }
         Ok(())
     }
@@ -983,16 +939,9 @@ impl Delegate {
             if filtered_entries.is_empty() {
                 continue;
             }
-            let event = Event {
-                region_id: self.region_id,
-                request_id: downstream.req_id.0,
-                event: Some(Event_oneof_event::Entries(EventEntries {
-                    entries: filtered_entries.into(),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            };
-            downstream.sink_event(event, false)?;
+            if let Some(sink) = downstream.sink.as_ref() {
+                block_on(sink.send_observed_tidb(filtered_entries))?;
+            }
         }
         Ok(())
     }

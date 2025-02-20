@@ -7,8 +7,8 @@ use std::sync::{
 
 use collections::{HashMap, HashMapEntry};
 use crossbeam::atomic::AtomicCell;
-use futures::stream::TryStreamExt;
-use grpcio::{DuplexSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode};
+use futures::stream::{StreamExt, TryStreamExt};
+use grpcio::{DuplexSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode, WriteFlags};
 use kvproto::{
     cdcpb::{
         ChangeData, ChangeDataEvent, ChangeDataRequest, ChangeDataRequestKvApi,
@@ -19,7 +19,7 @@ use kvproto::{
 use tikv_util::{error, info, memory::MemoryQuota, warn, worker::*};
 
 use crate::{
-    channel::{channel, Sink, CDC_CHANNLE_CAPACITY},
+    channel::{channel, Sink},
     delegate::{Downstream, DownstreamId, DownstreamState, ObservedRange},
     endpoint::{Deregister, Task},
 };
@@ -406,8 +406,7 @@ impl Service {
     ) {
         sink.enhance_batch(true);
         let conn_id = ConnId::new();
-        let (event_sink, mut event_drain) =
-            channel(conn_id, CDC_CHANNLE_CAPACITY, self.memory_quota.clone());
+        let (event_sink, mut event_drain) = channel(conn_id, self.memory_quota.clone());
         let conn = Conn::new(conn_id, event_sink, ctx.peer());
         let mut explicit_features = vec![];
 
@@ -455,19 +454,22 @@ impl Service {
             while let Some(request) = stream.try_next().await? {
                 Self::handle_request(&scheduler, &peer, request, conn_id)?;
             }
-            let deregister = Deregister::Conn(conn_id);
-            if let Err(e) = scheduler.schedule(Task::Deregister(deregister)) {
-                error!("cdc deregister failed"; "error" => ?e, "conn_id" => ?conn_id);
-            }
             Ok::<(), String>(())
         };
 
         let peer = ctx.peer();
+        let scheduler = self.scheduler.clone();
         ctx.spawn(async move {
             if let Err(e) = recv_req.await {
                 warn!("cdc receive failed"; "error" => ?e, "downstream" => peer, "conn_id" => ?conn_id);
             } else {
                 info!("cdc receive closed"; "downstream" => peer, "conn_id" => ?conn_id);
+            }
+            let deregister = Deregister::Conn(conn_id);
+            if let Err(e) = scheduler.schedule(Task::Deregister(deregister)) {
+                error!("cdc deregister failed"; "error" => ?e, "conn_id" => ?conn_id);
+            } else {
+                error!("cdc deregister success"; "conn_id" => ?conn_id);
             }
         });
 
@@ -475,10 +477,14 @@ impl Service {
         ctx.spawn(async move {
             #[cfg(feature = "failpoints")]
             sleep_before_drain_change_event().await;
-            if let Err(e) = event_drain.forward(&mut sink).await {
-                warn!("cdc send failed"; "error" => ?e, "downstream" => peer, "conn_id" => ?conn_id);
+
+            // NOTE: enhance_batch so that we can set `buffer_hint(false)` for all messages.
+            sink.enhance_batch(true);
+            let flags = WriteFlags::default().buffer_hint(false);
+            if let Err(e) = event_drain.map(|x| Ok((x, flags))).forward(&mut sink).await {
+                warn!("cdc send failed"; "error" => ?e, "downstream" => &peer, "conn_id" => ?conn_id);
             } else {
-                info!("cdc send closed"; "downstream" => peer, "conn_id" => ?conn_id);
+                info!("cdc send closed"; "downstream" => &peer, "conn_id" => ?conn_id);
             }
         });
     }

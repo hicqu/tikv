@@ -105,7 +105,7 @@ pub(crate) struct Initializer<E> {
 
     pub(crate) tablet: Option<E>,
     pub(crate) sched: Scheduler<Task>,
-    pub(crate) sink: crate::channel::Sink,
+    pub(crate) sink: crate::channel::DownstreamSink,
     pub(crate) concurrency_semaphore: Arc<Semaphore>,
 
     pub(crate) scan_speed_limiter: Limiter,
@@ -150,9 +150,6 @@ impl<E: KvEngine> Initializer<E> {
         let (cb, fut) = tikv_util::future::paired_future_callback();
         let sink = self.sink.clone();
         let build_resolver = self.build_resolver.clone();
-        let (incremental_scan_barrier_cb, incremental_scan_barrier_fut) =
-            tikv_util::future::paired_future_callback();
-        let barrier = CdcEvent::Barrier(Some(incremental_scan_barrier_cb));
         if let Err(e) = cdc_handle.capture_change(
             self.region_id,
             region_epoch,
@@ -166,9 +163,8 @@ impl<E: KvEngine> Initializer<E> {
                     observe_id,
                     downstream_id,
                     downstream_state,
-                    sink,
                     build_resolver,
-                    incremental_scan_barrier: barrier,
+                    // incremental_scan_barrier: barrier,
                     cb: Box::new(move || cb(resp)),
                 }) {
                     error!("cdc schedule cdc task failed"; "error" => ?e);
@@ -178,13 +174,6 @@ impl<E: KvEngine> Initializer<E> {
             warn!("cdc send capture change cmd failed";
             "region_id" => self.region_id, "error" => ?e);
             return Err(Error::request(e.into()));
-        }
-
-        // Wait all delta changes earlier than the incremental scan snapshot be
-        // sent to the downstream, so that they must be consumed before the
-        // incremental scan result.
-        if let Err(e) = incremental_scan_barrier_fut.await {
-            return Err(Error::Other(box_err!(e)));
         }
 
         match fut.await {
@@ -376,7 +365,7 @@ impl<E: KvEngine> Initializer<E> {
             debug!("cdc scan entries"; "len" => entries.len(), "region_id" => region_id);
             fail_point!("before_schedule_incremental_scan");
             let start_sink = Instant::now_coarse();
-            self.sink_scan_events(entries, done).await?;
+            self.sink_scan_events(entries).await?;
             sink_time += start_sink.saturating_elapsed();
         }
 
@@ -504,34 +493,17 @@ impl<E: KvEngine> Initializer<E> {
         Ok(entries)
     }
 
-    async fn sink_scan_events(&mut self, entries: Vec<Option<KvEntry>>, done: bool) -> Result<()> {
-        let mut barrier = None;
-        let mut events = Delegate::convert_to_grpc_events(
+    async fn sink_scan_events(&mut self, entries: Vec<Option<KvEntry>>) -> Result<()> {
+        let events = Delegate::convert_to_grpc_events(
             self.region_id,
             self.request_id,
             entries,
             self.filter_loop,
             &self.observed_range,
         )?;
-        if done {
-            let (cb, fut) = tikv_util::future::paired_future_callback();
-            events.push(CdcEvent::Barrier(Some(cb)));
-            barrier = Some(fut);
-        }
-        if let Err(e) = self
-            .sink
-            .send_all(events, self.scan_truncated.clone())
-            .await
-        {
-            error!("cdc send scan event failed"; "req_id" => ?self.request_id);
-            return Err(Error::Sink(e));
-        }
-
-        if let Some(barrier) = barrier {
-            // CDC needs to make sure resolved ts events can only be sent after
-            // incremental scan is finished.
-            // Wait the barrier to ensure tikv sends out all scan events.
-            let _ = barrier.await;
+        if let Err(e) = self.sink.send_scaned(events).await {
+            error!("cdc send scan event failed"; "req_id" => ?self.request_id, "error" => ?e);
+            return Err(e);
         }
 
         Ok(())
